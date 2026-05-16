@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import imaplib
 from typing import List, Optional, Tuple
 
 from aiogram import Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -84,6 +86,128 @@ def check_imap_credentials(email: str, password: str) -> Tuple[bool, Optional[st
     except Exception as e:  # noqa: BLE001
         logger.warning("IMAP login failed for %s: %s", email, e)
         return False, provider, str(e)
+
+
+async def _imap_check_async(email: str, password: str) -> Tuple[bool, Optional[str], Optional[str]]:
+    """IMAP-проверка в отдельном потоке, чтобы не блокировать polling."""
+    return await asyncio.to_thread(check_imap_credentials, email, password)
+
+
+async def _edit_add_progress(
+    status_msg: Message,
+    *,
+    current: int,
+    total: int,
+    ok: int,
+    fail: int,
+) -> None:
+    try:
+        await status_msg.edit_text(
+            "⏳ <b>Добавление аккаунтов</b>\n\n"
+            f"Проверка IMAP: <b>{current}/{total}</b>\n"
+            f"✅ успешно: <b>{ok}</b> · ❌ ошибки: <b>{fail}</b>",
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest:
+        pass
+
+
+def _trim_details(details: List[str], limit: int = 35) -> str:
+    if len(details) <= limit:
+        return "\n".join(details)
+    hidden = len(details) - limit
+    return "\n".join(details[:limit]) + f"\n… и ещё {hidden} строк(и)"
+
+
+async def _bulk_add_accounts(
+    message: Message,
+    session,
+    user: User,
+    lines: List[str],
+    *,
+    gmail_only: bool = False,
+) -> Tuple[int, int, List[str]]:
+    total = len(lines)
+    status_msg = await message.answer(
+        f"⏳ <b>Добавление аккаунтов</b>\n\nПроверка IMAP: <b>0/{total}</b>",
+        parse_mode="HTML",
+    )
+
+    ok_count = 0
+    fail_count = 0
+    details: List[str] = []
+
+    for i, line in enumerate(lines, start=1):
+        if ":" not in line:
+            fail_count += 1
+            if gmail_only:
+                details.append(f"❌ <code>{_e(line)}</code> — нет <code>:</code>")
+            else:
+                details.append(f"❌ <code>{_e(line)}</code> — нет разделителя <code>:</code>")
+            await _edit_add_progress(status_msg, current=i, total=total, ok=ok_count, fail=fail_count)
+            continue
+
+        email, password = line.split(":", 1)
+        email = email.strip()
+        password = password.strip()
+
+        if gmail_only and not _is_gmail_address(email):
+            fail_count += 1
+            details.append(f"❌ <code>{_e(email)}</code> — только @gmail.com / @googlemail.com")
+            await _edit_add_progress(status_msg, current=i, total=total, ok=ok_count, fail=fail_count)
+            continue
+
+        if not email or not password:
+            fail_count += 1
+            details.append(f"❌ <code>{_e(line)}</code> — пустой email или пароль")
+            await _edit_add_progress(status_msg, current=i, total=total, ok=ok_count, fail=fail_count)
+            continue
+
+        ok, provider, err = await _imap_check_async(email, password)
+        if not ok:
+            fail_count += 1
+            err_txt = _e(err or ("ошибка IMAP" if gmail_only else "ошибка при входе"))
+            details.append(f"❌ <code>{_e(email)}</code> — {err_txt}")
+            await _edit_add_progress(status_msg, current=i, total=total, ok=ok_count, fail=fail_count)
+            continue
+
+        existing_res = await session.execute(
+            select(EmailAccount).where(
+                EmailAccount.user_id == user.id,
+                EmailAccount.email == email,
+            )
+        )
+        existing = existing_res.scalar_one_or_none()
+        prov = provider or "gmail"
+        if existing:
+            existing.password = password
+            existing.provider = prov
+            existing.status = "active"
+        else:
+            session.add(
+                EmailAccount(
+                    user_id=user.id,
+                    email=email,
+                    password=password,
+                    provider=prov,
+                    status="active",
+                )
+            )
+
+        ok_count += 1
+        if gmail_only:
+            details.append(f"✅ <code>{_e(email)}</code>")
+        else:
+            details.append(f"✅ <code>{_e(email)}</code> — добавлен ({_e(prov)})")
+        await _edit_add_progress(status_msg, current=i, total=total, ok=ok_count, fail=fail_count)
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    return ok_count, fail_count, details
+
 
 def _filtered(accounts: List[EmailAccount], status_filter: str) -> List[EmailAccount]:
     sf = (status_filter or "all").lower().strip()
@@ -322,10 +446,6 @@ async def quick_gmail_creds(message: Message, state: FSMContext) -> None:
     if not lines:
         return await message.answer("Не вижу строк. Формат: <code>login@gmail.com:пароль</code>", parse_mode="HTML")
 
-    ok_count = 0
-    fail_count = 0
-    details: List[str] = []
-
     async with Session() as session:
         user = await get_user(session, message.from_user.id)
         if not user:
@@ -335,58 +455,9 @@ async def quick_gmail_creds(message: Message, state: FSMContext) -> None:
             await session.refresh(user)
 
         user.sender_name = sender_name
-
-        for line in lines:
-            if ":" not in line:
-                fail_count += 1
-                details.append(f"❌ <code>{_e(line)}</code> — нет <code>:</code>")
-                continue
-
-            email, password = line.split(":", 1)
-            email = email.strip()
-            password = password.strip()
-
-            if not _is_gmail_address(email):
-                fail_count += 1
-                details.append(f"❌ <code>{_e(email)}</code> — только @gmail.com / @googlemail.com")
-                continue
-
-            if not email or not password:
-                fail_count += 1
-                details.append(f"❌ <code>{_e(line)}</code> — пустой email или пароль")
-                continue
-
-            ok, provider, err = check_imap_credentials(email, password)
-            if not ok:
-                fail_count += 1
-                details.append(f"❌ <code>{_e(email)}</code> — {_e(err or 'ошибка IMAP')}")
-                continue
-
-            existing_res = await session.execute(
-                select(EmailAccount).where(
-                    EmailAccount.user_id == user.id,
-                    EmailAccount.email == email,
-                )
-            )
-            existing = existing_res.scalar_one_or_none()
-            if existing:
-                existing.password = password
-                existing.provider = provider or "gmail"
-                existing.status = "active"
-            else:
-                session.add(
-                    EmailAccount(
-                        user_id=user.id,
-                        email=email,
-                        password=password,
-                        provider=provider or "gmail",
-                        status="active",
-                    )
-                )
-
-            ok_count += 1
-            details.append(f"✅ <code>{_e(email)}</code>")
-
+        ok_count, fail_count, details = await _bulk_add_accounts(
+            message, session, user, lines, gmail_only=True,
+        )
         await session.commit()
 
     await state.clear()
@@ -396,7 +467,7 @@ async def quick_gmail_creds(message: Message, state: FSMContext) -> None:
         f"Имя отправителя: <b>{_e(sender_name)}</b>\n"
         f"Аккаунтов добавлено: <b>{ok_count}</b>\n"
         f"Ошибок: <b>{fail_count}</b>\n\n"
-        + "\n".join(details)
+        + _trim_details(details)
     )
     await message.answer(summary, parse_mode="HTML")
     await render_accounts_menu(message, message.from_user.id, page=1, status_filter="all")
@@ -424,10 +495,6 @@ async def process_accounts_input(message: Message, state: FSMContext) -> None:
         await message.answer("Я не увидел ни одной строки с аккаунтом. Попробуй ещё раз.")
         return
 
-    ok_count = 0
-    fail_count = 0
-    details: List[str] = []
-
     async with Session() as session:
         user = await get_user(session, message.from_user.id)
         if not user:
@@ -436,54 +503,15 @@ async def process_accounts_input(message: Message, state: FSMContext) -> None:
             await session.commit()
             await session.refresh(user)
 
-        for line in lines:
-            if ":" not in line:
-                fail_count += 1
-                details.append(f"❌ <code>{_e(line)}</code> — нет разделителя <code>:</code>")
-                continue
-
-            email, password = line.split(":", 1)
-            email = email.strip()
-            password = password.strip()
-
-            if not email or not password:
-                fail_count += 1
-                details.append(f"❌ <code>{_e(line)}</code> — пустой email или пароль")
-                continue
-
-            ok, provider, err = check_imap_credentials(email, password)
-            if not ok:
-                fail_count += 1
-                details.append(f"❌ <code>{_e(email)}</code> — {_e(err or 'ошибка при входе')}")
-                continue
-
-            existing_res = await session.execute(
-                select(EmailAccount).where(
-                    EmailAccount.user_id == user.id,
-                    EmailAccount.email == email,
-                )
-            )
-            existing = existing_res.scalar_one_or_none()
-            if existing:
-                existing.password = password
-                existing.provider = provider
-                existing.status = "active"
-            else:
-                acc = EmailAccount(
-                    user_id=user.id,
-                    email=email,
-                    password=password,
-                    provider=provider,
-                    status="active",
-                )
-                session.add(acc)
-
-            ok_count += 1
-            details.append(f"✅ <code>{_e(email)}</code> — добавлен ({_e(provider or '')})")
-
+        ok_count, fail_count, details = await _bulk_add_accounts(
+            message, session, user, lines, gmail_only=False,
+        )
         await session.commit()
 
-    summary = f"Готово.\n\nУспешно: {ok_count}\nОшибок: {fail_count}\n\n" + "\n".join(details)
+    summary = (
+        f"Готово.\n\nУспешно: {ok_count}\nОшибок: {fail_count}\n\n"
+        + _trim_details(details)
+    )
     await message.answer(summary, parse_mode="HTML")
 
     await state.clear()

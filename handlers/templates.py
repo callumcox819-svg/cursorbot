@@ -398,9 +398,53 @@ class PresetAdd(StatesGroup):
     text = State()
 
 
+_PRESETS_MENU_TEXT = "🧾 <b>Пресеты</b>\n\nВыберите действие:"
+_SMART_PRESETS_MENU_TEXT = "📄 <b>Умные пресеты</b>\n\nВыберите действие:"
+
+
+async def _restore_presets_menu(message: Message, state_data: dict) -> bool:
+    chat_id = state_data.get("_menu_chat_id")
+    msg_id = state_data.get("_menu_msg_id")
+    if not chat_id or not msg_id:
+        return False
+    try:
+        await message.bot.edit_message_text(
+            _PRESETS_MENU_TEXT,
+            chat_id=int(chat_id),
+            message_id=int(msg_id),
+            reply_markup=presets_menu_kb(),
+            parse_mode="HTML",
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _restore_smart_presets_menu(message: Message, state_data: dict) -> bool:
+    chat_id = state_data.get("_menu_chat_id")
+    msg_id = state_data.get("_menu_msg_id")
+    if not chat_id or not msg_id:
+        return False
+    try:
+        await message.bot.edit_message_text(
+            _SMART_PRESETS_MENU_TEXT,
+            chat_id=int(chat_id),
+            message_id=int(msg_id),
+            reply_markup=smart_presets_menu_kb(),
+            parse_mode="HTML",
+        )
+        return True
+    except Exception:
+        return False
+
+
 @router.callback_query(F.data == "tmpl_add")
 async def tmpl_add_start(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PresetAdd.title)
+    await state.update_data(
+        _menu_chat_id=call.message.chat.id,
+        _menu_msg_id=call.message.message_id,
+    )
     await call.message.answer("Введите название пресета:")
     await call.answer()
 
@@ -431,10 +475,10 @@ async def tmpl_add_text(message: Message, state: FSMContext) -> None:
     items.append(TemplateItem(title=title, text=body))
     save_templates(int(user.telegram_id), items)
 
-    await message.answer(
-        "✅ Пресет добавлен.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="presets_menu")]]),
-    )
+    restored = await _restore_presets_menu(message, data)
+    await message.answer("✅ Текст добавлен.")
+    if not restored:
+        await message.answer(_PRESETS_MENU_TEXT, reply_markup=presets_menu_kb(), parse_mode="HTML")
 
 
 @router.callback_query(F.data == "tmpl_rm_menu")
@@ -515,7 +559,7 @@ def smart_templates_delete_kb(idx: int) -> InlineKeyboardMarkup:
 @router.callback_query(F.data == "smart_presets_menu")
 async def smart_presets_menu(call: CallbackQuery) -> None:
     await call.message.edit_text(
-        "📄 <b>Умные пресеты</b>\n\nВыберите действие:",
+        _SMART_PRESETS_MENU_TEXT,
         reply_markup=smart_presets_menu_kb(),
         parse_mode="HTML",
     )
@@ -535,6 +579,10 @@ async def smart_presets_list(call: CallbackQuery) -> None:
 @router.callback_query(F.data == "stmpl_add")
 async def stmpl_add_start(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SmartTmplAdd.title)
+    await state.update_data(
+        _menu_chat_id=call.message.chat.id,
+        _menu_msg_id=call.message.message_id,
+    )
     await call.message.answer("Введите название пресета:")
     await call.answer()
 
@@ -564,7 +612,11 @@ async def stmpl_add_text(message: Message, state: FSMContext) -> None:
     items = load_smart_templates(int(user.telegram_id))
     items.append(TemplateItem(title=title, text=text))
     save_smart_templates(int(user.telegram_id), items)
-    await message.answer("✅ Пресет добавлен.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="smart_presets_menu")]]))
+
+    restored = await _restore_smart_presets_menu(message, data)
+    await message.answer("✅ Текст добавлен.")
+    if not restored:
+        await message.answer(_SMART_PRESETS_MENU_TEXT, reply_markup=smart_presets_menu_kb(), parse_mode="HTML")
 
 
 @router.callback_query(F.data == "stmpl_delall")
