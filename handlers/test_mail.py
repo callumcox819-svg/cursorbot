@@ -12,6 +12,7 @@ from database import async_session
 from models import EmailAccount, Offer, OfferEmail, User
 from sqlalchemy import select, func
 from services.smtp_proxy_send import send_email_via_account_with_proxy
+from handlers.templates import pick_random_smart_preset
 from handlers.first_sms import pick_random_first_sms
 
 router = Router()
@@ -91,7 +92,9 @@ async def test_mail_send(message: Message, state: FSMContext):
         offer_title = title_row[0] if title_row and title_row[0] else ""
 
     subject = random.choice(TEST_SUBJECTS)
-    body = await pick_random_first_sms(message.from_user.id, offer_title)
+    body = await pick_random_smart_preset(message.from_user.id, offer_title)
+    if not (body or "").strip():
+        body = await pick_random_first_sms(message.from_user.id, offer_title)
 
     try:
         async with async_session() as session_proxy:

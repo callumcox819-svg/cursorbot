@@ -104,18 +104,49 @@ async def save_templates(tg_id: int, items: List[TemplateItem]) -> None:
     await save_json_blob(int(tg_id), "templates", data)
 
 
-async def load_smart_templates(tg_id: int) -> List[TemplateItem]:
+def _smart_texts_from_json(data: object) -> List[str]:
+    out: List[str] = []
+    for x in data if isinstance(data, list) else []:
+        if isinstance(x, str):
+            txt = x.strip()
+        elif isinstance(x, dict):
+            txt = str(x.get("text", "")).strip() or str(x.get("title", "")).strip()
+        else:
+            txt = str(x).strip()
+        if txt:
+            out.append(txt[:MAX_TEXT_LEN])
+    return out
+
+
+async def load_smart_texts(tg_id: int) -> List[str]:
     from services.user_json_store import load_json_blob
 
     data = await load_json_blob(int(tg_id), "smart_templates", default=[])
-    return _items_from_json(data)
+    return _smart_texts_from_json(data)
 
 
-async def save_smart_templates(tg_id: int, items: List[TemplateItem]) -> None:
+async def save_smart_texts(tg_id: int, texts: List[str]) -> None:
     from services.user_json_store import save_json_blob
 
-    data = [{"title": it.title, "text": it.text} for it in items]
-    await save_json_blob(int(tg_id), "smart_templates", data)
+    clean = [t.strip()[:MAX_TEXT_LEN] for t in texts if (t or "").strip()]
+    await save_json_blob(int(tg_id), "smart_templates", clean)
+
+
+async def pick_random_smart_preset(tg_id: int, offer_title: str) -> str:
+    """Случайный умный пресет: спинтаксис + подстановка OFFER."""
+    import random
+
+    from services.spintax import expand_spintax
+
+    texts = await load_smart_texts(int(tg_id))
+    if not texts:
+        return ""
+    base = texts[random.randrange(len(texts))]
+    txt = expand_spintax(base)
+    title = (offer_title or "").strip()
+    if title:
+        txt = txt.replace("OFFER", title)
+    return txt
 
 
 def _load_templates_sync(tg_id: int) -> List[TemplateItem]:
@@ -189,6 +220,28 @@ def _render_presets(items: List[TemplateItem], header_html: str) -> str:
             f"<u>{title}</u>\n"
             f"<blockquote>{body}</blockquote>"
         )
+    return "\n\n".join(out)
+
+
+def _render_smart_presets(texts: List[str], header_html: str) -> str:
+    if not texts:
+        return (
+            f"{header_html}\n\n"
+            "Пока нет текстов.\n"
+            "Нажми «➕ Добавить пресет» и отправь текст одним сообщением.\n\n"
+            "<b>OFFER</b> — подставится название товара.\n"
+            "<b>Спинтаксис:</b> <code>{Hallo|Hi}</code>\n"
+            "При рассылке бот выбирает текст случайно."
+        )
+    out: List[str] = [f"{header_html}\n"]
+    for i, raw in enumerate(texts[:20], start=1):
+        preview = raw.strip().replace("\n", " ")
+        if len(preview) > 200:
+            preview = preview[:197] + "…"
+        out.append(f"<b>#{i}</b>\n<blockquote>{escape(preview)}</blockquote>")
+    if len(texts) > 20:
+        out.append(f"\n…и ещё {len(texts) - 20}")
+    out.append("\n<b>OFFER</b> · спинтаксис <code>{a|b}</code> · случайная ротация при рассылке")
     return "\n\n".join(out)
 
 
@@ -388,7 +441,11 @@ class PresetAdd(StatesGroup):
 
 
 _PRESETS_MENU_TEXT = "🧾 <b>Пресеты</b>\n\nВыберите действие:"
-_SMART_PRESETS_MENU_TEXT = "📄 <b>Умные пресеты</b>\n\nВыберите действие:"
+_SMART_PRESETS_MENU_TEXT = (
+    "📄 <b>Умные пресеты</b>\n\n"
+    "Только текст письма — без названия. Несколько вариантов → случайный при каждой рассылке.\n\n"
+    "Выберите действие:"
+)
 
 
 async def _restore_presets_menu(message: Message, state_data: dict) -> bool:
@@ -517,7 +574,6 @@ async def tmpl_rm_do(call: CallbackQuery) -> None:
 # =========================
 
 class SmartTmplAdd(StatesGroup):
-    title = State()
     text = State()
 
 
@@ -559,48 +615,42 @@ async def smart_presets_menu(call: CallbackQuery) -> None:
 async def smart_presets_list(call: CallbackQuery) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
-    items = await load_smart_templates(int(user.telegram_id))
-    text = _render_presets(items, "📄 <b>Ваши умные пресеты:</b>")
+    items = await load_smart_texts(int(user.telegram_id))
+    text = _render_smart_presets(items, "📄 <b>Ваши умные пресеты:</b>")
     await _safe_edit_text(call, text=text, reply_markup=_back_only_kb("smart_presets_menu"), parse_mode="HTML")
     await call.answer()
 
 
 @router.callback_query(F.data == "stmpl_add")
 async def stmpl_add_start(call: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(SmartTmplAdd.title)
+    await state.set_state(SmartTmplAdd.text)
     await state.update_data(
         _menu_chat_id=call.message.chat.id,
         _menu_msg_id=call.message.message_id,
     )
-    await call.message.answer("Введите название пресета:")
+    await call.message.answer(
+        "➕ Отправь <b>текст пресета</b> одним сообщением.\n\n"
+        "<code>OFFER</code> — название товара\n"
+        "Спинтаксис: <code>{Hallo|Hi}</code>",
+        parse_mode="HTML",
+    )
     await call.answer()
-
-
-@router.message(SmartTmplAdd.title)
-async def stmpl_add_title(message: Message, state: FSMContext) -> None:
-    title = (message.text or "").strip()[:MAX_TITLE_LEN]
-    if not title:
-        return await message.answer("Название не может быть пустым. Введите ещё раз:")
-    await state.update_data(title=title)
-    await state.set_state(SmartTmplAdd.text)
-    await message.answer("Отправьте текст пресета:")
 
 
 @router.message(SmartTmplAdd.text)
 async def stmpl_add_text(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()[:MAX_TEXT_LEN]
-    if not text:
-        return await message.answer("Текст не может быть пустым. Отправьте ещё раз:")
+    if len(text) < 2:
+        return await message.answer("Текст слишком короткий. Отправь ещё раз.")
     data = await state.get_data()
-    title = str(data.get("title") or "").strip()[:MAX_TITLE_LEN]
     await state.clear()
 
     async with Session() as session:
         user = await get_or_create_user(session, message.from_user.id)
 
-    items = await load_smart_templates(int(user.telegram_id))
-    items.append(TemplateItem(title=title, text=text))
-    await save_smart_templates(int(user.telegram_id), items)
+    items = await load_smart_texts(int(user.telegram_id))
+    items.append(text)
+    await save_smart_texts(int(user.telegram_id), items)
 
     restored = await _restore_smart_presets_menu(message, data)
     await message.answer("✅ Текст добавлен.")
@@ -612,7 +662,7 @@ async def stmpl_add_text(message: Message, state: FSMContext) -> None:
 async def stmpl_delete_all(call: CallbackQuery) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
-    await save_smart_templates(int(user.telegram_id), [])
+    await save_smart_texts(int(user.telegram_id), [])
     await smart_presets_menu(call)
 
 
@@ -624,10 +674,16 @@ async def stmpl_delete_ask(call: CallbackQuery) -> None:
         return await call.answer()
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
-    items = await load_smart_templates(int(user.telegram_id))
+    items = await load_smart_texts(int(user.telegram_id))
     if idx < 0 or idx >= len(items):
         return await call.answer()
-    await _safe_edit_text(call, text=f"Удалить пресет <b>{items[idx].title}</b>?", reply_markup=smart_templates_delete_kb(idx), parse_mode="HTML")
+    preview = escape(items[idx][:120] + ("…" if len(items[idx]) > 120 else ""))
+    await _safe_edit_text(
+        call,
+        text=f"Удалить этот пресет?\n\n<blockquote>{preview}</blockquote>",
+        reply_markup=smart_templates_delete_kb(idx),
+        parse_mode="HTML",
+    )
     await call.answer()
 
 
@@ -639,10 +695,10 @@ async def stmpl_delete_ok(call: CallbackQuery) -> None:
         return await call.answer()
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
-    items = await load_smart_templates(int(user.telegram_id))
+    items = await load_smart_texts(int(user.telegram_id))
     if 0 <= idx < len(items):
         items.pop(idx)
-        await save_smart_templates(int(user.telegram_id), items)
+        await save_smart_texts(int(user.telegram_id), items)
     await smart_presets_list(call)
 
 
