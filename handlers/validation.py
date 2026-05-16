@@ -21,7 +21,7 @@ from services.validemail_validator import ValidationConfig, validate_offers
 router = Router()
 
 REPLACE_OLD_FOR_USER = True
-REQUIRE_FIRST_AND_LAST = True
+REQUIRE_FIRST_AND_LAST = False
 PROGRESS_UPDATE_INTERVAL = 20  # seconds
 
 
@@ -106,17 +106,16 @@ _WORD_RE = re.compile(r"[A-Za-zÀ-ÿ0-9]+")
 
 
 def _normalize_person_name(raw_name: str) -> str:
-    """Привести сырой seller-name к виду 'First Last', если получается."""
+    """Нормализовать имя продавца для отображения (1+ слово)."""
     s = (raw_name or "").strip()
     if not s:
         return ""
-    # вытащить слова
     words = _WORD_RE.findall(s)
-    if len(words) < 2:
-        return ""
-    first = words[0]
-    last = words[-1]
-    return f"{first} {last}"
+    if not words:
+        return s
+    if len(words) == 1:
+        return words[0]
+    return f"{words[0]} {words[-1]}"
 
 
 def _normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -233,22 +232,15 @@ async def validation_handler(message: Message):
         return await status_msg.edit_text("❌ В файле не найдено записей.")
 
     # --- UI статистика (не влияет на логику валидации) ---
-    def _looks_like_first_last(name: str) -> bool:
-        # максимально мягкая проверка для статистики: минимум 2 нормальных токена
-        parts = [p for p in re.split(r"\s+", (name or "").strip()) if p]
-        parts = [p.strip(".,;:()[]{}<>\"'\u2019\u2018") for p in parts]
-        parts = [p for p in parts if p]
-        if len(parts) < 2:
-            return False
-        # игнорируем очевидные "компании" и мусор
-        good = [p for p in parts if any(ch.isalpha() for ch in p) and len(p) >= 2]
-        return len(good) >= 2
+    def _has_any_name(name: str) -> bool:
+        good = [p for p in _WORD_RE.findall(name or "") if len(p) >= 2]
+        return len(good) >= 1
 
     total_offers = len(items)
     offers_with_name = sum(
         1
         for it in items
-        if _looks_like_first_last(
+        if _has_any_name(
             str(
                 it.get("item_person_name")
                 or it.get("person_name")
@@ -259,18 +251,13 @@ async def validation_handler(message: Message):
         )
     )
 
-    # показываем пользователю, сколько объявлений реально попадёт под правило First+Last
     try:
-        if REQUIRE_FIRST_AND_LAST:
-            await status_msg.edit_text(
-                "📥 Файл принят. Подготавливаю данные…\n"
-                f"Найдено (Имя+Фамилия): {offers_with_name}/{total_offers}"
-            )
-        else:
-            await status_msg.edit_text(
-                "📥 Файл принят. Подготавливаю данные…\n"
-                f"Всего объявлений: {total_offers}"
-            )
+        await status_msg.edit_text(
+            "📥 Файл принят. Подготавливаю данные…\n"
+            f"Всего объявлений: <b>{total_offers}</b>\n"
+            f"С именем продавца: <b>{offers_with_name}</b>",
+            parse_mode="HTML",
+        )
     except Exception:
         pass
 
@@ -347,6 +334,7 @@ async def validation_handler(message: Message):
         concurrency=max(4, int(getattr(config, "VALIDEMAIL_CONCURRENCY", 12) or 12)),
         max_emails_per_seller=2,
         require_first_and_last=REQUIRE_FIRST_AND_LAST,
+        max_len=32,
     )
 
     n_keys = len(api_keys)
@@ -356,7 +344,7 @@ async def validation_handler(message: Message):
         parse_mode="HTML",
     )
 
-    # st обновляется только через progress_cb (done/total/limit/in_use)
+    live_stats: dict = {}
     state = {
         "done": 0,
         "total": 0,
@@ -392,86 +380,75 @@ async def validation_handler(message: Message):
             return f"{h}ч {m:02d}м"
         return f"{m}м {s:02d}с"
 
-    async def _progress_updater(msg: Message, st: dict, stop: asyncio.Event):
+    async def _progress_updater(
+        msg: Message, st: dict, stop: asyncio.Event, vstats: dict
+    ) -> None:
         while not stop.is_set():
             done = int(st.get("done", 0) or 0)
             total = int(st.get("total", 0) or 0)
             limit = int(st.get("limit", 0) or 0)
             in_use = int(st.get("in_use", 0) or 0)
-            offers_total_ = int(st.get("offers_total", 0) or 0)
-            offers_with_name_ = int(st.get("offers_with_name", 0) or 0)
+            offers_total_ = int(vstats.get("offers_total") or st.get("offers_total") or 0)
+            validated_ = int(vstats.get("offers_validated") or 0)
+            remaining_ = int(
+                vstats.get("offers_remaining")
+                if vstats.get("offers_remaining") is not None
+                else max(0, offers_total_ - validated_)
+            )
+            eligible_ = int(vstats.get("offers_eligible") or st.get("offers_with_name") or 0)
 
+            bar, pct = ("", 0)
             if total > 0:
                 bar, pct = _progress_bar(done, total)
-                elapsed = max(0.1, time.time() - float(st.get("t0") or time.time()))
-                rate = done / elapsed if done > 0 else 0.0
-                eta = (total - done) / rate if rate > 0 else 0
+            elapsed = max(0.1, time.time() - float(st.get("t0") or time.time()))
+            rate = done / elapsed if done > 0 else 0.0
+            eta = (total - done) / rate if total > 0 and rate > 0 else 0
 
-                text = (
-                    "📬 Подбор почт по именам (раунды)\n\n"
-                    f"{bar} {pct}%\n\n"
-                    f"Найдено: {offers_with_name_}/{offers_total_}\n"
-                    f"Проверено email: {done}/{total}\n"
+            text = (
+                "🔎 <b>Валидация email</b>\n\n"
+                f"👁 Просмотрено: <b>{offers_total_}</b>\n"
+                f"📝 С именем (проверяем): <b>{eligible_}</b>\n"
+                f"✅ Валидировано: <b>{validated_}</b>\n"
+                f"⏳ Осталось: <b>{remaining_}</b>\n"
+            )
+            if total > 0:
+                text += (
+                    f"\n{bar} {pct}%\n"
+                    f"Проверено адресов: {done}/{total}\n"
                     f"ETA: ~{_fmt_eta(eta)}\n"
-                    f"Активных потоков: {in_use}/{(limit or 0)}"
+                    f"Потоков: {in_use}/{(limit or 0)}"
                 )
-                if text != st.get("last_text"):
-                    try:
-                        await msg.edit_text(text)
-                        st["last_text"] = text
-                    except Exception:
-                        pass
+            if text != st.get("last_text"):
+                try:
+                    await msg.edit_text(text, parse_mode="HTML")
+                    st["last_text"] = text
+                except Exception:
+                    pass
             await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
 
-    updater = asyncio.create_task(_progress_updater(progress_msg, state, stop_evt))
+    updater = asyncio.create_task(
+        _progress_updater(progress_msg, state, stop_evt, live_stats)
+    )
 
     try:
-        validated = await validate_offers(items, domains, cfg, progress_cb=_progress_cb)
+        validated = await validate_offers(
+            items, domains, cfg, progress_cb=_progress_cb, stats=live_stats
+        )
     finally:
         stop_evt.set()
         await updater
 
+    validated_count = len(validated or [])
+    remaining_final = max(0, total_offers - validated_count)
 
-    # Если файл пришёл от внешнего парсера, имя продавца может быть без "First Last".
-    # В таком случае при require_first_and_last=True валидатор может отфильтровать всё.
-    # Делаем один безопасный ретрай с ослабленным правилом (только если результатов 0).
-    if not validated and getattr(cfg, "require_first_and_last", False):
-        try:
-            await progress_msg.edit_text("🔁 0 результатов. Повторяю без требования First/Last…")
-        except Exception:
-            pass
-        cfg_relaxed = ValidationConfig(
-            validemail_api_keys=cfg.validemail_api_keys,
-            concurrency=cfg.concurrency,
-            max_emails_per_seller=cfg.max_emails_per_seller,
-            require_first_and_last=False,
-        )
-        stop_evt2 = asyncio.Event()
-        state2 = {
-            "done": 0,
-            "total": 0,
-            "limit": 0,
-            "in_use": 0,
-            "t0": time.time(),
-            "offers_total": total_offers,
-            "offers_with_name": offers_with_name,
-            "last_text": "",
-        }
-
-        def _progress_cb2(done: int, total: int, limit: int, in_use: int) -> None:
-            state2["done"] = int(done or 0)
-            state2["total"] = int(total or 0)
-            state2["limit"] = int(limit or 0)
-            state2["in_use"] = int(in_use or 0)
-
-        updater2 = asyncio.create_task(_progress_updater(progress_msg, state2, stop_evt2))
-        try:
-            validated = await validate_offers(items, domains, cfg_relaxed, progress_cb=_progress_cb2)
-        finally:
-            stop_evt2.set()
-            await updater2
     if not validated:
-        return await progress_msg.edit_text("✅ Валидация завершена: 0 результатов.")
+        return await progress_msg.edit_text(
+            "✅ Валидация завершена: 0 результатов.\n\n"
+            f"👁 Просмотрено: {total_offers}\n"
+            f"✅ Валидировано: 0\n"
+            f"⏳ Осталось: {total_offers}",
+            parse_mode="HTML",
+        )
 
     await progress_msg.edit_text("💾 Сохраняю в базу…")
 
@@ -603,5 +580,10 @@ async def validation_handler(message: Message):
 
     await message.answer_document(
         FSInputFile(out_path),
-        caption=f"✅ Валидировано: {len(output)}\n📧 Email сохранено: {saved_email_count}",
+        caption=(
+            f"👁 Просмотрено: {total_offers}\n"
+            f"✅ Валидировано: {len(output)}\n"
+            f"⏳ Без email: {remaining_final}\n"
+            f"📧 Email сохранено: {saved_email_count}"
+        ),
     )

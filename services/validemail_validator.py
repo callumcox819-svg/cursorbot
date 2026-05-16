@@ -31,8 +31,8 @@ class ValidationConfig:
     concurrency: int = 12
     max_emails_per_seller: int = 4
     min_len: int = 3
-    max_len: int = 12
-    require_first_and_last: bool = True
+    max_len: int = 32
+    require_first_and_last: bool = False
 
     user_blacklist: list[str] | None = None
     use_ssl_verify: bool = True
@@ -62,53 +62,64 @@ def _normalize_name(raw: str) -> str:
 _ALPHA_TOKEN_RE = re.compile(r"[A-Za-z]{2,}", re.UNICODE)
 
 
-def _pick_first_last_alpha_tokens(name: str) -> tuple[str, str]:
-    """
-    Берём ПЕРВЫЙ и ПОСЛЕДНИЙ нормальные буквенные токены (>=2 букв).
-    Это чинит кейсы, когда в конце мусор типа: "8 Monate alt", "GmbH", "iPhone App".
-    """
+def _pick_alpha_tokens(name: str) -> list[str]:
+    """Буквенные токены имени (>=2 букв), без мусора в конце строки."""
     s = _normalize_name(name)
     if not s:
-        return "", ""
+        return []
 
-    # превращаем всё в пробелы кроме букв/цифр/дефиса/пробела/точки
-    # но для отбора токенов берём только буквенные сегменты
     s2 = re.sub(r"[^A-Za-z0-9\.\s-]", " ", s)
     parts = [p for p in re.split(r"\s+", s2.strip()) if p]
 
     alpha: list[str] = []
     for p in parts:
-        # забираем только буквенную часть
         m = _ALPHA_TOKEN_RE.search(p)
         if m:
             alpha.append(m.group(0))
+    return alpha
 
-    if len(alpha) < 2:
+
+def _pick_first_last_alpha_tokens(name: str) -> tuple[str, str]:
+    tokens = _pick_alpha_tokens(name)
+    if len(tokens) < 2:
         return "", ""
+    return tokens[0], tokens[-1]
 
-    return alpha[0], alpha[-1]
+
+def _name_is_usable(name: str, *, require_first_and_last: bool) -> bool:
+    tokens = _pick_alpha_tokens(name)
+    if require_first_and_last:
+        return len(tokens) >= 2
+    return len(tokens) >= 1
 
 
 def _name_has_first_last(name: str) -> bool:
+    return _name_is_usable(name, require_first_and_last=True)
+
+
+def _make_local_part_from_name(name: str, *, require_first_and_last: bool) -> str:
     """
-    Реальное 'Имя Фамилия':
-      - минимум 2 нормальных буквенных токена (>=2 букв)
+    local-part для email: first.last или одно слово, если фамилии нет.
     """
-    first, last = _pick_first_last_alpha_tokens(name)
-    return bool(first and last)
+    tokens = _pick_alpha_tokens(name)
+    if require_first_and_last:
+        if len(tokens) < 2:
+            return ""
+        first, last = tokens[0], tokens[-1]
+        local = f"{first}.{last}"
+    else:
+        if not tokens:
+            return ""
+        if len(tokens) == 1:
+            local = tokens[0]
+        else:
+            local = f"{tokens[0]}.{tokens[-1]}"
+    local = re.sub(r"\.+", ".", local).strip(".")
+    return local.lower()
 
 
 def _make_local_part_first_last(name: str) -> str:
-    """
-    Делает local part вида first.last из первого и последнего нормальных токенов.
-    """
-    first, last = _pick_first_last_alpha_tokens(name)
-    if not first or not last:
-        return ""
-
-    local = f"{first}.{last}"
-    local = re.sub(r"\.+", ".", local).strip(".")
-    return local.lower()
+    return _make_local_part_from_name(name, require_first_and_last=True)
 
 
 def _is_blacklisted(name: str, user_blacklist: Iterable[str] | None) -> bool:
@@ -188,6 +199,7 @@ async def _validate_offers_old(
     cfg: ValidationConfig,
     *,
     progress_cb: ProgressCb | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     # домены: uniq + clean (сохраняем порядок = приоритет)
     domains_clean: list[str] = []
@@ -201,8 +213,22 @@ async def _validate_offers_old(
         return []
 
     user_blacklist = cfg.user_blacklist or []
+    require_fl = bool(cfg.require_first_and_last)
 
-    # 1) подготовка офферов (строго Имя Фамилия + blacklist + длина)
+    if stats is not None:
+        stats.clear()
+        stats.update(
+            {
+                "offers_total": len(items),
+                "offers_eligible": 0,
+                "offers_validated": 0,
+                "offers_remaining": len(items),
+                "emails_checked": 0,
+                "emails_total": 0,
+            }
+        )
+
+    # 1) подготовка офферов (имя из JSON + blacklist + длина local-part)
     prepared: list[dict[str, Any]] = []
     for it in items:
         if not isinstance(it, dict):
@@ -216,13 +242,12 @@ async def _validate_offers_old(
             or ""
         ).strip()
 
-        # ✅ берём first+last нормальные токены (как было)
-        if cfg.require_first_and_last and not _name_has_first_last(raw_name):
+        if not _name_is_usable(raw_name, require_first_and_last=require_fl):
             continue
         if _is_blacklisted(raw_name, user_blacklist):
             continue
 
-        local = _make_local_part_first_last(raw_name)
+        local = _make_local_part_from_name(raw_name, require_first_and_last=require_fl)
         if not local:
             continue
 
@@ -240,6 +265,10 @@ async def _validate_offers_old(
             "photo": str(it.get("item_photo") or it.get("photo") or it.get("image") or "").strip(),
         })
 
+    if stats is not None:
+        stats["offers_eligible"] = len(prepared)
+        stats["offers_remaining"] = max(0, int(stats.get("offers_total", 0)) - 0)
+
     if not prepared:
         return []
 
@@ -253,6 +282,9 @@ async def _validate_offers_old(
     # общий прогресс (примерный): максимум prepared*domains
     overall_total = len(prepared) * len(domains_clean)
     overall_done = 0
+
+    if stats is not None:
+        stats["emails_total"] = overall_total
 
     limit = max(2, int(cfg.concurrency))
     if progress_cb:
@@ -309,6 +341,12 @@ async def _validate_offers_old(
 
         # считаем, что батч "проверен"
         overall_done += len(batch_emails)
+
+        if stats is not None:
+            stats["emails_checked"] = overall_done
+            stats["offers_validated"] = sum(1 for f in found_by_idx if f)
+            total_o = int(stats.get("offers_total") or 0)
+            stats["offers_remaining"] = max(0, total_o - int(stats["offers_validated"]))
 
         for e, ok, _raw in results:
             if not ok:
@@ -497,6 +535,9 @@ async def validate_offers(*args, **kwargs):
         domains = args[1]
         cfg = args[2]
         progress_cb = kwargs.get("progress_cb")
-        return await _validate_offers_old(items, domains, cfg, progress_cb=progress_cb)
+        stats = kwargs.get("stats")
+        return await _validate_offers_old(
+            items, domains, cfg, progress_cb=progress_cb, stats=stats
+        )
 
     raise TypeError("validate_offers(): unsupported call signature")
