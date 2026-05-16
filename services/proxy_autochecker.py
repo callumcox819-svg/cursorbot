@@ -7,7 +7,8 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-TEST_URL = "https://api.ipify.org?format=json"
+# Те же эндпоинты, что при добавлении прокси (handlers / proxy_verify).
+TEST_URL = "http://httpbin.org/ip"
 
 
 async def _tcp_probe(host: str, port: int, timeout: int = 3) -> Tuple[bool, Optional[str]]:
@@ -101,9 +102,10 @@ async def _check_socks_proxy(proxy_url: str, timeout: int = 10) -> Tuple[bool, O
 
 
 async def test_proxy(proxy: str, timeout: int = 10) -> ProxyCheckResult:
+    from services.proxy_verify import test_proxy_url
+
     proxy = (proxy or "").strip()
     kind = _detect_kind(proxy)
-
     if kind == "unknown":
         return ProxyCheckResult(
             proxy=proxy,
@@ -112,12 +114,8 @@ async def test_proxy(proxy: str, timeout: int = 10) -> ProxyCheckResult:
             error="Proxy must start with http:// or socks5://",
         )
 
-    if kind == "http":
-        ok, err, ip = await _check_http_proxy(proxy, timeout=timeout)
-        return ProxyCheckResult(proxy=proxy, ok=ok, kind="http", error=err, ip=ip)
-
-    ok, err, ip = await _check_socks_proxy(proxy, timeout=timeout)
-    return ProxyCheckResult(proxy=proxy, ok=ok, kind="socks5", error=err, ip=ip)
+    ok, err = await test_proxy_url(proxy, timeout=timeout)
+    return ProxyCheckResult(proxy=proxy, ok=ok, kind=kind, error=None if ok else err, ip=None)
 
 
 async def autocheck_proxies(

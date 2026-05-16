@@ -1,7 +1,7 @@
 import random
 from typing import Optional
 
-from sqlalchemy import select, update, delete
+from sqlalchemy import select, update, delete, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Proxy

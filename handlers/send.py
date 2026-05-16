@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 from typing import List, Optional, Tuple
 
@@ -33,9 +34,10 @@ from services.sending_state import get_state as _get_sending_state
 from services.sending_state import set_state as _set_sending_state
 from services.settings import load_timing
 from services.proxy_manager import choose_proxy_for_user
-from services.proxy_autochecker import autocheck_proxies
+from services.proxy_verify import refresh_proxies_status
 
 router = Router(name="send")
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -269,48 +271,27 @@ async def start_sending(message: Message, fast: bool = False):
             )
             return
 
-        # ✅ Авто-проверка прокси перед стартом (как в референс-боте из видео)
-        # Если прокси невалидные — удаляем их из БД, чтобы не мешали рассылке.
+        # Авто-проверка перед стартом: обновляем is_active, прокси не удаляем.
         try:
-            proxies = (
-                await session.execute(select(Proxy).where(Proxy.user_id == db_user_id))
-            ).scalars().all()
-
-            def _to_url(p: Proxy) -> str:
-                kind = (p.type or "http").strip().lower() or "http"
-                auth = ""
-                if (p.username or "") and (p.password or ""):
-                    auth = f"{p.username}:{p.password}@"
-                return f"{kind}://{auth}{p.host}:{int(p.port)}"
-
-            urls = [_to_url(p) for p in proxies if p and p.host and p.port]
-            if urls:
-                results = await autocheck_proxies(urls, concurrency=20, timeout=10)
-
-                bad_set = {r.proxy for r in results if not r.ok}
-                if bad_set:
-                    bad_ids: list[int] = []
-                    for p in proxies:
-                        if _to_url(p) in bad_set:
-                            bad_ids.append(int(p.id))
-
-                    if bad_ids:
-                        await session.execute(delete(Proxy).where(Proxy.user_id == db_user_id, Proxy.id.in_(bad_ids)))
-                        await session.commit()
-
-                    await tg_answer_safe(message, "✅ Невалидные прокси были автоматически удалены")
-                else:
-                    await tg_answer_safe(message, "✅ Все прокси валидны")
+            ok_n, fail_n, _total = await refresh_proxies_status(
+                session, db_user_id, concurrency=10, timeout=12
+            )
+            if fail_n and ok_n:
+                await tg_answer_safe(
+                    message,
+                    f"⚠️ Проверка прокси: рабочих {ok_n}, неактивных {fail_n}.",
+                )
+            elif ok_n and not fail_n:
+                await tg_answer_safe(message, "✅ Все прокси прошли проверку.")
         except Exception:
-            # авто-чек не должен ломать запуск рассылки
-            pass
+            logger.exception("proxy pre-check before send failed")
 
         proxy_in_use = await choose_proxy_for_user(session, db_user_id)
         if not proxy_in_use:
             await tg_answer_safe(
                 message,
-                "❌ У вас настроены прокси, но нет активных прокси (is_active=True).\n"
-                "Зайдите в «Прокси» и активируйте хотя бы один прокси.",
+                "❌ Нет рабочих прокси после проверки.\n"
+                "Зайдите в «Прокси» → «Проверить прокси» или добавьте новый.",
                 reply_markup=main_menu_kb(tg_user_id),
             )
             return

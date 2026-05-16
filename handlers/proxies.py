@@ -21,6 +21,7 @@ from sqlalchemy import select
 
 from database import Session
 from models import User, Proxy
+from services.proxy_verify import test_proxy, refresh_proxies_status
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -359,75 +360,6 @@ def parse_proxy_block(text: str) -> Optional[dict]:
 
 
 # ======================
-#  Проверка прокси
-# ======================
-
-async def _test_http_like_proxy(proxy_url: str) -> Tuple[bool, str]:
-    test_urls = [
-        "http://httpbin.org/ip",
-        "http://example.com",
-        "http://icanhazip.com",
-    ]
-    timeout = aiohttp.ClientTimeout(total=10)
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        last_error = "no response"
-        for url in test_urls:
-            try:
-                async with session.get(url, proxy=proxy_url) as resp:
-                    return True, f"HTTP-proxy OK ({resp.status}) via {url}"
-            except Exception as e:
-                last_error = f"{type(e).__name__}: {e} ({url})"
-                logger.warning("HTTP proxy check failed %s via %s", proxy_url, url)
-                continue
-
-    return False, last_error
-
-
-async def _test_socks_proxy(proxy_url: str) -> Tuple[bool, str]:
-    try:
-        from aiohttp_socks import ProxyConnector  # type: ignore
-    except ImportError:
-        return False, "aiohttp_socks не установлен (pip install aiohttp_socks)"
-
-    test_urls = [
-        "http://httpbin.org/ip",
-        "http://example.com",
-    ]
-    timeout = aiohttp.ClientTimeout(total=10)
-    connector = ProxyConnector.from_url(proxy_url)
-
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        last_error = "no response"
-        for url in test_urls:
-            try:
-                async with session.get(url) as resp:
-                    return True, f"SOCKS OK ({resp.status}) via {url}"
-            except Exception as e:
-                last_error = f"{type(e).__name__}: {e} ({url})"
-                logger.warning("SOCKS proxy check failed %s via %s", proxy_url, url)
-                continue
-
-    return False, last_error
-
-
-async def test_proxy(proxy: dict) -> Tuple[bool, str]:
-    proxy_type = _normalize_proxy_type(proxy.get("type"))
-
-    if proxy.get("username") and proxy.get("password"):
-        proxy_url = f"{proxy_type}://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
-    else:
-        proxy_url = f"{proxy_type}://{proxy['host']}:{proxy['port']}"
-
-    if proxy_type in ("http",):
-        return await _test_http_like_proxy(proxy_url)
-    elif proxy_type.startswith("socks"):
-        return await _test_socks_proxy(proxy_url)
-    else:
-        return False, f"Неизвестный тип прокси: {proxy_type}"
-
-
-# ======================
 #  Меню
 # ======================
 
@@ -739,59 +671,25 @@ async def proxies_check_all(callback: CallbackQuery) -> None:
         return await render_proxy_menu(callback, telegram_id)
 
     total = len(proxies)
+    async with Session() as session:
+        user = (
+            await session.execute(select(User).where(User.telegram_id == telegram_id))
+        ).scalar_one_or_none()
+        if not user:
+            return await callback.message.edit_text("❌ Пользователь не найден.")
+        ok_n, fail_n, _ = await refresh_proxies_status(
+            session, int(user.id), concurrency=concurrency, timeout=10
+        )
+
     try:
         await callback.message.edit_text(
-            f"⏳ <b>Проверка прокси</b>\n\n0/{total} · параллельно до {concurrency}",
+            "✅ <b>Проверка завершена</b>\n\n"
+            f"🟢 рабочих: <b>{ok_n}</b> · 🔴 неактивных: <b>{fail_n}</b>\n"
+            "<i>Прокси не удаляются — только статус в списке.</i>",
             parse_mode="HTML",
         )
     except TelegramBadRequest:
         pass
-
-    sem = asyncio.Semaphore(concurrency)
-    progress_lock = asyncio.Lock()
-    done = 0
-    ok_n = 0
-    fail_n = 0
-
-    async def _check_one(proxy: Proxy) -> Tuple[Proxy, bool, str]:
-        nonlocal done, ok_n, fail_n
-        proxy_dict = {
-            "host": proxy.host,
-            "port": proxy.port,
-            "username": proxy.username,
-            "password": proxy.password,
-            "type": proxy.type,
-        }
-        async with sem:
-            ok, info = await test_proxy(proxy_dict)
-        async with progress_lock:
-            done += 1
-            if ok:
-                ok_n += 1
-            else:
-                fail_n += 1
-            snap_done, snap_ok, snap_fail = done, ok_n, fail_n
-        if snap_done == total or snap_done % max(1, total // 5) == 0:
-            try:
-                await callback.message.edit_text(
-                    "⏳ <b>Проверка прокси</b>\n\n"
-                    f"Готово: <b>{snap_done}/{total}</b>\n"
-                    f"🟢 рабочих: <b>{snap_ok}</b> · 🔴 ошибок: <b>{snap_fail}</b>",
-                    parse_mode="HTML",
-                )
-            except TelegramBadRequest:
-                pass
-        return proxy, ok, info
-
-    results = await asyncio.gather(*[_check_one(p) for p in proxies])
-
-    async with Session() as session:
-        for proxy, ok, info in results:
-            row = await session.get(Proxy, proxy.id)
-            if row:
-                row.is_active = ok
-                row.last_error = None if ok else info
-        await session.commit()
 
     await render_proxy_menu(callback, telegram_id)
 
@@ -811,16 +709,8 @@ async def proxy_test(callback: CallbackQuery):
     if not proxy:
         return
 
-    proxy_dict = {
-        "host": proxy.host,
-        "port": proxy.port,
-        "username": proxy.username,
-        "password": proxy.password,
-        "type": proxy.type,
-    }
-
     async def run():
-        ok, info = await test_proxy(proxy_dict)
+        ok, info = await test_proxy(proxy)
 
         async with Session() as session2:
             proxy_db = await session2.get(Proxy, proxy_id)

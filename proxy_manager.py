@@ -5,7 +5,7 @@ import logging
 import random
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, or_
 
 from models import Proxy, UserSetting
 
@@ -45,11 +45,13 @@ async def choose_proxy_for_user(session, user_id: int) -> Optional[Proxy]:
         ).scalar_one_or_none()
         rot_on = str(rot or "0").strip().lower() in {"1", "true", "yes", "on", "y"}
 
+        active_cond = or_(Proxy.is_active.is_(True), Proxy.is_active.is_(None))
+
         if not rot_on:
             q = (
                 select(Proxy)
                 .where(Proxy.user_id == int(user_id))
-                .where(Proxy.is_active.is_(True))
+                .where(active_cond)
                 .order_by(Proxy.id.asc())
                 .limit(1)
             )
@@ -59,7 +61,7 @@ async def choose_proxy_for_user(session, user_id: int) -> Optional[Proxy]:
         q_all = (
             select(Proxy)
             .where(Proxy.user_id == int(user_id))
-            .where(Proxy.is_active.is_(True))
+            .where(active_cond)
         )
         items = (await session.execute(q_all)).scalars().all()
         if not items:
