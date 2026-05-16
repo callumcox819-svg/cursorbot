@@ -883,7 +883,7 @@ async def ref_open_commands(callback: CallbackQuery, state: FSMContext):
         "⌨️ <b>Команды</b>\n\n"
         "/send — запустить рассылку\n"
         "/stop — остановить рассылку\n"
-        "/status — статус\n\n"
+        "/stat — статус рассылки\n\n"
         "Также: просто пришли JSON/TXT с объявлениями — бот провалидирует и сохранит в БД."
     )
     await _safe_send(callback.message.edit_text(

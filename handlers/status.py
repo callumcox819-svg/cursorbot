@@ -134,7 +134,7 @@ async def _collect_db_stats(tg_user_id: int) -> tuple[int, int, int]:
         return int(pending_now), int(accounts_total), int(accounts_active)
 
 
-@router.message(Command("statussend"))
+@router.message(Command("stat", "status", "statussend"))
 @router.message(F.text == "📊 Статус рассылки")
 async def cmd_statussend(message: Message) -> None:
     tg_user_id = message.from_user.id
