@@ -436,6 +436,9 @@ async def validation_handler(message: Message):
         await updater
 
     validated_count = len(validated or [])
+    combos_checked = int(live_stats.get("emails_checked") or 0)
+    combos_valid = int(live_stats.get("combinations_valid") or 0)
+    eligible = int(live_stats.get("offers_eligible") or offers_with_name or 0)
 
     await progress_msg.edit_text(
         "💾 Сохраняю все объявления в базу…\n"
@@ -484,8 +487,10 @@ async def validation_handler(message: Message):
         FSInputFile(out_path),
         caption=(
             f"💾 Сохранено в БД: {offers_saved}/{total_offers}\n"
-            f"✅ С валидным email: {offers_with_email}\n"
-            f"⏳ Без email (данные есть): {max(0, offers_saved - offers_with_email)}\n"
+            f"👤 Имён проверено: {eligible}\n"
+            f"🔎 Комбинаций имя@домен: {combos_checked} (валидных: {combos_valid})\n"
+            f"✅ Продавцов с email: {offers_with_email}\n"
+            f"⏳ Без email (имя есть): {max(0, offers_saved - offers_with_email)}\n"
             f"📧 Email записей: {saved_email_count}"
         ),
     )

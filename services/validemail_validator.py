@@ -18,7 +18,7 @@ from services.validemail_fast import validate_emails_fast
 
 logger = logging.getLogger(__name__)
 
-HARD_BLACKLIST = ["bruno", "pierre", "evelyn", "marco", "peter", "tom", "hans", "claude"]
+# Только пользовательский blacklist из настроек (не режем имена из JSON автоматически).
 DEFAULT_VALIDEMAIL_URL = "https://validemail.co/api/v1/validate"
 
 
@@ -63,19 +63,23 @@ _ALPHA_TOKEN_RE = re.compile(r"[A-Za-z]{2,}", re.UNICODE)
 
 
 def _pick_alpha_tokens(name: str) -> list[str]:
-    """Буквенные токены имени (>=2 букв), без мусора в конце строки."""
+    """Буквенные токены имени (>=2 букв): слова, дефисы, апострофы."""
     s = _normalize_name(name)
     if not s:
         return []
 
-    s2 = re.sub(r"[^A-Za-z0-9\.\s-]", " ", s)
-    parts = [p for p in re.split(r"\s+", s2.strip()) if p]
+    s2 = re.sub(r"[^A-Za-z0-9.\s'\-]", " ", s)
+    parts = re.split(r"[\s\-']+", s2.strip())
 
     alpha: list[str] = []
+    seen: set[str] = set()
     for p in parts:
-        m = _ALPHA_TOKEN_RE.search(p)
-        if m:
-            alpha.append(m.group(0))
+        p = p.strip(".")
+        if len(p) >= 2 and p.isalpha():
+            pl = p.lower()
+            if pl not in seen:
+                seen.add(pl)
+                alpha.append(pl)
     return alpha
 
 
@@ -149,18 +153,13 @@ def _make_local_part_variants(name: str, *, require_first_and_last: bool) -> lis
 
 
 def _is_blacklisted(name: str, user_blacklist: Iterable[str] | None) -> bool:
-    if not name:
-        return True
+    """Только явный blacklist пользователя (полное имя)."""
+    if not name or not user_blacklist:
+        return False
     n = _normalize_name(name).lower()
-    bl = list(HARD_BLACKLIST)
-    if user_blacklist:
-        bl.extend([str(x).strip().lower() for x in user_blacklist if str(x).strip()])
-
-    words = set(re.split(r"\s+", re.sub(r"[^a-z0-9\s-]", " ", n)))
-    for b in bl:
-        if not b:
-            continue
-        if b == n or b in words:
+    for b in user_blacklist:
+        bb = str(b or "").strip().lower()
+        if bb and bb == n:
             return True
     return False
 
@@ -238,6 +237,14 @@ async def _validate_offers_old(
     if not domains_clean:
         return []
 
+    # После фикса парсинга ответа API — не использовать старый кэш с ложными "invalid".
+    try:
+        from services.validemail_fast import _CACHE
+
+        _CACHE.clear()
+    except Exception:
+        pass
+
     user_blacklist = cfg.user_blacklist or []
     require_fl = bool(cfg.require_first_and_last)
 
@@ -251,6 +258,7 @@ async def _validate_offers_old(
                 "offers_remaining": len(items),
                 "emails_checked": 0,
                 "emails_total": 0,
+                "combinations_valid": 0,
             }
         )
 
@@ -376,9 +384,11 @@ async def _validate_offers_old(
             total_o = int(stats.get("offers_total") or 0)
             stats["offers_remaining"] = max(0, total_o - int(stats["offers_validated"]))
 
+        combos_valid = 0
         for e, ok, _raw in results:
             if not ok:
                 continue
+            combos_valid += 1
             key = (e or "").strip().lower()
             idx = email_to_idx.get(key)
             if idx is None:
@@ -386,6 +396,9 @@ async def _validate_offers_old(
             lst = found_by_idx[idx]
             if len(lst) < per_seller_limit and key not in lst:
                 lst.append(key)
+
+        if stats is not None:
+            stats["combinations_valid"] = int(stats.get("combinations_valid") or 0) + combos_valid
 
     # 3) собираем результат
     out_rows: list[dict[str, Any]] = []

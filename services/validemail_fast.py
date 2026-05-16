@@ -69,25 +69,41 @@ async def close_validemail_session() -> None:
 def _normalize_ok(data: object) -> bool:
     """
     Универсальная нормализация под разные ответы ValidEmail.
+    validemail.co: IsValid, State=Deliverable, Score (см. docs).
     """
     if not isinstance(data, dict):
         return False
 
-    # old/simple
-    if data.get("is_valid") is True:
+    # validemail.co / validemail.net (PascalCase)
+    if data.get("IsValid") is True or data.get("isValid") is True:
         return True
-    if data.get("valid") is True:
+    state = str(data.get("State") or data.get("state") or "").lower().strip()
+    if state in ("deliverable", "valid", "ok", "accepted"):
+        return True
+    reason = str(data.get("Reason") or data.get("reason") or "").lower()
+    if "accepted" in reason and "invalid" not in reason:
+        return True
+    try:
+        score = int(data.get("Score") if data.get("Score") is not None else data.get("score") or 0)
+        if score >= 80 and state != "not deliverable":
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    # lowercase / legacy
+    if data.get("is_valid") is True or data.get("valid") is True:
         return True
 
-    # validemail.co / другие
-    status = str(data.get("status") or data.get("result") or "").lower().strip()
+    status = str(
+        data.get("status") or data.get("result") or data.get("State") or ""
+    ).lower().strip()
     if status in ("valid", "ok", "deliverable", "accepted"):
         return True
 
     if data.get("isDeliverable") is True or data.get("is_deliverable") is True or data.get("deliverable") is True:
         return True
 
-    if data.get("smtp_check") is True or data.get("is_valid") is True:
+    if data.get("smtp_check") is True:
         return True
 
     return False
