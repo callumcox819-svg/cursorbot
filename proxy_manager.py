@@ -15,8 +15,12 @@ logger = logging.getLogger(__name__)
 _PROXY_LOCK = asyncio.Lock()
 
 # Оригинальный socket-модуль внутри smtplib (чтобы вернуть назад)
+import socket as _stdlib_socket
 import smtplib as _smtplib
+
 _SMTP_SOCKET_ORIG = _smtplib.socket
+_SMTP_CONNECT_ORIG = None
+_SOCKET_GETADDRINFO_ORIG = None
 
 
 # ----------------------------
@@ -72,6 +76,33 @@ async def choose_proxy_for_user(session, user_id: int) -> Optional[Proxy]:
         return None
 
 
+def _looks_like_ipv6(host: str) -> bool:
+    h = (host or "").strip()
+    if not h or h.startswith("."):
+        return False
+    if h.count(":") >= 2:
+        return True
+    if ":" in h and "." not in h:
+        return True
+    return False
+
+
+def _ensure_smtp_host_ipv4(host: str) -> str:
+    """PySocks не умеет IPv6 — для SMTP только IPv4."""
+    h = (host or "").strip()
+    if not h:
+        return h
+    if _looks_like_ipv6(h):
+        raise OSError(f"PySocks doesn't support IPv6: ({h!r},)")
+    parts = h.split(".")
+    if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+        return h
+    infos = _stdlib_socket.getaddrinfo(h, None, _stdlib_socket.AF_INET, _stdlib_socket.SOCK_STREAM)
+    if not infos:
+        raise OSError(f"No IPv4 address for SMTP host {h!r}")
+    return str(infos[0][4][0])
+
+
 # ----------------------------
 # Low-level: apply/reset proxy ONLY for smtplib
 # ----------------------------
@@ -81,6 +112,8 @@ def apply_proxy_to_smtplib(proxy: Proxy) -> None:
     НЕ трогаем глобальный socket.socket, иначе сломаешь Telegram (aiohttp).
     Мы меняем только smtplib.socket -> socks, через wrapmodule.
     """
+    global _SMTP_CONNECT_ORIG, _SOCKET_GETADDRINFO_ORIG
+
     import socks  # PySocks
     import smtplib
 
@@ -121,8 +154,38 @@ def apply_proxy_to_smtplib(proxy: Proxy) -> None:
         rdns=rdns,
     )
 
-    # ✅ Только smtplib начинает использовать socks.create_connection (без локального getaddrinfo)
+  # Только smtplib → PySocks; DNS только IPv4 (Railway иначе даёт AAAA → падение).
+    if _SMTP_CONNECT_ORIG is None:
+        _SMTP_CONNECT_ORIG = smtplib.SMTP.connect
+
+    def _smtp_connect_ipv4(self, host="", port=0, source_address=None):
+        target = (host or getattr(self, "host", "") or "").strip()
+        if target:
+            target = _ensure_smtp_host_ipv4(target)
+        if source_address is not None:
+            return _SMTP_CONNECT_ORIG(self, target, port, source_address)
+        return _SMTP_CONNECT_ORIG(self, target, port)
+
+    smtplib.SMTP.connect = _smtp_connect_ipv4  # type: ignore[method-assign]
+
+    if _SOCKET_GETADDRINFO_ORIG is None:
+        _SOCKET_GETADDRINFO_ORIG = _stdlib_socket.getaddrinfo
+
+    def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+        return _SOCKET_GETADDRINFO_ORIG(
+            host,
+            port,
+            _stdlib_socket.AF_INET,
+            type or _stdlib_socket.SOCK_STREAM,
+            proto,
+            flags,
+        )
+
+    _stdlib_socket.getaddrinfo = _getaddrinfo_ipv4  # type: ignore[assignment]
+
     socks.wrapmodule(smtplib)
+    if hasattr(smtplib.socket, "getaddrinfo"):
+        smtplib.socket.getaddrinfo = _getaddrinfo_ipv4  # type: ignore[attr-defined]
 
     logger.info("SMTP proxy applied (smtplib only): %s://%s:%s rdns=%s", proxy_type, host, port, rdns)
 
@@ -131,6 +194,8 @@ def reset_smtplib_proxy() -> None:
     """
     Возвращает стандартное поведение smtplib (убирает proxy wrapper).
     """
+    global _SMTP_CONNECT_ORIG, _SOCKET_GETADDRINFO_ORIG
+
     import smtplib
 
     try:
@@ -139,7 +204,12 @@ def reset_smtplib_proxy() -> None:
     except Exception:
         pass
 
-    # ✅ возвращаем smtplib.socket как было (НЕ глобальный socket)
+    if _SMTP_CONNECT_ORIG is not None:
+        smtplib.SMTP.connect = _SMTP_CONNECT_ORIG  # type: ignore[method-assign]
+
+    if _SOCKET_GETADDRINFO_ORIG is not None:
+        _stdlib_socket.getaddrinfo = _SOCKET_GETADDRINFO_ORIG  # type: ignore[assignment]
+
     smtplib.socket = _SMTP_SOCKET_ORIG
 
     logger.info("SMTP proxy reset (smtplib only)")

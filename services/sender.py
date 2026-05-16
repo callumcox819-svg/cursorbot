@@ -167,6 +167,8 @@ _PROXY_PATTERNS = [
     r"name or service not known",
     r"getaddrinfo failed",
     r"network is unreachable",
+    r"pysocks doesn't support ipv6",
+    r"doesn't support ipv6",
 ]
 
 _INVALID_CRED_PATTERNS = [
@@ -214,6 +216,8 @@ _HARD_PATTERNS = [
 
 def _is_proxy_error(e: Exception, text: str) -> bool:
     t = (text or "").lower()
+    if isinstance(e, OSError) and "ipv6" in t and "pysocks" in t:
+        return True
     if isinstance(e, (TimeoutError, smtplib.SMTPServerDisconnected)):
         return True
     return any(re.search(p, t) for p in _PROXY_PATTERNS)
