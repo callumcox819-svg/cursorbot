@@ -1,0 +1,45 @@
+def _bind_settings_main_keyboard_callbacks(dp: Dispatcher) -> None:
+    """Главное меню ⚙️ Настройки: колбэки вешаем на корень Dispatcher — первым делом trigger(),
+    без зависимости от порядка/глубины include_router (типичный обход «апдейт есть — кнопка мёртвая»)."""
+    from handlers.accounts import open_accounts_from_settings
+    from handlers.api_keys import goo_show_key, goo_show_profile
+    from handlers.first_sms import firstsms_open
+    from handlers.proxies import open_proxies
+    from handlers.settings import (
+        deprecated_subj_insert_toggle,
+        priority_menu,
+        ref_hide,
+        ref_toggle,
+        settings_open_cb,
+        settings_timings,
+        spoof_name_menu,
+        _force_settings_menu,
+    )
+    from handlers.templates import presets_menu
+
+    _DEPRECATED_SETTINGS_ALIASES = frozenset(
+        {"settings_menu", "goo:settings", "goo_settings", "settings_main"}
+    )
+
+    for cb, flt in (
+        (settings_open_cb, F.data == "settings_open"),
+        (priority_menu, F.data == "priority_menu"),
+        (presets_menu, F.data == "presets_menu"),
+        (firstsms_open, F.data == "firstsms_open"),
+        (spoof_name_menu, F.data == "spoof_name_menu"),
+        (open_accounts_from_settings, F.data == "settings_accounts"),
+        (open_proxies, F.data == "settings_proxies"),
+        (settings_timings, F.data == "settings_timings"),
+        (goo_show_key, F.data == "goo_show:key"),
+        (goo_show_profile, F.data == "goo_show:profile"),
+        (ref_hide, F.data == "ref_hide"),
+        (deprecated_subj_insert_toggle, F.data == "ref_toggle:subj_insert"),
+        (_force_settings_menu, F.data.in_(_DEPRECATED_SETTINGS_ALIASES)),
+        (ref_toggle, F.data.startswith("ref_toggle:")),
+    ):
+        dp.callback_query.register(cb, flt)
+
+    logger.info("Привязано %d колбэков главной клавиатуры «Настройки» к Dispatcher", 13)
+
+
+async def _on_startup(bot: Bot) -> None:

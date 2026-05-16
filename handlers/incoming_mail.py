@@ -1,0 +1,2183 @@
+# handlers/incoming_mail.py
+from __future__ import annotations
+
+import asyncio
+import html
+import re
+
+from aiogram import Router, F
+from aiogram.types import CallbackQuery, Message
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+
+from sqlalchemy import select as sa_select, func, select
+
+from database import Session
+from models import EmailAccount, ConversationLink, Offer, OfferEmail, IncomingMail, UserSetting
+
+from services.users import get_or_create_user
+from services.user_settings import get_user_setting
+from services.team_keys import get_team_api_key
+from services.gag_keys import gag_default_version, gag_generate_endpoint, get_user_gag_api_key
+from services.goo_network import generate_single_parse
+from services.gag_network import generate_gag_url, GAGError
+from services.incoming_mail_worker import FULL_META, _try_pin, build_mail_card_from_mail
+from services.smtp_proxy_send import send_email_via_account_with_proxy
+from services.translate import translate_to_ru, _strip_html
+
+# Email reply "presets" must use the same storage/UI as ⚡ Шаблоны (handlers/templates.py)
+from handlers.templates import load_templates, TemplateItem
+
+router = Router()
+
+COUNTRY_KEY = "country"
+GAG_PROFILE_TITLE_KEY = "gag_profile_title"
+GAG_PROFILE_NAME_KEY = "gag_profile_name"
+GAG_PROFILE_ADDRESS_KEY = "gag_profile_address"
+GAG_SERVICE_KEY = "gag_service"
+HTML_NICK_KEY = "html_nick"
+HTML_SIGNATURE_KEY = "html_signature"
+HTML_SUBJECT_KEY = "html_subject_theme"
+
+
+class _MailReplyState(StatesGroup):
+    # after clicking "Написать ещё" we show a choice menu (preset / HTML / manual)
+    waiting_choice = State()
+    waiting_text = State()
+    waiting_custom_html = State()
+
+
+def _kb_reply_choice(acc_id: int, uid: str):
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📄 Отправить пресет",
+                    callback_data=f"mail_reply_mode:preset:{acc_id}:{uid}",
+                ),
+                InlineKeyboardButton(
+                    text="🧩 Отправить HTML",
+                    callback_data=f"mail_reply_mode:html:{acc_id}:{uid}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🚫 Отмена",
+                    callback_data=f"mail_reply_mode:cancel:{acc_id}:{uid}",
+                )
+            ],
+        ]
+    )
+
+
+def _kb_preset_pick(items: list[TemplateItem], acc_id: int, uid: str):
+    """Picker for reply-presets.
+
+    IMPORTANT (per TZ): must use the same presets as ⚡ Шаблоны.
+    We reuse handlers/templates.py storage and send via the existing mail_tmpl_send handler.
+    """
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for i, t in enumerate(items[:30]):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"Пресет #{i+1}",
+                    callback_data=f"mail_tmpl_send:{i}:{acc_id}:{uid}",
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=f"mail_reply_mode:back:{acc_id}:{uid}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _kb_html_pick(acc_id: int, uid: str):
+    """HTML picker (strict TZ): only GO / PUSH / SMS / BACK."""
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🟢 GO", callback_data=f"mail_reply_html:go:{acc_id}:{uid}")],
+            [InlineKeyboardButton(text="📣 PUSH", callback_data=f"mail_reply_html:push:{acc_id}:{uid}")],
+            [InlineKeyboardButton(text="💬 SMS", callback_data=f"mail_reply_html:sms:{acc_id}:{uid}")],
+            [InlineKeyboardButton(text="🔙 BACK", callback_data=f"mail_reply_html:back:{acc_id}:{uid}")],
+            [InlineKeyboardButton(text="🚫 Отмена", callback_data=f"mail_reply_mode:back:{acc_id}:{uid}")],
+        ]
+    )
+
+
+@router.callback_query(F.data.startswith("mail_hide:"))
+async def cb_mail_hide(callback: CallbackQuery):
+    """Скрыть карточку письма (UI как в референс-видео).
+
+    Безопасное поведение:
+    - пытаемся снять pin (если был)
+    - удаляем сообщение с карточкой
+    """
+    try:
+        _, acc_id, uid = (callback.data or "").split(":", 2)
+        int(acc_id)
+        str(uid)
+    except Exception:
+        return await callback.answer("Неверные данные", show_alert=True)
+
+    try:
+        # best-effort unpin + delete
+        try:
+            await callback.bot.unpin_chat_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
+        except Exception:
+            pass
+        await callback.message.delete()
+    except Exception:
+        # если нельзя удалить — просто убираем клавиатуру
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    await callback.answer("Скрыто")
+
+
+@router.callback_query(F.data.startswith("mail_ignore:"))
+async def cb_mail_ignore(callback: CallbackQuery):
+    """Отметить письмо как "не отвечать".
+
+    В проекте авто-ответ запускается сразу после получения письма,
+    поэтому здесь мы делаем честное и полезное действие:
+    - убираем кнопки, чтобы не тыкали случайно
+    - помечаем в FULL_META флагом ignored (на будущее/лог)
+    """
+    try:
+        _, acc_id, uid = (callback.data or "").split(":", 2)
+        acc_id_i = int(acc_id)
+        uid_s = str(uid)
+    except Exception:
+        return await callback.answer("Неверные данные", show_alert=True)
+
+    try:
+        meta = FULL_META.get((acc_id_i, uid_s)) or {}
+        meta["ignored"] = True
+        FULL_META[(acc_id_i, uid_s)] = meta
+    except Exception:
+        pass
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await callback.answer("Ок")
+
+
+def _canon_email(email: str) -> str:
+    """Canonicalize email for robust matching.
+    - lower/strip
+    - for Gmail/Googlemail: remove dots in local-part, strip +tag, normalize domain to gmail.com
+    - for others: strip +tag in local-part (common), keep domain
+    """
+    e = (email or "").strip().lower()
+    if "@" not in e:
+        return e
+    local, domain = e.split("@", 1)
+    local = local.strip()
+    domain = domain.strip().lower()
+    if "+" in local:
+        local = local.split("+", 1)[0]
+    if domain in ("googlemail.com", "gmail.com"):
+        local = local.replace(".", "")
+        domain = "gmail.com"
+    return f"{local}@{domain}"
+
+
+def _e(s: str) -> str:
+    return html.escape(s or "", quote=False)
+
+
+def _clean(v: str | None) -> str:
+    return (v or "").strip()
+
+
+def _service_label_for_card(service_code: str) -> str:
+    """Human-readable service label for the link card.
+
+    IMPORTANT: used only for UI rendering (per TZ).
+    """
+    sc = (service_code or "").strip().lower()
+
+    # CH (GAG)
+    if sc in {"ricardo_ch", "ricardo.ch"}:
+        return "ricardo.ch"
+    if sc in {"tutti_ch", "tutti.ch"}:
+        return "tutti.ch"
+    if sc in {"post_ch", "posta_ch", "post.ch"}:
+        return "post.ch"
+
+    # DE (GOO)
+    if sc in {"ebay_de", "kleinanzeigen", "kleinanzeigen_de", "kleinanzeigen.de"}:
+        # The project uses goo service code "ebay_de" for Kleinanzeigen.
+        return "kleinanzeigen.de"
+
+    # FB (inbox)
+    if sc in {"facebook", "facebook.com"}:
+        return "facebook.com"
+
+    return service_code or "—"
+
+
+async def _send_generated_link_card(
+    *,
+    callback: CallbackQuery,
+    offer_title: str | None,
+    offer_price: str | None,
+    photo_url: str | None,
+    profile_display: str | None,
+    service_code: str,
+    link: str,
+    offer_id: int | None = None,
+):
+    """Send the link generation card exactly like reference style (photo + fields + optional price button)."""
+    service_label = _service_label_for_card(service_code)
+
+    card_text = (
+        f"📣 <b>Объявления » { _e(service_label) }</b>\n\n"
+        f"📌 <b>Название:</b> {_e((offer_title or '').strip()) or '—'}\n"
+        f"💰 <b>Цена:</b> {_e((offer_price or '').strip()) or '—'}\n"
+        f"👤 <b>Профиль:</b> <code>{_e((profile_display or '').strip()) or '—'}</code>\n\n"
+        f"🔗 <b>Ссылка:</b>\n{_e(link)}"
+    )
+
+    price_kb = None
+    if offer_id:
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+        price_kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="💶 Цена", callback_data=f"offer_price:{offer_id}")]]
+        )
+
+    # Per requirement: photo must be shown (do not silently downgrade).
+    p = (photo_url or "").strip()
+    if not p:
+        await callback.message.answer("❌ Нет фото объявления (photo).")
+        return
+
+    try:
+        sent = await callback.message.answer_photo(
+            photo=p,
+            caption=card_text,
+            parse_mode="HTML",
+            reply_markup=price_kb,
+        )
+    except Exception:
+        await callback.message.answer("❌ Не удалось отправить фото объявления.")
+        return
+
+    await _try_pin(callback.bot, callback.message.chat.id, sent.message_id)
+
+
+def _norm_subject_for_match(subject: str) -> str:
+    """Normalize email subject for offer matching.
+
+    Keep behavior predictable:
+    - strip common reply/forward prefixes (re/aw/fw/fwd)
+    - trim
+    """
+    s = (subject or "").strip()
+    if not s:
+        return ""
+    return re.sub(r"^(re|aw|fw|fwd)\s*:\s*", "", s, flags=re.I).strip()
+
+
+async def _offer_link_by_subject_or_name(
+    session,
+    *,
+    user_id: int,
+    subject: str,
+    from_name: str,
+) -> str | None:
+    """Fallback: try to resolve Offer.link by subject/title or seller name.
+
+    This is the same idea as in cb_create_goo_link (in-memory flow),
+    but used for the DB-bound flow too.
+    """
+    if not user_id:
+        return None
+
+    subj = _norm_subject_for_match(subject)
+    fn = (from_name or "").strip()
+
+    # 1) by title-ish subject
+    if subj:
+        row_t = (
+            await session.execute(
+                sa_select(Offer.link)
+                .where(Offer.user_id == int(user_id))
+                .where(func.lower(Offer.title).like(f"%{subj.lower()}%"))
+                .where(Offer.link.is_not(None))
+                .order_by(Offer.id.desc())
+                .limit(1)
+            )
+        ).first()
+        if row_t and row_t[0]:
+            return str(row_t[0]).strip()
+
+        # Some subjects include extra words like "Verkaufe".
+        # If the subject is long, also try a smaller token window.
+        try:
+            parts = [p for p in re.split(r"\s+", subj) if p]
+            if len(parts) >= 4:
+                tail = " ".join(parts[-4:]).strip()
+                if tail and tail.lower() != subj.lower():
+                    row_t2 = (
+                        await session.execute(
+                            sa_select(Offer.link)
+                            .where(Offer.user_id == int(user_id))
+                            .where(func.lower(Offer.title).like(f"%{tail.lower()}%"))
+                            .where(Offer.link.is_not(None))
+                            .order_by(Offer.id.desc())
+                            .limit(1)
+                        )
+                    ).first()
+                    if row_t2 and row_t2[0]:
+                        return str(row_t2[0]).strip()
+        except Exception:
+            pass
+
+    # 2) by seller name
+    if fn:
+        row_n = (
+            await session.execute(
+                sa_select(Offer.link)
+                .where(Offer.user_id == int(user_id))
+                .where(func.lower(Offer.person_name).like(f"%{fn.lower()}%"))
+                .where(Offer.link.is_not(None))
+                .order_by(Offer.id.desc())
+                .limit(1)
+            )
+        ).first()
+        if row_n and row_n[0]:
+            return str(row_n[0]).strip()
+
+    return None
+
+
+def _looks_transient_goo_error(msg: str) -> bool:
+    s = (msg or "").lower()
+    return any(
+        x in s
+        for x in (
+            "timeout",
+            "timed out",
+            "temporarily",
+            "temporary",
+            "connection",
+            "connect",
+            "network",
+            "eof",
+            "reset",
+            "502",
+            "503",
+            "504",
+        )
+    )
+
+
+async def _generate_goo_with_retries(
+    *,
+    user_api_key: str,
+    team_api_key: str,
+    team_name: str,
+    profile_id: str,
+    service: str,
+    url: str,
+    attempts: int = 3,
+) -> tuple[bool, str]:
+    """Call generate_single_parse with a few safe retries.
+
+    We only retry on errors that look transient (timeouts/network/5xx).
+    """
+    last_msg = ""
+    for i in range(max(1, int(attempts))):
+        ok, msg = await generate_single_parse(
+            user_api_key=user_api_key,
+            team_api_key=team_api_key,
+            team_name=team_name,
+            profile_id=profile_id,
+            service=service,
+            url=url,
+            need_balance_checker=False,
+        )
+        if ok:
+            return True, str(msg)
+        last_msg = str(msg)
+        if i < attempts - 1 and _looks_transient_goo_error(last_msg):
+            await asyncio.sleep(0.8 + (i * 0.8))
+            continue
+        break
+    return False, last_msg
+
+
+async def _get_acc_owner_user_id(session, acc_id: int) -> int | None:
+    acc = (
+        await session.execute(
+            sa_select(EmailAccount).where(EmailAccount.id == int(acc_id))
+        )
+    ).scalars().first()
+    return int(acc.user_id) if acc else None
+
+
+async def _get_convlink(
+    session,
+    *,
+    user_id: int,
+    inbox_email: str,
+    contact_email: str,
+) -> ConversationLink | None:
+    """
+    Связка диалога для конкретного ящика и контакта.
+
+    В МОДЕЛИ ConversationLink поля:
+      - account_email — наш почтовый ящик (куда пришло письмо)
+      - from_email    — email отправителя (продавца)
+
+    Здесь:
+      inbox_email   -> пишем/сравниваем с account_email
+      contact_email -> пишем/сравниваем с from_email
+    """
+    inbox = (inbox_email or "").strip().lower()
+    contact = (contact_email or "").strip().lower()
+    if not inbox or not contact:
+        return None
+
+    return (
+        await session.execute(
+            sa_select(ConversationLink)
+            .where(ConversationLink.user_id == int(user_id))
+            .where(ConversationLink.account_email == inbox)
+            .where(ConversationLink.from_email == contact)
+            .limit(1)
+        )
+    ).scalars().first()
+
+
+async def _upsert_convlink(
+    session,
+    *,
+    user_id: int,
+    inbox_email: str,
+    contact_email: str,
+    ad_url: str | None = None,
+    generated_link: str | None = None,
+) -> None:
+    """
+    Обновить/создать запись ConversationLink.
+
+    В МОДЕЛИ ConversationLink поля:
+      - account_email — наш почтовый ящик (куда пришло письмо)
+      - from_email    — email отправителя (продавца)
+    """
+    inbox = (inbox_email or "").strip().lower()
+    contact = (contact_email or "").strip().lower()
+    if not inbox or not contact:
+        return
+
+    conv = await _get_convlink(
+        session,
+        user_id=user_id,
+        inbox_email=inbox,
+        contact_email=contact,
+    )
+    if not conv:
+        conv = ConversationLink(
+            user_id=int(user_id),
+            account_email=inbox,
+            from_email=contact,
+            ad_url=(ad_url or "").strip() or None,
+            generated_link=(generated_link or "").strip() or None,
+        )
+        session.add(conv)
+    else:
+        if ad_url:
+            conv.ad_url = (ad_url or "").strip() or conv.ad_url
+        if generated_link:
+            conv.generated_link = (generated_link or "").strip() or conv.generated_link
+    await session.commit()
+
+
+async def _offer_link_by_sender_email(session, user_id: int, from_email: str) -> str | None:
+    """Попробовать найти Offer.link по email отправителя.
+
+    Правила:
+    - single-name НЕ обрабатываем (нужен first.last)
+    - сначала exact match OfferEmail.email == from_email
+    - если нет, то first.last@gmail.com -> ищем OfferEmail.email LIKE 'first.last@%'
+    """
+    if not user_id or not from_email or "@" not in from_email:
+        return None
+
+    fe = from_email.strip().lower()
+    local, domain = fe.split("@", 1)
+    local = local.strip()
+    domain = domain.strip().lower()
+
+    # 1) exact
+    row = (
+        await session.execute(
+            sa_select(Offer.link)
+            .select_from(OfferEmail)
+            .join(Offer, Offer.id == OfferEmail.offer_id)
+            .where(Offer.user_id == int(user_id))
+            .where(func.lower(OfferEmail.email) == fe)
+            .where(Offer.link.is_not(None))
+            .order_by(Offer.id.desc())
+            .limit(1)
+        )
+    ).first()
+    if row and row[0]:
+        return str(row[0]).strip()
+
+    # 1.5) Gmail: точки в local-part могут "исчезать" (gmail игнорирует '.')
+    # пример: sorik.hajoyan@gmail.com -> sorikhajoyan@gmail.com
+    if domain in ("gmail.com", "googlemail.com"):
+        fe_nodot = fe.replace(".", "")
+        row_g = (
+            await session.execute(
+                sa_select(Offer.link)
+                .select_from(OfferEmail)
+                .join(Offer, Offer.id == OfferEmail.offer_id)
+                .where(Offer.user_id == int(user_id))
+                # убираем точки у email в БД и у входящего email
+                .where(func.replace(func.lower(OfferEmail.email), ".", "") == fe_nodot)
+                .where(Offer.link.is_not(None))
+                .order_by(Offer.id.desc())
+                .limit(1)
+            )
+        ).first()
+        if row_g and row_g[0]:
+            return str(row_g[0]).strip()
+
+    # 2) local-part match (first.last@domain -> first.last@ANY)
+    # Для single-name у не-gmail почти всегда бесполезно, но тут не режем жестко,
+    # чтобы не ломать нестандартные кейсы (и для gmail тоже).
+    row2 = (
+        await session.execute(
+            sa_select(Offer.link)
+            .select_from(OfferEmail)
+            .join(Offer, Offer.id == OfferEmail.offer_id)
+            .where(Offer.user_id == int(user_id))
+            .where(func.lower(OfferEmail.email).like(local + "@%"))
+            .where(Offer.link.is_not(None))
+            .order_by(Offer.id.desc())
+            .limit(1)
+        )
+    ).first()
+    if row2 and row2[0]:
+        return str(row2[0]).strip()
+
+    # 3) python-side canonical fallback (handles gmail dots/+ and domain mismatches)
+    try:
+        fe_can = _canon_email(from_email)
+        rows = (
+            await session.execute(
+                sa_select(OfferEmail.email, Offer.link)
+                .select_from(OfferEmail)
+                .join(Offer, Offer.id == OfferEmail.offer_id)
+                .where(Offer.user_id == int(user_id))
+                .where(Offer.link.is_not(None))
+                .order_by(Offer.id.desc())
+                .limit(800)
+            )
+        ).all()
+        for em, lk in rows:
+            if not lk:
+                continue
+            if _canon_email(em or "") == fe_can:
+                return str(lk).strip()
+    except Exception:
+        pass
+
+    return None
+
+
+async def _offer_by_sender_email(session, user_id: int, from_email: str) -> tuple[Offer | None, int]:
+    """Находит Offer по email отправителя.
+
+    Для Gmail/Googlemail сравнение делается без точек в адресе,
+    т.к. в реальности отправитель может ответить с варианта без точек.
+    """
+    fe = (from_email or "").strip().lower()
+    if "@" not in fe:
+        return None, 0
+
+    domain = fe.split("@", 1)[1].strip().lower()
+    if domain in ("gmail.com", "googlemail.com"):
+        fe_nd = fe.replace(".", "")
+        row = (
+            await session.execute(
+                select(Offer, func.count(OfferEmail.id))
+                .join(OfferEmail, OfferEmail.offer_id == Offer.id)
+                .where(Offer.user_id == user_id)
+                .where(func.replace(func.lower(OfferEmail.email), ".", "") == fe_nd)
+                .group_by(Offer.id)
+                .limit(1)
+            )
+        ).first()
+        if row:
+            return row[0], int(row[1] or 0)
+        return None, 0
+
+    # обычный случай: точное совпадение
+    row = (
+        await session.execute(
+            select(Offer, func.count(OfferEmail.id))
+            .join(OfferEmail, OfferEmail.offer_id == Offer.id)
+            .where(Offer.user_id == user_id)
+            .where(func.lower(OfferEmail.email) == fe)
+            .group_by(Offer.id)
+            .limit(1)
+        )
+    ).first()
+    if row:
+        return row[0], int(row[1] or 0)
+    return None, 0
+
+
+def _kb_view_mode(reply_markup, mail_id: int) -> str:
+    try:
+        kb = reply_markup
+        if kb and getattr(kb, "inline_keyboard", None):
+            for row in kb.inline_keyboard:
+                for b in row:
+                    cd = getattr(b, "callback_data", "") or ""
+                    if cd == f"mail_view:{mail_id}:short":
+                        return "full"
+    except Exception:
+        pass
+    return "short"
+
+
+def _extract_translation_from_card(text: str) -> str | None:
+    try:
+        m = re.search(
+            r"(?is)<b>Перевод:</b>\s*<blockquote><code>(.*?)</code></blockquote>",
+            text or "",
+        )
+        if m:
+            return html.unescape(m.group(1)).strip()
+    except Exception:
+        pass
+    return None
+
+
+@router.callback_query(F.data.startswith("mail_translate:"))
+async def cb_mail_translate(callback: CallbackQuery) -> None:
+    try:
+        _, mail_id_s = (callback.data or "").split(":", 1)
+        mail_id = int(mail_id_s)
+    except Exception:
+        return await callback.answer("Неверные данные", show_alert=True)
+
+    async with Session() as session:
+        mail = (
+            await session.execute(
+                sa_select(IncomingMail).where(IncomingMail.id == int(mail_id)).limit(1)
+            )
+        ).scalars().first()
+        if not mail:
+            return await callback.answer("Письмо не найдено в БД.", show_alert=True)
+
+        body_full = (getattr(mail, "body", None) or "").strip()
+        if not body_full:
+            return await callback.answer("Нет текста для перевода.", show_alert=True)
+
+        view_mode = _kb_view_mode(callback.message.reply_markup, mail_id)
+        shown = body_full
+        if view_mode != "full":
+            try:
+                from services.incoming_mail_worker import _extract_reply_only_preview
+
+                shown = (_extract_reply_only_preview(body_full) or body_full).strip()
+            except Exception:
+                shown = body_full
+
+        shown = _strip_html(shown)
+        if not shown:
+            return await callback.answer("Нет текста для перевода.", show_alert=True)
+
+        await callback.answer("Перевожу…", show_alert=False)
+        translated = await translate_to_ru(shown, preserve_blocks=(view_mode == "full"))
+        if not translated:
+            try:
+                await callback.message.answer(
+                    "❌ Не удалось перевести. Попробуйте позже.",
+                    reply_to_message_id=callback.message.message_id,
+                )
+            except Exception:
+                pass
+            return await callback.answer("Не удалось перевести.", show_alert=True)
+
+        expanded = view_mode == "full"
+        new_text, new_kb = await build_mail_card_from_mail(
+            session,
+            mail,
+            expanded=expanded,
+            translation=translated,
+            view_mode=view_mode,
+        )
+
+    try:
+        await callback.message.edit_text(
+            new_text,
+            reply_markup=new_kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        await callback.message.answer(
+            new_text,
+            reply_markup=new_kb,
+            parse_mode="HTML",
+            reply_to_message_id=callback.message.message_id,
+        )
+
+
+@router.callback_query(F.data.startswith("mail_translate_stub:"))
+async def cb_mail_translate_stub(callback: CallbackQuery) -> None:
+    await callback.answer("Письмо устарело — дождитесь нового входящего.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("mail_view:"))
+async def cb_mail_view_toggle(callback: CallbackQuery) -> None:
+    try:
+        _, mail_id_s, mode = (callback.data or "").split(":", 2)
+        mail_id = int(mail_id_s)
+        mode = (mode or "short").strip().lower()
+    except Exception:
+        return await callback.answer("Неверные данные", show_alert=True)
+
+    async with Session() as session:
+        mail = (
+            await session.execute(
+                sa_select(IncomingMail).where(IncomingMail.id == int(mail_id)).limit(1)
+            )
+        ).scalars().first()
+        if not mail:
+            return await callback.answer("Письмо не найдено.", show_alert=True)
+
+        cur = (callback.message.html_text or callback.message.text or "").strip()
+        translation = _extract_translation_from_card(cur)
+        expanded = mode == "full"
+        view_mode = "full" if expanded else "short"
+        new_text, new_kb = await build_mail_card_from_mail(
+            session,
+            mail,
+            expanded=expanded,
+            translation=translation,
+            view_mode=view_mode,
+        )
+
+    try:
+        await callback.message.edit_text(
+            new_text,
+            reply_markup=new_kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("goo_mail:"))
+async def cb_create_goo_link_from_db(callback: CallbackQuery):
+    """Create goo-link for the exact incoming mail snapshot stored in DB.
+
+    This avoids relying on in-memory FULL_META and binds the link to the specific
+    message the user clicked.
+    """
+
+    try:
+        _, mail_id = (callback.data or "").split(":", 1)
+        mail_id = int(mail_id)
+    except Exception:
+        return await callback.answer("Неверные данные", show_alert=True)
+
+    async with Session() as session:
+        # Ensure the telegram user is the owner in our DB
+        tg_user = await get_or_create_user(session, int(callback.from_user.id))
+
+        mail = (
+            await session.execute(
+                sa_select(IncomingMail).where(IncomingMail.id == int(mail_id)).limit(1)
+            )
+        ).scalars().first()
+
+        if not mail:
+            return await callback.answer("Письмо не найдено в БД", show_alert=True)
+
+        if int(mail.user_id) != int(tg_user.id):
+            return await callback.answer("Нет доступа к этому письму", show_alert=True)
+
+        acc_id = int(mail.account_id)
+        inbox_email = _canon_email(mail.account_email or "")
+        contact_email = _canon_email(mail.from_email or "")
+
+        # Resolve url (ad_url) строго из БД (по ТЗ: не ищем ссылку в теле письма)
+        delays = [0.0, 0.6, 1.2, 2.0]
+        url = ""
+        reasons: list[str] = []
+
+        for d in delays:
+            if d:
+                await asyncio.sleep(d)
+            reasons = []
+
+            # 1) incoming_mails.ad_url (самый точный источник по конкретному письму)
+            url = (getattr(mail, "ad_url", "") or "").strip()
+            if url:
+                break
+            reasons.append("incoming_mails.ad_url пустой")
+
+            # 2) linked Offer (preferred)
+            if getattr(mail, "resolved_offer_id", None):
+                off_link = (
+                    await session.execute(
+                        sa_select(Offer.link)
+                        .where(Offer.id == int(mail.resolved_offer_id))
+                        .where(Offer.user_id == int(tg_user.id))
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if off_link and str(off_link).strip():
+                    url = str(off_link).strip()
+                    break
+                reasons.append("resolved_offer_id есть, но Offer.link пустой")
+            else:
+                reasons.append("resolved_offer_id не найден")
+
+            # 3) existing convlink
+            conv = await _get_convlink(
+                session,
+                user_id=int(tg_user.id),
+                inbox_email=inbox_email,
+                contact_email=contact_email,
+            )
+            if conv and conv.ad_url and str(conv.ad_url).strip():
+                url = str(conv.ad_url).strip()
+                break
+            reasons.append("conversation_links.ad_url пустой/нет")
+
+            # 4) Offer.link by sender email (OfferEmail)
+            url = (await _offer_link_by_sender_email(session, int(tg_user.id), contact_email)) or ""
+            if url.strip():
+                url = url.strip()
+                break
+            reasons.append("не найден Offer.link по OfferEmail")
+
+        if not url:
+            reason_text = "\n".join([f"• { _e(r) }" for r in (reasons or ["не удалось получить ссылку из БД"])])
+            await callback.message.answer(
+                "❌ <b>Не нашёл ссылку на объявление (ad_url)</b>\n\n"
+                f"<b>from_email:</b> <code>{_e(contact_email) or '—'}</code>\n"
+                f"<b>inbox:</b> <code>{_e(inbox_email) or '—'}</code>\n\n"
+                "<b>Причины:</b>\n"
+                f"{reason_text}\n\n"
+                "По ТЗ ссылка берётся только из БД (Offer/OfferEmail/ConversationLink).",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            await callback.answer()
+            return
+
+        # Switzerland: use GAG (imageoxo) instead of Goo
+        country = (await get_user_setting(session, tg_user, COUNTRY_KEY) or "DE").strip().upper() or "DE"
+        if country == "CH":
+            gag_key = await get_user_gag_api_key(session, tg_user)
+            if not gag_key:
+                await callback.message.answer(
+                    "❌ <b>GAG API ключ не установлен</b>\n\n"
+                    "Открой ⚙️ Настройки → 🔑 Ключ и вставь свой API-ключ команды.",
+                    parse_mode="HTML",
+                )
+                await callback.answer()
+                return
+
+            service = (await get_user_setting(session, tg_user, GAG_SERVICE_KEY) or "").strip()
+            if service not in ("tutti_ch", "post_ch", "ricardo_ch"):
+                await callback.message.answer(
+                    "❌ Не выбран сервис (ТУТТИ/ПОСТ/Ricardo.ch). Открой 👤 Профиль → 🧭 Выбор сервиса."
+                )
+                await callback.answer()
+                return
+
+            prof_title = (await get_user_setting(session, tg_user, GAG_PROFILE_TITLE_KEY) or "").strip()
+            prof_name = (await get_user_setting(session, tg_user, GAG_PROFILE_NAME_KEY) or "").strip()
+            prof_addr = (await get_user_setting(session, tg_user, GAG_PROFILE_ADDRESS_KEY) or "").strip()
+            if not (prof_title and prof_name and prof_addr):
+                await callback.message.answer(
+                    "❌ Профиль GAG не заполнен. Открой 👤 Профиль → ➕ Создать профиль."
+                )
+                await callback.answer()
+                return
+
+            offer_title = offer_price = offer_image = None
+            offer_id = None
+            if getattr(mail, "resolved_offer_id", None):
+                offer = (
+                    await session.execute(select(Offer).where(Offer.id == int(mail.resolved_offer_id)).limit(1))
+                ).scalars().first()
+                if offer:
+                    offer_title = (offer.title or "").strip() or None
+                    offer_price = (offer.price or "").strip() or None
+                    offer_image = (offer.photo or "").strip() or None
+                    offer_id = int(getattr(offer, "id", 0) or 0) or None
+
+            title = offer_title or (mail.subject or "").strip()
+            price = offer_price
+            if not title:
+                await callback.message.answer("❌ Нет названия объявления (title).")
+                await callback.answer()
+                return
+            if not price:
+                await callback.message.answer("❌ Нет цены объявления (price).")
+                await callback.answer()
+                return
+
+            # Map our internal service code to GAG API service code.
+            # GAG API expects POSTA.CH as "posta_ch" (not "post_ch").
+            api_service = "posta_ch" if service == "post_ch" else service
+
+            # Domain selection (CH/GAG):
+            # - If user selected personal domain slot 1..4, map to API 5..8
+            # - If not selected (team domain), omit "domain" so GAG uses its default (team)
+            dom_raw = (await get_user_setting(session, tg_user, "gag_domain_slot") or "").strip()
+            dom_slot = None
+            try:
+                if dom_raw and dom_raw.lower() not in {"team", "default", "0"}:
+                    dom_slot = int(dom_raw)
+            except Exception:
+                dom_slot = None
+            api_domain = (dom_slot + 4) if dom_slot in (1, 2, 3, 4) else None
+
+            try:
+                gag_url = await generate_gag_url(
+                    endpoint=gag_generate_endpoint(),
+                    apikey=gag_key,
+                    title=title,
+                    price=price,
+                    service=api_service,
+                    name=prof_name,
+                    address=prof_addr,
+                    image=offer_image,
+                    domain=api_domain,
+                    version=gag_default_version(),
+                )
+            except GAGError as e:
+                await callback.message.answer(f"❌ GAG ошибка: {e}")
+                await callback.answer()
+                return
+
+            # Persist convlink for downstream HTML sending
+            await _upsert_convlink(
+                session,
+                user_id=int(tg_user.id),
+                inbox_email=inbox_email,
+                contact_email=contact_email,
+                ad_url=url,
+                generated_link=gag_url,
+            )
+            try:
+                mail.generated_link = gag_url
+            except Exception:
+                pass
+            await session.commit()
+
+            await _send_generated_link_card(
+                callback=callback,
+                offer_title=offer_title or title,
+                offer_price=offer_price or price,
+                photo_url=offer_image,
+                profile_display=prof_title,
+                service_code=service,
+                link=gag_url,
+                offer_id=offer_id,
+            )
+            await callback.answer()
+            return
+
+        # keys
+        user_api_key = _clean(tg_user.goo_user_api_key or tg_user.goo_api_key)
+        team_name = _clean(tg_user.goo_team_key)
+        profile_id = _clean(tg_user.goo_profile_id)
+
+        if not user_api_key:
+            return await callback.answer("❌ Не задан User API key (GOO)", show_alert=True)
+        if not team_name:
+            return await callback.answer("❌ Не задан Team (AQUA/TSUM/NUR)", show_alert=True)
+        if not profile_id:
+            return await callback.answer("❌ Не задан Goo Profile ID", show_alert=True)
+
+        team_api_key = _clean(await get_team_api_key(session, team_name))
+        if not team_api_key:
+            return await callback.answer("❌ Не задан Team API key для выбранной команды", show_alert=True)
+
+    # GOO
+    service = "ebay_de"
+    ok, msg = await _generate_goo_with_retries(
+        user_api_key=user_api_key,
+        team_api_key=team_api_key,
+        team_name=team_name,
+        profile_id=profile_id,
+        service=service,
+        url=url,
+        attempts=3,
+    )
+
+    if not ok:
+        await callback.message.answer(f"❌ Goo ошибка: <code>{_e(str(msg))}</code>", parse_mode="HTML")
+        await callback.answer()
+        return
+
+    link = str(msg).strip()
+    if not link:
+        return await callback.answer("❌ Goo вернул пустую ссылку", show_alert=True)
+
+    # Persist convlink for downstream HTML sending
+    async with Session() as session:
+        await _upsert_convlink(
+            session,
+            user_id=int(tg_user.id),
+            inbox_email=inbox_email,
+            contact_email=contact_email,
+            ad_url=url,
+            generated_link=link,
+        )
+        # also store into IncomingMail for debugging/history
+        try:
+            mail = (
+                await session.execute(sa_select(IncomingMail).where(IncomingMail.id == int(mail_id)).limit(1))
+            ).scalars().first()
+            if mail:
+                # keep resolved_offer_id if we can now match by url
+                if not mail.resolved_offer_id:
+                    off = (
+                        await session.execute(
+                            sa_select(Offer).where(Offer.user_id == int(tg_user.id)).where(Offer.link == url).limit(1)
+                        )
+                    ).scalars().first()
+                    if off:
+                        mail.resolved_offer_id = int(off.id)
+                await session.commit()
+        except Exception:
+            await session.rollback()
+
+    # Render the same reference-style card (photo + fields) for generated links
+    offer_title = offer_price = photo_url = None
+    offer_id = None
+    async with Session() as session:
+        try:
+            off = (
+                await session.execute(
+                    sa_select(Offer)
+                    .where(Offer.user_id == int(tg_user.id))
+                    .where(Offer.link == url)
+                    .order_by(Offer.id.desc())
+                    .limit(1)
+                )
+            ).scalars().first()
+            if off:
+                offer_title = (off.title or '').strip() or None
+                offer_price = (off.price or '').strip() or None
+                photo_url = (off.photo or '').strip() or None
+                offer_id = int(getattr(off, 'id', 0) or 0) or None
+        except Exception:
+            pass
+
+    await _send_generated_link_card(
+        callback=callback,
+        offer_title=offer_title,
+        offer_price=offer_price,
+        photo_url=photo_url,
+        profile_display=profile_id,
+        service_code=service,
+        link=link,
+        offer_id=offer_id,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("goo_link:"))
+async def cb_create_goo_link(callback: CallbackQuery):
+    try:
+        _, acc_id, uid = (callback.data or "").split(":", 2)
+        acc_id = int(acc_id)
+    except Exception:
+        return await callback.answer("Неверные данные", show_alert=True)
+
+    meta = FULL_META.get((acc_id, uid))
+    if not meta:
+        return await callback.answer("Письмо устарело", show_alert=True)
+
+    inbox_email = _canon_email((meta.get("account_email") or ""))
+    contact_email = _canon_email((meta.get("from_email") or ""))
+
+    async def _get_ad_url_db_with_retries(session, *, owner_user_id: int) -> tuple[str, list[str]]:
+        """Стабильно получаем ad_url ТОЛЬКО из БД (по ТЗ), с ретраями и причинами."""
+
+        delays = [0.0, 0.6, 1.2, 2.0]
+        last_reasons: list[str] = []
+
+        for i, d in enumerate(delays, start=1):
+            if d:
+                await asyncio.sleep(d)
+
+            reasons: list[str] = []
+            url: str = ""
+
+            # 1) url из meta (если уже был записан ранее)
+            url = (meta.get("ad_url") or "").strip()
+            if url:
+                return url, []
+            reasons.append("meta.ad_url пустой")
+
+            # 2) url из IncomingMail (самый надёжный источник по конкретному письму)
+            mail = (
+                await session.execute(
+                    sa_select(IncomingMail)
+                    .where(IncomingMail.account_id == int(acc_id))
+                    .where(IncomingMail.imap_uid == int(uid))
+                    .where(IncomingMail.user_id == int(owner_user_id))
+                    .limit(1)
+                )
+            ).scalars().first()
+            if mail:
+                m_url = (getattr(mail, "ad_url", "") or "").strip()
+                if m_url:
+                    return m_url, []
+                reasons.append("incoming_mails.ad_url пустой")
+
+                # 2.1) если письмо уже связано с Offer — берём Offer.link
+                roid = getattr(mail, "resolved_offer_id", None)
+                if roid:
+                    off_link = (
+                        await session.execute(
+                            sa_select(Offer.link)
+                            .where(Offer.id == int(roid))
+                            .where(Offer.user_id == int(owner_user_id))
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+                    if off_link and str(off_link).strip():
+                        return str(off_link).strip(), []
+                    reasons.append("resolved_offer_id есть, но Offer.link пустой")
+                else:
+                    reasons.append("resolved_offer_id не найден")
+            else:
+                reasons.append("incoming_mails запись не найдена")
+
+            # 3) url из conversation_links
+            conv = await _get_convlink(
+                session,
+                user_id=owner_user_id,
+                inbox_email=inbox_email,
+                contact_email=contact_email,
+            )
+            if conv and conv.ad_url and str(conv.ad_url).strip():
+                return str(conv.ad_url).strip(), []
+            reasons.append("conversation_links.ad_url пустой/нет")
+
+            # 4) url из Offer.link по OfferEmail (валидированные данные в БД)
+            off_by_email = (await _offer_link_by_sender_email(session, owner_user_id, contact_email)) or ""
+            if off_by_email.strip():
+                return off_by_email.strip(), []
+            reasons.append("не найден Offer.link по OfferEmail")
+
+            last_reasons = reasons
+
+        return "", last_reasons
+
+    async with Session() as session:
+        owner_user_id = await _get_acc_owner_user_id(session, acc_id)
+        if not owner_user_id:
+            return await callback.answer("Аккаунт не найден в БД", show_alert=True)
+
+        url, reasons = await _get_ad_url_db_with_retries(session, owner_user_id=owner_user_id)
+
+        if not url:
+            reason_text = "\n".join([f"• { _e(r) }" for r in (reasons or ["не удалось получить ссылку из БД"])])
+            await callback.message.answer(
+                "❌ <b>Не нашёл ссылку на объявление (ad_url)</b>\n\n"
+                f"<b>from_email:</b> <code>{_e(contact_email) or '—'}</code>\n"
+                f"<b>inbox:</b> <code>{_e(inbox_email) or '—'}</code>\n\n"
+                "<b>Причины:</b>\n"
+                f"{reason_text}\n\n"
+                "По ТЗ ссылка берётся только из БД (Offer/OfferEmail/ConversationLink).",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            await callback.answer()
+            return
+
+        # ключи из User + TeamKey
+        user = await get_or_create_user(session, int(callback.from_user.id))
+
+        # Switzerland: use GAG (imageoxo) instead of Goo
+        country = (await get_user_setting(session, user, COUNTRY_KEY) or "DE").strip().upper() or "DE"
+        if country == "CH":
+            gag_key = await get_user_gag_api_key(session, user)
+            if not gag_key:
+                await callback.message.answer(
+                    "❌ <b>GAG API ключ не установлен</b>\n\n"
+                    "Открой ⚙️ Настройки → 🔑 Ключ и вставь свой API-ключ команды.",
+                    parse_mode="HTML",
+                )
+                return await callback.answer()
+
+            service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
+            if service not in ("tutti_ch", "post_ch", "ricardo_ch"):
+                await callback.message.answer("❌ Не выбран сервис (ТУТТИ/ПОСТ/Ricardo.ch). Открой 👤 Профиль → 🧭 Выбор сервиса.")
+                return await callback.answer()
+
+            prof_title = (await get_user_setting(session, user, GAG_PROFILE_TITLE_KEY) or "").strip()
+            prof_name = (await get_user_setting(session, user, GAG_PROFILE_NAME_KEY) or "").strip()
+            prof_addr = (await get_user_setting(session, user, GAG_PROFILE_ADDRESS_KEY) or "").strip()
+            if not (prof_title and prof_name and prof_addr):
+                await callback.message.answer("❌ Профиль GAG не заполнен. Открой 👤 Профиль → ➕ Создать профиль.")
+                return await callback.answer()
+
+            offer_title = None
+            offer_price = None
+            offer_image = None
+            offer_id = None
+            mail = (
+                await session.execute(
+                    sa_select(IncomingMail)
+                    .where(IncomingMail.account_id == int(acc_id))
+                    .where(IncomingMail.imap_uid == int(uid))
+                    .where(IncomingMail.user_id == int(owner_user_id))
+                    .limit(1)
+                )
+            ).scalars().first()
+
+            if mail and getattr(mail, "resolved_offer_id", None):
+                offer = (
+                    await session.execute(select(Offer).where(Offer.id == int(mail.resolved_offer_id)).limit(1))
+                ).scalars().first()
+                if offer:
+                    offer_title = (offer.title or "").strip() or None
+                    offer_price = (offer.price or "").strip() or None
+                    offer_image = (offer.photo or "").strip() or None
+                    offer_id = int(getattr(offer, "id", 0) or 0) or None
+
+            title = offer_title or ((mail.subject or "").strip() if mail else "")
+            price = offer_price
+            if not title:
+                await callback.message.answer("❌ Нет названия объявления (title).")
+                return await callback.answer()
+            if not price:
+                await callback.message.answer("❌ Нет цены объявления (price).")
+                return await callback.answer()
+
+            # Map our internal service code to GAG API service code.
+            api_service = "posta_ch" if service == "post_ch" else service
+
+            # Domain selection (CH/GAG): see handlers/settings.py (gag_domain_slot)
+            dom_raw = (await get_user_setting(session, user, "gag_domain_slot") or "").strip()
+            dom_slot = None
+            try:
+                if dom_raw and dom_raw.lower() not in {"team", "default", "0"}:
+                    dom_slot = int(dom_raw)
+            except Exception:
+                dom_slot = None
+            api_domain = (dom_slot + 4) if dom_slot in (1, 2, 3, 4) else None
+
+            try:
+                gag_url = await generate_gag_url(
+                    endpoint=gag_generate_endpoint(),
+                    apikey=gag_key,
+                    title=title,
+                    price=price,
+                    service=api_service,
+                    name=prof_name,
+                    address=prof_addr,
+                    image=offer_image,
+                    domain=api_domain,
+                    version=gag_default_version(),
+                )
+            except GAGError as e:
+                await callback.message.answer(f"❌ GAG ошибка: {e}")
+                return await callback.answer()
+
+            await _upsert_convlink(
+                session,
+                user_id=int(owner_user_id),
+                inbox_email=inbox_email,
+                contact_email=contact_email,
+                ad_url=url,
+                generated_link=gag_url,
+            )
+            if mail:
+                try:
+                    mail.generated_link = gag_url
+                except Exception:
+                    pass
+            await session.commit()
+
+            await _send_generated_link_card(
+                callback=callback,
+                offer_title=offer_title or title,
+                offer_price=offer_price or price,
+                photo_url=offer_image,
+                profile_display=prof_title,
+                service_code=service,
+                link=gag_url,
+                offer_id=offer_id,
+            )
+            await callback.answer()
+            return
+
+        user_api_key = _clean(user.goo_user_api_key or user.goo_api_key)
+        team_name = _clean(user.goo_team_key)
+        profile_id = _clean(user.goo_profile_id)
+
+        if not user_api_key:
+            return await callback.answer("❌ Не задан User API key (GOO)", show_alert=True)
+        if not team_name:
+            return await callback.answer("❌ Не задан Team (AQUA/TSUM/NUR)", show_alert=True)
+        if not profile_id:
+            return await callback.answer("❌ Не задан Goo Profile ID", show_alert=True)
+
+        team_api_key = _clean(await get_team_api_key(session, team_name))
+        if not team_api_key:
+            return await callback.answer("❌ Не задан Team API key для выбранной команды", show_alert=True)
+
+        # GOO: для Kleinanzeigen используется сервис "ebay_de" (не "kleinanzeigen_de")
+    service = "ebay_de"
+
+    ok, msg = await generate_single_parse(
+        user_api_key=user_api_key,
+        team_api_key=team_api_key,
+        team_name=team_name,
+        profile_id=profile_id,
+        service=service,
+        url=url,
+        need_balance_checker=False,
+    )
+
+    if not ok:
+        await callback.message.answer(f"❌ Goo ошибка: <code>{_e(str(msg))}</code>", parse_mode="HTML")
+        await callback.answer()
+        return
+
+    link = str(msg).strip()
+    if not link:
+        return await callback.answer("❌ Goo вернул пустую ссылку", show_alert=True)
+
+    meta["generated_link"] = link
+    meta["ad_url"] = url
+
+    # Подготовим поля для красивой карточки ссылки
+    offer_title = ""
+    offer_price = ""
+    offer_row = None
+
+    async with Session() as session:
+        owner_user_id = await _get_acc_owner_user_id(session, acc_id)
+        if owner_user_id:
+            # связываем ящик + отправителя + объявление с созданной ссылкой
+            await _upsert_convlink(
+                session,
+                user_id=owner_user_id,
+                inbox_email=inbox_email,
+                contact_email=contact_email,
+                ad_url=url,
+                generated_link=link,
+            )
+
+            # пробуем найти оффер по точному URL, чтобы взять название и цену
+            try:
+                offer_row = (
+                    await session.execute(
+                        sa_select(Offer)
+                        .where(Offer.user_id == int(owner_user_id))
+                        .where(Offer.link == url)
+                        .order_by(Offer.id.desc())
+                        .limit(1)
+                    )
+                ).scalars().first()
+                if offer_row:
+                    offer_title = (offer_row.title or "").strip()
+                    offer_price = (offer_row.price or "").strip()
+            except Exception:
+                # на всякий случай не роняем обработчик
+                pass
+    await _send_generated_link_card(
+        callback=callback,
+        offer_title=offer_title,
+        offer_price=offer_price,
+        photo_url=(getattr(offer_row, "photo", None) or "").strip() if offer_row else None,
+        profile_display=profile_id,
+        service_code=service,
+        link=link,
+        offer_id=int(getattr(offer_row, "id", 0) or 0) or None,
+    )
+
+    await callback.answer("Готово ✅")
+
+
+@router.callback_query(F.data.startswith("mail_reply:"))
+async def cb_mail_reply(callback: CallbackQuery, state: FSMContext):
+    try:
+        _, acc_id, uid = (callback.data or "").split(":", 2)
+        acc_id = int(acc_id)
+    except Exception:
+        return await callback.answer("Неверные данные", show_alert=True)
+
+    meta = FULL_META.get((acc_id, uid)) or {}
+    to_email = _canon_email(meta.get("from_email") or "")
+    subject = (meta.get("subject") or "").strip()
+    account_email = _canon_email(meta.get("account_email") or "")
+
+    if not to_email or "@" not in to_email:
+        return await callback.answer("Не вижу email отправителя", show_alert=True)
+
+    await state.set_state(_MailReplyState.waiting_choice)
+    await state.update_data(acc_id=acc_id, uid=uid, to_email=to_email, subject=subject, account_email=account_email)
+
+    await callback.message.answer(
+        "✉️ <b>Ответ</b>\n\n"
+        f"<b>Кому:</b> <code>{_e(to_email)}</code>\n"
+        f"<b>Тема:</b> <code>{_e(subject) or '—'}</code>\n\n"
+        "Выбери способ ответа:\n"
+        "• <b>Пресет</b> — отправит готовый текст\n"
+        "• <b>HTML</b> — отправит HTML-шаблон\n\n"
+        "Или просто напиши сообщение — отправлю как обычный ответ.\n"
+        "Чтобы отменить — нажми <b>Отмена</b> или отправь <code>-</code>.",
+        parse_mode="HTML",
+        reply_markup=_kb_reply_choice(acc_id, uid),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mail_reply_mode:"))
+async def cb_mail_reply_mode(callback: CallbackQuery, state: FSMContext):
+    """Choice menu after clicking "Написать ещё"."""
+    try:
+        _, mode, acc_id, uid = (callback.data or "").split(":", 3)
+        acc_id = int(acc_id)
+    except Exception:
+        return await callback.answer("Неверные данные", show_alert=True)
+
+    if mode in {"cancel"}:
+        await state.clear()
+        await callback.answer("Ок")
+        return await callback.message.answer("❌ Отменено.")
+
+    if mode in {"back"}:
+        # show choice menu again
+        data = await state.get_data()
+        to_email = str(data.get("to_email") or "")
+        subject = str(data.get("subject") or "")
+        await state.set_state(_MailReplyState.waiting_choice)
+        await callback.message.answer(
+            "✉️ <b>Ответ</b>\n\n"
+            f"<b>Кому:</b> <code>{_e(to_email)}</code>\n"
+            f"<b>Тема:</b> <code>{_e(subject) or '—'}</code>\n\n"
+            "Выбери способ ответа или напиши сообщение вручную.",
+            parse_mode="HTML",
+            reply_markup=_kb_reply_choice(acc_id, uid),
+        )
+        return await callback.answer()
+
+    # preset picker
+    if mode == "preset":
+        items = load_templates(int(callback.from_user.id))
+        if not items:
+            return await callback.answer("Нет шаблонов. Добавь их в ⚡ Шаблоны", show_alert=True)
+
+        await callback.message.answer(
+            "🧾 <b>Ваши шаблоны:</b>\n\nНажмите на пресет для отправки",
+            parse_mode="HTML",
+            reply_markup=_kb_preset_pick(items, acc_id, uid),
+        )
+        return await callback.answer()
+
+    # html picker
+    if mode == "html":
+        await callback.message.answer(
+            "🧩 <b>HTML</b>\n\nВыбери HTML-шаблон:",
+            parse_mode="HTML",
+            reply_markup=_kb_html_pick(acc_id, uid),
+        )
+        return await callback.answer()
+
+    return await callback.answer("Ок")
+
+
+@router.callback_query(F.data.startswith("mail_reply_preset:"))
+async def cb_mail_reply_preset_send(callback: CallbackQuery, state: FSMContext):
+    try:
+        _, acc_id, uid, tid = (callback.data or "").split(":", 3)
+        acc_id = int(acc_id)
+        tid = int(tid)
+    except Exception:
+        return await callback.answer("Неверные данные", show_alert=True)
+
+    data = await state.get_data()
+    to_email = str(data.get("to_email") or "").strip().lower()
+    subject = str(data.get("subject") or "").strip()
+    if not to_email:
+        return await callback.answer("Не вижу email отправителя", show_alert=True)
+
+    async with Session() as session:
+        user = await get_or_create_user(session, int(callback.from_user.id))
+        tmpl = (
+            await session.execute(
+                sa_select(QuickTemplate)
+                .where(QuickTemplate.user_id == int(user.id))
+                .where(QuickTemplate.id == int(tid))
+            )
+        ).scalar_one_or_none()
+        if not tmpl:
+            return await callback.answer("Пресет не найден", show_alert=True)
+
+        acc = (
+            await session.execute(sa_select(EmailAccount).where(EmailAccount.id == int(acc_id)))
+        ).scalar_one_or_none()
+        if not acc:
+            await state.clear()
+            return await callback.message.answer("❌ SMTP аккаунт не найден в БД.")
+
+        out_subject = _reply_subject(subject)
+        ok, err = await send_email_via_account_with_proxy(
+            session,
+            int(user.id),
+            acc,
+            to_email,
+            out_subject,
+            tmpl.body or "",
+        )
+    await state.clear()
+    if ok:
+        await callback.message.answer("✅ Отправлено.")
+        return await callback.answer("Отправлено ✅")
+    return await callback.answer(f"❌ Ошибка SMTP: {err}", show_alert=True)
+
+
+def _reply_subject(subject: str) -> str:
+    subj_norm = re.sub(r"^(re|aw|fw|fwd)\s*:\s*", "", (subject or ""), flags=re.I).strip()
+    return f"Re: {subj_norm}" if subj_norm else "Re:"
+
+
+def _html_nick_key_for_service(service: str) -> str:
+    service = (service or "").strip()
+    return f"html_nick_{service}" if service else HTML_NICK_KEY
+
+
+async def _offer_title_for_email(session: Session, user_id: int, to_email: str) -> str:
+    try:
+        canon = _canon_email(to_email)
+        off = (
+            await session.execute(
+                sa_select(Offer)
+                .join(OfferEmail, OfferEmail.offer_id == Offer.id)
+                .where(Offer.user_id == int(user_id))
+                .where(OfferEmail.email == canon)
+                .order_by(Offer.id.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if off:
+            return (off.title or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+async def _load_html_template_for_user(session: Session, user_id: int, filename: str) -> str:
+    # we are CH-only, but keep fallback to root templates
+    from pathlib import Path
+
+    service = (
+        await session.execute(
+            sa_select(UserSetting.value)
+            .where(UserSetting.user_id == int(user_id))
+            .where(UserSetting.key == GAG_SERVICE_KEY)
+        )
+    ).scalar_one_or_none()
+    service = (str(service or "").strip() or "")
+
+    base = Path("data") / "HTMLch"
+    p = base / service / filename if service else base / filename
+    if not p.exists():
+        p = base / filename
+    try:
+        return p.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _apply_link(html_text: str, link: str) -> str:
+    if not html_text:
+        return ""
+    if not link:
+        return html_text
+    return re.sub(r"\{\{\s*LINK\s*\}\}", link, html_text, flags=re.I)
+
+
+@router.callback_query(F.data.startswith("mail_reply_html:"))
+async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
+    try:
+        _, kind, acc_id, uid = (callback.data or "").split(":", 3)
+        acc_id = int(acc_id)
+    except Exception:
+        return await callback.answer("Неверные данные", show_alert=True)
+
+    data = await state.get_data()
+    to_email = str(data.get("to_email") or "").strip().lower()
+    subject_raw = str(data.get("subject") or "").strip()
+    account_email = str(data.get("account_email") or "").strip().lower()
+
+    if not to_email:
+        return await callback.answer("Не вижу email отправителя", show_alert=True)
+
+    if kind == "custom":
+        await state.set_state(_MailReplyState.waiting_custom_html)
+        await callback.message.answer(
+            "Отправьте HTML-разметку текстом или .txt файлом\n\n"
+            "Чтобы отменить — отправь <code>-</code>.",
+            parse_mode="HTML",
+        )
+        return await callback.answer()
+
+    file_map = {
+        "pro": "confirmation.html",
+        "go": "confirmation.html",
+        "pickup": "pickup.html",
+        "sms": "sms.html",
+        "push": "push.html",
+        "back": "return.html",
+    }
+    filename = file_map.get(kind)
+    if not filename:
+        return await callback.answer("Неизвестный шаблон", show_alert=True)
+
+    async with Session() as session:
+        user = await get_or_create_user(session, int(callback.from_user.id))
+        acc = (
+            await session.execute(sa_select(EmailAccount).where(EmailAccount.id == int(acc_id)))
+        ).scalar_one_or_none()
+        if not acc:
+            await state.clear()
+            return await callback.message.answer("❌ SMTP аккаунт не найден в БД.")
+
+        from services.html_reply import (
+            get_html_reply_subject,
+            get_html_sender_name,
+            prepare_html_body,
+        )
+
+        subject = await get_html_reply_subject(session, user, fallback=_reply_subject(subject_raw))
+        sender_name = await get_html_sender_name(session, user)
+
+        html_signature = (
+            await session.execute(
+                sa_select(UserSetting.value)
+                .where(UserSetting.user_id == int(user.id))
+                .where(UserSetting.key == HTML_SIGNATURE_KEY)
+            )
+        ).scalar_one_or_none()
+
+        raw_html = await _load_html_template_for_user(session, int(user.id), filename)
+        if not raw_html:
+            return await callback.answer("HTML шаблон не найден", show_alert=True)
+
+        # link (only if created)
+        link = ""
+        if account_email:
+            conv = (
+                await session.execute(
+                    sa_select(ConversationLink)
+                    .where(ConversationLink.user_id == int(user.id))
+                    .where(ConversationLink.account_email == account_email)
+                    .where(ConversationLink.from_email == to_email)
+                )
+            ).scalar_one_or_none()
+            if conv and conv.generated_link:
+                link = str(conv.generated_link)
+
+        html_body = prepare_html_body(_apply_link(raw_html, link), session, user)
+        if html_signature:
+            html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
+
+        # ✅ Переменные в HTML ({{ITEM_TITLE}}, {{PRICE}}, {{IMAGE_URL}}, {{IMAGE}} и т.д.)
+        try:
+            from services.placeholders import apply_placeholders
+
+            offer_title = await _offer_title_for_email(session, int(user.id), to_email)
+            offer_price = ""
+            offer_photo = ""
+            if offer_title:
+                try:
+                    canon = _canon_email(to_email)
+                    off = (
+                        await session.execute(
+                            sa_select(Offer)
+                            .join(OfferEmail, OfferEmail.offer_id == Offer.id)
+                            .where(Offer.user_id == int(user.id))
+                            .where(OfferEmail.email == canon)
+                            .order_by(Offer.id.desc())
+                            .limit(1)
+                        )
+                    ).scalars().first()
+                    if off:
+                        offer_price = (off.price or "").strip()
+                        offer_photo = (off.photo or "").strip()
+                except Exception:
+                    pass
+
+            ctx = {
+                "ITEM_TITLE": offer_title,
+                "PRICE": offer_price,
+                "IMAGE_URL": offer_photo,
+            }
+            html_body = apply_placeholders(html_body, link=link, ctx=ctx)
+        except Exception:
+            pass
+
+        ok, err = await send_email_via_account_with_proxy(
+            session,
+            int(user.id),
+            acc,
+            to_email,
+            subject,
+            html_body,
+            is_html=True,
+            sender_name=sender_name,
+        )
+
+    await state.clear()
+    if ok:
+        await callback.message.answer("✅ Отправлено.")
+        return await callback.answer("Отправлено ✅")
+    return await callback.answer(f"❌ Ошибка SMTP: {err}", show_alert=True)
+
+
+@router.message(_MailReplyState.waiting_choice)
+@router.message(_MailReplyState.waiting_text)
+async def mail_reply_text(message: Message, state: FSMContext):
+    data = await state.get_data()
+    text = (message.text or "").strip()
+    if text == "-":
+        await state.clear()
+        return await message.answer("❌ Отменено.")
+
+    acc_id = int(data.get("acc_id") or 0)
+    uid = str(data.get("uid") or "")
+    to_email = str(data.get("to_email") or "").strip().lower()
+    subject = str(data.get("subject") or "").strip()
+
+    out_subject = _reply_subject(subject)
+
+    async with Session() as session:
+        acc = (
+            await session.execute(sa_select(EmailAccount).where(EmailAccount.id == acc_id))
+        ).scalar_one_or_none()
+        if not acc:
+            await state.clear()
+            return await message.answer("❌ SMTP аккаунт не найден в БД.")
+
+        user = await get_or_create_user(session, int(message.from_user.id))
+        owner_user_id = await _get_acc_owner_user_id(session, acc_id)
+        if owner_user_id and int(owner_user_id) != int(user.id):
+            await state.clear()
+            return await message.answer("❌ Этот ящик не принадлежит вам.")
+
+        ok, err = await send_email_via_account_with_proxy(
+            session,
+            int(user.id),
+            acc,
+            to_email,
+            out_subject,
+            text,
+        )
+
+    await state.clear()
+    if ok:
+        await message.answer("✅ Отправлено.")
+        try:
+            FULL_META[(acc_id, uid)] = {
+                **(FULL_META.get((acc_id, uid)) or {}),
+                "last_reply": "sent",
+            }
+        except Exception:
+            pass
+    else:
+        await message.answer(
+            f"❌ Ошибка отправки: <code>{_e(err) or 'unknown'}</code>",
+            parse_mode="HTML",
+        )
+
+
+@router.message(_MailReplyState.waiting_custom_html)
+async def mail_reply_custom_html(message: Message, state: FSMContext):
+    """Send user-provided HTML as a reply (CUSTOME-like)."""
+    data = await state.get_data()
+    text = (message.text or "").strip()
+    if text == "-":
+        await state.clear()
+        return await message.answer("❌ Отменено.")
+
+    acc_id = int(data.get("acc_id") or 0)
+    to_email = str(data.get("to_email") or "").strip().lower()
+    subject_raw = str(data.get("subject") or "").strip()
+    account_email = str(data.get("account_email") or "").strip().lower()
+
+    async with Session() as session:
+        user = await get_or_create_user(session, int(message.from_user.id))
+        acc = (
+            await session.execute(sa_select(EmailAccount).where(EmailAccount.id == acc_id))
+        ).scalar_one_or_none()
+        if not acc:
+            await state.clear()
+            return await message.answer("❌ SMTP аккаунт не найден в БД.")
+
+        from services.html_reply import (
+            get_html_reply_subject,
+            get_html_sender_name,
+            prepare_html_body,
+        )
+
+        subject = await get_html_reply_subject(session, user, fallback=_reply_subject(subject_raw))
+        sender_name = await get_html_sender_name(session, user)
+
+        html_signature = (
+            await session.execute(
+                sa_select(UserSetting.value)
+                .where(UserSetting.user_id == int(user.id))
+                .where(UserSetting.key == HTML_SIGNATURE_KEY)
+            )
+        ).scalar_one_or_none()
+
+        link = ""
+        if account_email:
+            conv = (
+                await session.execute(
+                    sa_select(ConversationLink)
+                    .where(ConversationLink.user_id == int(user.id))
+                    .where(ConversationLink.account_email == account_email)
+                    .where(ConversationLink.from_email == to_email)
+                )
+            ).scalar_one_or_none()
+            if conv and conv.generated_link:
+                link = str(conv.generated_link)
+
+        html_body = prepare_html_body(_apply_link(text, link), session, user)
+        if html_signature:
+            html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
+
+        try:
+            from services.placeholders import apply_placeholders
+
+            offer_title = await _offer_title_for_email(session, int(user.id), to_email)
+            offer_price = ""
+            offer_photo = ""
+            if offer_title:
+                try:
+                    canon = _canon_email(to_email)
+                    off = (
+                        await session.execute(
+                            sa_select(Offer)
+                            .join(OfferEmail, OfferEmail.offer_id == Offer.id)
+                            .where(Offer.user_id == int(user.id))
+                            .where(OfferEmail.email == canon)
+                            .order_by(Offer.id.desc())
+                            .limit(1)
+                        )
+                    ).scalars().first()
+                    if off:
+                        offer_price = (off.price or "").strip()
+                        offer_photo = (off.photo or "").strip()
+                except Exception:
+                    pass
+
+            ctx = {
+                "ITEM_TITLE": offer_title,
+                "PRICE": offer_price,
+                "IMAGE_URL": offer_photo,
+            }
+            html_body = apply_placeholders(html_body, link=link, ctx=ctx)
+        except Exception:
+            pass
+
+        ok, err = await send_email_via_account_with_proxy(
+            session,
+            int(user.id),
+            acc,
+            to_email,
+            subject,
+            html_body,
+            is_html=True,
+            sender_name=sender_name,
+        )
+
+    await state.clear()
+    if ok:
+        return await message.answer("✅ Отправлено.")
+    return await message.answer(f"❌ Ошибка SMTP: {err}")
+
+
+@router.callback_query(F.data.startswith("mail_info:"))
+async def cb_mail_info(callback: CallbackQuery):
+    try:
+        _, acc_id, uid = (callback.data or "").split(":", 2)
+        acc_id = int(acc_id)
+    except Exception:
+        return await callback.answer("Неверные данные", show_alert=True)
+
+    # ✅ Основной источник данных — БД (IncomingMail).
+    # FULL_META может быть очищен при рестартах, поэтому здесь всегда...
+    meta = FULL_META.get((acc_id, uid)) or {}
+    inbox_email = _canon_email(meta.get("account_email") or "")
+    contact_email = _canon_email(meta.get("from_email") or "")
+    subject = (meta.get("subject") or "").strip()
+    ad_url = (meta.get("ad_url") or "").strip()
+    gen_link = (meta.get("generated_link") or "").strip()
+
+    mail_db_id: int | None = None
+    mail_body: str = ""
+    mail_date: str = ""
+    mail_from_name: str = ""
+    resolved_offer_id: int | None = None
+
+    offer_title_full = offer_price = offer_link_full = offer_photo = offer_person = ""
+
+    conv_ad = conv_gen = ""
+    offer_title = offer_link = ""
+    offer_emails_cnt = 0
+    offer_link_by_email = ""
+    offer_emails_cnt_by_email = 0
+
+    async with Session() as session:
+        owner_user_id = await _get_acc_owner_user_id(session, acc_id)
+        if owner_user_id:
+            # 0) Ищем письмо в БД
+            mail = (
+                await session.execute(
+                    sa_select(IncomingMail)
+                    .where(IncomingMail.account_id == int(acc_id))
+                    .where(IncomingMail.imap_uid == int(uid))
+                    .limit(1)
+                )
+            ).scalars().first()
+            if mail:
+                mail_db_id = int(getattr(mail, "id", 0) or 0) or None
+                inbox_email = _canon_email(getattr(mail, "account_email", "") or "") or inbox_email
+                contact_email = _canon_email(getattr(mail, "from_email", "") or "") or contact_email
+                mail_from_name = (getattr(mail, "from_name", "") or "")
+                subject = (getattr(mail, "subject", "") or "").strip() or subject
+                mail_date = (getattr(mail, "date_str", "") or "")
+                mail_body = (getattr(mail, "body", "") or "")
+                ad_url = (getattr(mail, "ad_url", "") or "").strip() or ad_url
+                gen_link = (getattr(mail, "generated_link", "") or "").strip() or gen_link
+                resolved_offer_id = int(getattr(mail, "resolved_offer_id", 0) or 0) or None
+
+            conv = await _get_convlink(
+                session,
+                user_id=owner_user_id,
+                inbox_email=inbox_email,
+                contact_email=contact_email,
+            )
+            if conv:
+                conv_ad = (conv.ad_url or "").strip()
+                conv_gen = (conv.generated_link or "").strip()
+
+            # 0.1) Если письмо связано с Offer — показываем полные данные из Offer
+            if resolved_offer_id:
+                off = (
+                    await session.execute(
+                        sa_select(Offer).where(Offer.id == int(resolved_offer_id)).where(Offer.user_id == int(owner_user_id)).limit(1)
+                    )
+                ).scalars().first()
+                if off:
+                    offer_title_full = (getattr(off, "title", "") or "")
+                    offer_price = (getattr(off, "price", "") or "")
+                    offer_link_full = (getattr(off, "link", "") or "")
+                    offer_photo = (getattr(off, "photo", "") or "")
+                    offer_person = (getattr(off, "person_name", "") or "")
+
+            if subject:
+                subj_norm = re.sub(
+                    r"^(re|aw|fw|fwd)\s*:\s*",
+                    "",
+                    subject,
+                    flags=re.I,
+                ).strip()
+                m = re.search(r"\bOFFER\s*:\s*(.+)$", subj_norm, flags=re.I)
+                offer_title = (m.group(1).strip() if m else subj_norm)
+
+                row = (
+                    await session.execute(
+                        sa_select(Offer.id, Offer.link)
+                        .where(Offer.user_id == int(owner_user_id))
+                        .where(func.lower(Offer.title).like(f"%{offer_title.lower()}%"))
+                        .order_by(Offer.id.desc())
+                        .limit(1)
+                    )
+                ).first()
+                if row:
+                    oid, olink = row
+                    offer_link = (olink or "").strip()
+                    offer_emails_cnt = (
+                        await session.execute(
+                            sa_select(func.count(OfferEmail.id)).where(
+                                OfferEmail.offer_id == int(oid)
+                            )
+                        )
+                    ).scalar_one() or 0
+
+            # если по теме ничего не нашлось — ищем по email отправителя
+            if contact_email:
+                offer_obj, cnt = await _offer_by_sender_email(
+                    session, int(owner_user_id), contact_email
+                )
+                if offer_obj is not None:
+                    offer_link_by_email = (
+                        getattr(offer_obj, "link", "") or ""
+                    ).strip()
+                    offer_emails_cnt_by_email = int(cnt or 0)
+
+    # Показываем "фул данные" по письму (основное из IncomingMail + привязанные сущности).
+    # Дизайн не меняем — просто текст.
+    body_preview = (mail_body or "").strip()
+    if body_preview and len(body_preview) > 1800:
+        body_preview = body_preview[:1800] + "…"
+
+    text = (
+        "ℹ️ <b>Информация по письму</b>\n\n"
+        f"<b>Mail ID:</b> <code>{mail_db_id or '—'}</code>\n"
+        f"<b>Inbox:</b> <code>{_e(inbox_email) or '—'}</code>\n"
+        f"<b>From:</b> <code>{_e(contact_email) or '—'}</code>\n"
+        f"<b>From name:</b> <code>{_e(mail_from_name) or '—'}</code>\n"
+        f"<b>Subject:</b> <code>{_e(subject) or '—'}</code>\n\n"
+        f"<b>Date:</b> <code>{_e(mail_date) or '—'}</code>\n\n"
+        f"<b>Meta ad_url:</b> <code>{_e(ad_url) or '—'}</code>\n"
+        f"<b>Meta generated_link:</b> <code>{_e(gen_link) or '—'}</code>\n"
+        f"<b>DB conv ad_url:</b> <code>{_e(conv_ad) or '—'}</code>\n"
+        f"<b>DB conv generated_link:</b> <code>{_e(conv_gen) or '—'}</code>\n\n"
+        f"<b>Resolved offer_id:</b> <code>{resolved_offer_id or '—'}</code>\n"
+        f"<b>Offer.title:</b> <code>{_e(offer_title_full) or '—'}</code>\n"
+        f"<b>Offer.price:</b> <code>{_e(offer_price) or '—'}</code>\n"
+        f"<b>Offer.link:</b> <code>{_e(offer_link_full) or '—'}</code>\n"
+        f"<b>Offer.photo:</b> <code>{_e(offer_photo) or '—'}</code>\n"
+        f"<b>Offer.person_name:</b> <code>{_e(offer_person) or '—'}</code>\n\n"
+        f"<b>Offer title from subject:</b> <code>{_e(offer_title) or '—'}</code>\n"
+        f"<b>Offer.link (by title):</b> <code>{_e(offer_link) or '—'}</code>\n"
+        f"<b>Offer emails count:</b> <code>{offer_emails_cnt}</code>\n"
+        f"<b>Offer.link (by sender email):</b> <code>{_e(offer_link_by_email) or '—'}</code>\n"
+        f"<b>Offer emails count (by sender email):</b> <code>{offer_emails_cnt_by_email}</code>\n"
+        + ("\n<b>Body preview:</b>\n<blockquote><code>" + _e(body_preview) + "</code></blockquote>" if body_preview else "")
+    )
+    await callback.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    await callback.answer()
+
+
+# =========================
+# Offer price edit (кнопка "Цена" на pinned карточке)
+# =========================
+
+class _OfferPriceState(StatesGroup):
+    waiting_price = State()
+
+
+@router.callback_query(F.data.startswith("offer_price:"))
+async def cb_offer_price(callback: CallbackQuery, state: FSMContext):
+    try:
+        offer_id = int((callback.data or "").split(":", 1)[1])
+    except Exception:
+        return await callback.answer("Неверный ID", show_alert=True)
+
+    async with Session() as session:
+        offer = (await session.execute(sa_select(Offer).where(Offer.id == offer_id).limit(1))).scalars().first()
+        if not offer:
+            return await callback.answer("Оффер не найден", show_alert=True)
+        current = (offer.price or "—").strip() or "—"
+
+    await state.clear()
+    await state.set_state(_OfferPriceState.waiting_price)
+    await state.update_data(
+        offer_id=offer_id,
+        chat_id=int(callback.message.chat.id),
+        msg_id=int(callback.message.message_id),
+        has_photo=bool(getattr(callback.message, "photo", None)),
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open")]])
+
+    await callback.message.answer(
+        "💶 <b>Цена</b>\n\n"
+        f"Текущая цена: <code>{_e(current)}</code>\n\n"
+        "Отправь новую цену (например: <code>30</code> или <code>30.0</code>).\n"
+        "Чтобы отменить — отправь <code>-</code>."
+        ,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(_OfferPriceState.waiting_price)
+async def offer_price_set(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "-":
+        await state.clear()
+        return await message.answer("❌ Отменено.")
+
+    data = await state.get_data()
+    offer_id = int(data.get("offer_id") or 0)
+    if not offer_id:
+        await state.clear()
+        return await message.answer("❌ Нет offer_id.")
+
+    # normalize number
+    num = None
+    try:
+        num = float(text.replace(",", "."))
+    except Exception:
+        num = None
+
+    if num is None:
+        return await message.answer("❌ Введи число (пример: 30 или 30.0) или '-' для отмены.")
+
+    new_price = f"€ {num}"
+
+    async with Session() as session:
+        offer = (await session.execute(sa_select(Offer).where(Offer.id == offer_id).limit(1))).scalars().first()
+        if not offer:
+            await state.clear()
+            return await message.answer("❌ Оффер не найден.")
+        offer.price = new_price
+        await session.commit()
+
+    # Try to update the pinned card if possible (best-effort)
+    try:
+        chat_id = int(data.get("chat_id") or 0)
+        msg_id = int(data.get("msg_id") or 0)
+        if chat_id and msg_id:
+            # we don't have full card_text here; just notify in chat like reference
+            pass
+    except Exception:
+        pass
+
+    await state.clear()
+    await message.answer(f"✅ Цена товара с ID {offer_id} была изменена на {new_price}")

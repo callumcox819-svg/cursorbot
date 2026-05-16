@@ -1,0 +1,66 @@
+ОБНОВЛЁННЫЙ БОТ (happy88 / @spizdil88bot)
+Собрано: 2026-05-10
+Исходник: happy88-main
+
+═══════════════════════════════════════════════════════════════
+ПРОБЛЕМА
+═══════════════════════════════════════════════════════════════
+Inline-кнопки в «⚙️ Настройки» не реагировали: в логе был 📥 CallbackQuery,
+но экран не открывался / не было «Update is handled».
+
+═══════════════════════════════════════════════════════════════
+ОСНОВНЫЕ ПРАВКИ
+═══════════════════════════════════════════════════════════════
+
+1) bot.py
+   - Колбэки главной клавиатуры «Настройки» зарегистрированы на корневом
+     Dispatcher (_bind_settings_main_keyboard_callbacks) — 14 обработчиков
+     (priority_menu, presets_menu, firstsms_open, ref_toggle:*, прокси, и т.д.).
+   - Роутер settings подключается сразу после start.
+   - Middleware: щит от падений, лог 📥/📤 на Update, лог 🔎 на callback.
+   - Жёсткий таймаут колбэка (CALLBACK_CHAIN_TIMEOUT_SEC) по умолчанию ВЫКЛ.
+   - tasks_concurrency_limit=5 убран (блокировал polling при зависших апдейтах).
+   - allowed_updates с явным callback_query.
+   - AiohttpSession с таймаутом (TELEGRAM_HTTP_TIMEOUT_SEC).
+   - Защита от второго экземпляра бота (.happy88_bot.pid + psutil).
+
+2) utils/callback_safe.py
+   - callback_answer_safe — answer с таймаутом и без падения апдейта.
+
+3) handlers/settings.py, first_sms.py, proxies.py, templates.py, accounts.py, api_keys.py
+   - Безопасный answer перед edit_text; try/except на БД и TelegramBadRequest.
+   - Убран asyncio.gather (гонки FSM/БД/Telegram).
+
+4) database.py
+   - SQLite: WAL, busy_timeout=60000, connect timeout.
+
+5) handlers/catchall_debug.py
+   - Широкий @router.callback_query() только при DEBUG_CATCHALL=1.
+
+═══════════════════════════════════════════════════════════════
+ЗАПУСК
+═══════════════════════════════════════════════════════════════
+1. Установить зависимости (из requirements.txt, если есть).
+2. Задать BOT_TOKEN и при необходимости DATABASE_URL в окружении или .env.
+3. Один процесс на токен: python bot.py
+4. Не запускать второй экземпляр (Railway/другой ПК с тем же токеном).
+
+Переменные окружения (опционально):
+  CALLBACK_CHAIN_TIMEOUT_SEC — жёсткий таймаут цепочки колбэка (0 = выкл)
+  TELEGRAM_HTTP_TIMEOUT_SEC  — таймаут HTTP к Telegram (по умолчанию ~35)
+  TASKS_CONCURRENCY_LIMIT    — лимит параллельных апдейтов (не задавать без нужды)
+  DEBUG_CATCHALL=1           — отладочный перехват всех колбэков
+
+═══════════════════════════════════════════════════════════════
+ФАЙЛЫ С КЛЮЧЕВЫМИ ПРАВКАМИ
+═══════════════════════════════════════════════════════════════
+bot.py
+utils/callback_safe.py
+database.py
+handlers/settings.py
+handlers/first_sms.py
+handlers/proxies.py
+handlers/templates.py
+handlers/accounts.py
+handlers/api_keys.py
+handlers/catchall_debug.py

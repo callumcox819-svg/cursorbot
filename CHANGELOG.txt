@@ -1,0 +1,6 @@
+Changelog (TZ build)
+- FAST ускорен: batch SMTP per account (services/sender.py, handlers/send.py)
+- Антидубль навсегда через таблицу sent_emails (уже было, сохранили)
+- UX: исправлен Back из доменов (settings_menu_kb требует user_id)
+- Админка: новая панель с кнопками (валидатор key, stats, allow/deny, restart)
+- Доступ: middleware блокирует забаненных

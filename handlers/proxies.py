@@ -1,0 +1,756 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from typing import Optional, List, Tuple, Dict
+
+import aiohttp
+from aiogram import Router, F
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram.exceptions import TelegramBadRequest
+from sqlalchemy import select
+
+from database import Session
+from models import User, Proxy
+
+router = Router()
+logger = logging.getLogger(__name__)
+
+
+# ======================
+#  FSM состояния
+# ======================
+
+class ProxyAddStates(StatesGroup):
+    waiting_for_list = State()
+
+
+# ======================
+#  Helpers
+# ======================
+
+_HOST_IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+_HOST_IPV6_RE = re.compile(r"^\[?[0-9a-fA-F:]+\]?$")  # rough
+_HOST_HAS_DOT_RE = re.compile(r"\.")  # domain usually has dot
+_HOST_HAS_DIGIT_RE = re.compile(r"\d")
+_BAD_HOST_WORDS = {
+    "тип", "типпрокси", "прокси", "host", "хост", "порт", "port",
+    "логин", "login", "user", "username", "пароль", "password", "pass",
+}
+
+def _is_probable_host(host: str) -> bool:
+    """Чтобы не принимать 'Порт' как host."""
+    if not host:
+        return False
+    h = host.strip()
+    hl = h.lower()
+
+    # явно мусорные слова
+    if hl in _BAD_HOST_WORDS:
+        return False
+
+    # IPv4
+    if _HOST_IPV4_RE.match(h):
+        # грубо проверим октеты
+        try:
+            parts = [int(x) for x in h.split(".")]
+            if all(0 <= p <= 255 for p in parts):
+                return True
+        except Exception:
+            return False
+
+    # IPv6
+    if ":" in h and _HOST_IPV6_RE.match(h):
+        return True
+
+    # домены: обычно есть точка или цифра (многие прокси: proxy123.domain.com)
+    if _HOST_HAS_DOT_RE.search(h) or _HOST_HAS_DIGIT_RE.search(h):
+        return True
+
+    return False
+
+
+def _normalize_proxy_type(t: str | None) -> str:
+    t = (t or "http").strip().lower()
+    # популярные синонимы
+    if t in ("https",):
+        return "http"  # aiohttp использует http:// для https-proxy
+    if t in ("socks", "sock5", "socksv5"):
+        return "socks5"
+    if t in ("socks5h",):
+        return "socks5h"
+    if t in ("socks4", "socks4a"):
+        return t
+    if t in ("http", "socks5", "socks5h"):
+        return t
+    # если что-то странное — пусть будет http
+    if t.startswith("socks"):
+        return "socks5"
+    return "http"
+
+
+def _strip_comments(s: str) -> str:
+    """убираем комментарии типа '... # comment'"""
+    if not s:
+        return ""
+    s = s.strip().strip('"').strip("'")
+    # режем по # если это не часть пароля/логина (в прокси почти не встречается)
+    if "#" in s:
+        s = s.split("#", 1)[0].strip()
+    return s
+
+
+# ======================
+#  Парсер строки/блока прокси
+# ======================
+
+def parse_proxy_string(raw: str) -> Optional[dict]:
+    """
+    Поддерживаемые форматы (и ещё куча вариаций):
+
+      URL-формы:
+        - http://user:pass@ip:port
+        - https://user:pass@ip:port
+        - socks5://user:pass@ip:port
+        - socks5://ip:port
+
+      Классика:
+        - ip:port
+        - ip:port:user:pass
+        - ip:port:user:pass:socks5
+
+      Браузерные:
+        - user:pass@ip:port
+        - ip:port@user:pass
+
+    Важно: мы НЕ хотим принимать строки типа "Порт: 10811" как прокси.
+    """
+    raw = _strip_comments(raw)
+    if not raw:
+        return None
+
+    # ---------- 1) URL формат ----------
+    if "://" in raw:
+        from urllib.parse import urlsplit
+        try:
+            u = urlsplit(raw)
+            scheme = _normalize_proxy_type(u.scheme)
+            host = u.hostname
+            port = u.port
+            user = u.username
+            pwd = u.password
+            if not host or not port or not _is_probable_host(host):
+                return None
+            return {
+                "host": host,
+                "port": int(port),
+                "username": user,
+                "password": pwd,
+                "type": scheme,
+            }
+        except Exception as e:
+            logger.warning("URL proxy parse failed for '%s': %s", raw, e)
+            return None
+
+    # ---------- 2) user:pass@host:port ----------
+    if "@" in raw:
+        # A) user:pass@host:port(:type?)  или user:pass@host:port|type
+        try:
+            left, right = raw.rsplit("@", 1)
+            # возможен суффикс :type после port
+            proto = None
+
+            # right может быть host:port или host:port:type
+            rparts = right.split(":")
+            if len(rparts) >= 2:
+                host = rparts[0].strip()
+                port_s = rparts[1].strip()
+                if len(rparts) >= 3:
+                    proto = rparts[2].strip()
+                if not _is_probable_host(host):
+                    raise ValueError("bad host")
+                port_i = int(port_s)
+
+                if ":" in left:
+                    user, pwd = left.split(":", 1)
+                else:
+                    user, pwd = left, ""
+
+                return {
+                    "host": host,
+                    "port": port_i,
+                    "username": user or None,
+                    "password": pwd or None,
+                    "type": _normalize_proxy_type(proto or "http"),
+                }
+        except Exception:
+            pass
+
+        # B) host:port@user:pass
+        try:
+            hostport, creds = raw.split("@", 1)
+            if ":" not in hostport or ":" not in creds:
+                raise ValueError("not host:port@user:pass")
+            host, port_s = hostport.split(":", 1)
+            user, pwd = creds.split(":", 1)
+            if not _is_probable_host(host):
+                raise ValueError("bad host")
+            return {
+                "host": host.strip(),
+                "port": int(port_s.strip()),
+                "username": user.strip() or None,
+                "password": pwd.strip() or None,
+                "type": "http",
+            }
+        except Exception:
+            pass
+
+    # ---------- 3) через ':' ----------
+    parts = raw.split(":")
+    parts = [p.strip() for p in parts if p is not None]
+
+    # ip:port
+    if len(parts) == 2:
+        host, port = parts
+        if not _is_probable_host(host):
+            return None
+        try:
+            port_i = int(port)
+        except ValueError:
+            return None
+        return {
+            "host": host,
+            "port": port_i,
+            "username": None,
+            "password": None,
+            "type": "http",
+        }
+
+    # ip:port:user:pass
+    if len(parts) == 4:
+        host, port, user, pwd = parts
+        if not _is_probable_host(host):
+            return None
+        try:
+            port_i = int(port)
+        except ValueError:
+            return None
+        return {
+            "host": host,
+            "port": port_i,
+            "username": user or None,
+            "password": pwd or None,
+            "type": "http",
+        }
+
+    # ip:port:user:pass:type
+    if len(parts) == 5:
+        host, port, user, pwd, proto = parts
+        if not _is_probable_host(host):
+            return None
+        try:
+            port_i = int(port)
+        except ValueError:
+            return None
+        return {
+            "host": host,
+            "port": port_i,
+            "username": user or None,
+            "password": pwd or None,
+            "type": _normalize_proxy_type(proto),
+        }
+
+    return None
+
+
+def parse_proxy_block(text: str) -> Optional[dict]:
+    """
+    Парсит "карточку" вида:
+      Тип прокси: socks5
+      Хост: 109.104.153.100
+      Порт: 10811
+      Логин: user
+      Пароль: pass
+
+    Также понимает:
+      type=...
+      host=...
+      port=...
+      user=...
+      pass=...
+    """
+    if not text:
+        return None
+
+    raw = text.strip()
+    if not raw:
+        return None
+
+    # Если блок — это просто одна строка, пусть обработает parse_proxy_string
+    if "\n" not in raw:
+        return parse_proxy_string(raw)
+
+    kv: Dict[str, str] = {}
+    for line in raw.splitlines():
+        l = line.strip()
+        if not l:
+            continue
+
+        # позволяем "ключ: значение" и "ключ = значение"
+        if ":" in l:
+            k, v = l.split(":", 1)
+        elif "=" in l:
+            k, v = l.split("=", 1)
+        else:
+            # если это не key:value, возможно это обычная строка прокси — попробуем позже
+            continue
+
+        k = (k or "").strip().lower()
+        v = (v or "").strip()
+        if not v:
+            continue
+
+        # нормализуем ключи
+        if "тип" in k or k in ("type", "scheme", "proto", "protocol"):
+            kv["type"] = v
+        elif "хост" in k or k in ("host", "ip", "addr", "address"):
+            kv["host"] = v
+        elif "порт" in k or k in ("port",):
+            kv["port"] = v
+        elif "логин" in k or "user" in k or k in ("username",):
+            kv["username"] = v
+        elif "пароль" in k or "pass" in k:
+            kv["password"] = v
+
+    # Если похоже на карточку
+    if "host" in kv and "port" in kv:
+        host = kv.get("host", "").strip()
+        if not _is_probable_host(host):
+            return None
+        try:
+            port_i = int(str(kv.get("port", "")).strip())
+        except Exception:
+            return None
+
+        return {
+            "host": host,
+            "port": port_i,
+            "username": (kv.get("username") or "").strip() or None,
+            "password": (kv.get("password") or "").strip() or None,
+            "type": _normalize_proxy_type(kv.get("type")),
+        }
+
+    # Иначе попробуем найти строку прокси внутри блока (если человек вставил лишний текст)
+    for line in raw.splitlines():
+        p = parse_proxy_string(line.strip())
+        if p:
+            return p
+
+    return None
+
+
+# ======================
+#  Проверка прокси
+# ======================
+
+async def _test_http_like_proxy(proxy_url: str) -> Tuple[bool, str]:
+    test_urls = [
+        "http://httpbin.org/ip",
+        "http://example.com",
+        "http://icanhazip.com",
+    ]
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        last_error = "no response"
+        for url in test_urls:
+            try:
+                async with session.get(url, proxy=proxy_url) as resp:
+                    return True, f"HTTP-proxy OK ({resp.status}) via {url}"
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e} ({url})"
+                logger.warning("HTTP proxy check failed %s via %s", proxy_url, url)
+                continue
+
+    return False, last_error
+
+
+async def _test_socks_proxy(proxy_url: str) -> Tuple[bool, str]:
+    try:
+        from aiohttp_socks import ProxyConnector  # type: ignore
+    except ImportError:
+        return False, "aiohttp_socks не установлен (pip install aiohttp_socks)"
+
+    test_urls = [
+        "http://httpbin.org/ip",
+        "http://example.com",
+    ]
+    timeout = aiohttp.ClientTimeout(total=10)
+    connector = ProxyConnector.from_url(proxy_url)
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        last_error = "no response"
+        for url in test_urls:
+            try:
+                async with session.get(url) as resp:
+                    return True, f"SOCKS OK ({resp.status}) via {url}"
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e} ({url})"
+                logger.warning("SOCKS proxy check failed %s via %s", proxy_url, url)
+                continue
+
+    return False, last_error
+
+
+async def test_proxy(proxy: dict) -> Tuple[bool, str]:
+    proxy_type = _normalize_proxy_type(proxy.get("type"))
+
+    if proxy.get("username") and proxy.get("password"):
+        proxy_url = f"{proxy_type}://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
+    else:
+        proxy_url = f"{proxy_type}://{proxy['host']}:{proxy['port']}"
+
+    if proxy_type in ("http",):
+        return await _test_http_like_proxy(proxy_url)
+    elif proxy_type.startswith("socks"):
+        return await _test_socks_proxy(proxy_url)
+    else:
+        return False, f"Неизвестный тип прокси: {proxy_type}"
+
+
+# ======================
+#  Меню
+# ======================
+
+def proxies_menu(proxies: List[Proxy]) -> InlineKeyboardMarkup:
+    rows = []
+
+    for p in proxies:
+        status = "🟢" if p.is_active else "🔴"
+        ptype = (p.type or "http").lower()
+        text = f"{status} {ptype} {p.host}:{p.port}"
+
+        rows.append([
+            InlineKeyboardButton(text=text, callback_data=f"proxy_info:{p.id}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"proxy_del:{p.id}"),
+            InlineKeyboardButton(text="🔄", callback_data=f"proxy_test:{p.id}"),
+        ])
+
+    rows.append([InlineKeyboardButton(text="➕ Добавить прокси", callback_data="proxy_add_menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_back")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ======================
+#  Рендер меню
+# ======================
+
+async def render_proxy_menu(message_or_cb, telegram_id: int):
+    async with Session() as session:
+        res_user = await session.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        user = res_user.scalar_one_or_none()
+
+        if not user:
+            proxies: List[Proxy] = []
+        else:
+            result = await session.execute(
+                select(Proxy).where(Proxy.user_id == user.id)
+            )
+            proxies = list(result.scalars())
+
+    text = (
+        "🧩 <b>Твои прокси</b>\n\n"
+        f"Всего: {len(proxies)}\n"
+        f"Рабочих: {sum(1 for p in proxies if p.is_active)}\n"
+        f"Плохих: {sum(1 for p in proxies if not p.is_active)}"
+    )
+
+    kb = proxies_menu(proxies)
+
+    if isinstance(message_or_cb, Message):
+        await message_or_cb.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await message_or_cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+# ======================
+#  Открыть список прокси
+# ======================
+
+@router.callback_query(F.data == "settings_proxies")
+async def open_proxies(callback: CallbackQuery):
+    try:
+        await callback.answer()
+    except TelegramBadRequest:
+        pass
+    await render_proxy_menu(callback, callback.from_user.id)
+
+
+# ======================
+#  Добавить прокси — меню
+# ======================
+
+@router.callback_query(F.data == "proxy_add_menu")
+async def proxy_add_menu(callback: CallbackQuery, state: FSMContext):
+    try:
+        await callback.answer()
+    except TelegramBadRequest:
+        pass
+
+    await state.set_state(ProxyAddStates.waiting_for_list)
+    await callback.message.edit_text(
+        "📝 Пришли список прокси (по одному на строку) ИЛИ карточкой (Тип/Хост/Порт/Логин/Пароль).\n\n"
+        "<b>Примеры:</b>\n"
+        "<code>socks5://user:pass@109.104.153.100:10811</code>\n"
+        "<code>109.104.153.100:10811:user:pass:socks5</code>\n"
+        "<code>user:pass@109.104.153.100:10811</code>\n\n"
+        "<b>Или так (карточкой):</b>\n"
+        "<code>Тип прокси: socks5\nХост: 109.104.153.100\nПорт: 10811\nЛогин: user\nПароль: pass</code>\n\n"
+        "Каждый прокси будет проверен.\n",
+        parse_mode="HTML",
+    )
+
+
+# ======================
+#  Обработка добавления прокси
+# ======================
+
+@router.message(ProxyAddStates.waiting_for_list)
+async def proxy_add_process(message: Message, state: FSMContext):
+    raw_text = (message.text or "").strip()
+    if not raw_text:
+        await message.answer("❌ Пусто. Пришли прокси строками или карточкой.")
+        return
+
+    telegram_id = message.from_user.id
+
+    # 1) Разбиваем на блоки по пустым строкам (чтобы поддержать несколько карточек)
+    blocks: list[str] = []
+    cur: list[str] = []
+    for ln in raw_text.splitlines():
+        if ln.strip() == "":
+            if cur:
+                blocks.append("\n".join(cur).strip())
+                cur = []
+        else:
+            cur.append(ln.strip())
+    if cur:
+        blocks.append("\n".join(cur).strip())
+
+    # 2) Если это НЕ карточки — оставим как "строка на прокси"
+    # Если блок один и он без ключевых слов — будем парсить построчно.
+    def _has_kv_keywords(t: str) -> bool:
+        s = t.lower()
+        return any(k in s for k in ("тип прокси", "хост", "порт", "логин", "пароль", "username", "password", "type="))
+
+    parsed_items: list[tuple[str, Optional[dict]]] = []
+
+    if len(blocks) == 1 and not _has_kv_keywords(blocks[0]):
+        # обычный режим: каждая строка отдельный прокси
+        for line in [l.strip() for l in raw_text.splitlines() if l.strip()]:
+            parsed_items.append((line, parse_proxy_string(line)))
+    else:
+        # режим блоков: каждый блок либо карточка, либо одиночная строка
+        for b in blocks:
+            if _has_kv_keywords(b):
+                parsed_items.append((b, parse_proxy_block(b)))
+            else:
+                # если в блоке несколько строк, попробуем каждую
+                if "\n" in b:
+                    for line in [l.strip() for l in b.splitlines() if l.strip()]:
+                        parsed_items.append((line, parse_proxy_string(line)))
+                else:
+                    parsed_items.append((b, parse_proxy_string(b)))
+
+    ok_count = 0
+    fail_count = 0
+    details: List[str] = []
+
+    async with Session() as session:
+        res_user = await session.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        user = res_user.scalar_one_or_none()
+        if not user:
+            user = User(telegram_id=telegram_id)
+            session.add(user)
+            await session.commit()
+            await session.refresh(user)
+
+        for original_text, parsed in parsed_items:
+            if not parsed:
+                fail_count += 1
+                # показываем кратко (чтобы не залить чат огромным блоком)
+                preview = original_text.replace("\n", " / ")
+                if len(preview) > 120:
+                    preview = preview[:120] + "…"
+                details.append(f"❌ `{preview}` — неправильный формат")
+                continue
+
+            ok, info = await test_proxy(parsed)
+
+            proxy = Proxy(
+                user_id=user.id,
+                host=parsed["host"],
+                port=parsed["port"],
+                username=parsed.get("username"),
+                password=parsed.get("password"),
+                type=parsed.get("type", "http"),
+                is_active=ok,
+                last_error=None if ok else info,
+            )
+
+            try:
+                session.add(proxy)
+                await session.commit()
+                ok_count += 1
+                preview = original_text.replace("\n", " / ")
+                if len(preview) > 120:
+                    preview = preview[:120] + "…"
+                details.append(f"✅ `{preview}` — {info}")
+            except Exception as e:
+                logger.exception("Error saving proxy")
+                fail_count += 1
+                preview = original_text.replace("\n", " / ")
+                if len(preview) > 120:
+                    preview = preview[:120] + "…"
+                details.append(f"❌ `{preview}` — ошибка сохранения: {e}")
+
+    summary = (
+        "Готово.\n\n"
+        f"Успешно добавлено: {ok_count}\n"
+        f"Ошибок: {fail_count}\n\n" +
+        "\n".join(details[:50])  # ограничим, чтобы не словить лимиты
+    )
+    if len(details) > 50:
+        summary += f"\n…и ещё {len(details) - 50} строк"
+
+    await message.answer(summary, parse_mode="Markdown")
+    await state.clear()
+    await render_proxy_menu(message, telegram_id)
+
+
+# ======================
+#  Клик по прокси (инфо)
+# ======================
+
+@router.callback_query(F.data.startswith("proxy_info:"))
+async def proxy_info(callback: CallbackQuery):
+    proxy_id = int(callback.data.split(":")[1])
+
+    try:
+        await callback.answer()
+    except TelegramBadRequest:
+        pass
+
+    async with Session() as session:
+        proxy = await session.get(Proxy, proxy_id)
+
+    if not proxy:
+        return
+
+    err = proxy.last_error or "-"
+
+    text = (
+        "🧩 <b>Прокси</b>\n\n"
+        f"Host: <code>{proxy.host}</code>\n"
+        f"Port: <code>{proxy.port}</code>\n"
+        f"Type: <code>{proxy.type}</code>\n"
+        f"Username: <code>{proxy.username}</code>\n"
+        f"Password: <code>{proxy.password}</code>\n"
+        f"Статус: {'🟢 Рабочий' if proxy.is_active else '🔴 Ошибка'}\n"
+        f"Ошибка: <code>{err}</code>"
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Проверить", callback_data=f"proxy_test:{proxy.id}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_proxies")],
+        ]
+    )
+
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+# ======================
+#  Удаление прокси
+# ======================
+
+@router.callback_query(F.data.startswith("proxy_del:"))
+async def proxy_delete(callback: CallbackQuery):
+    proxy_id = int(callback.data.split(":")[1])
+
+    try:
+        await callback.answer("Удаляю…")
+    except TelegramBadRequest:
+        pass
+
+    async with Session() as session:
+        proxy = await session.get(Proxy, proxy_id)
+        if proxy:
+            await session.delete(proxy)
+            await session.commit()
+
+    await render_proxy_menu(callback, callback.from_user.id)
+
+
+# ======================
+#  Ручной тест прокси
+# ======================
+
+@router.callback_query(F.data.startswith("proxy_test:"))
+async def proxy_test(callback: CallbackQuery):
+    try:
+        await callback.answer("⏳ Тестирую прокси...", show_alert=False)
+    except TelegramBadRequest:
+        pass
+
+    proxy_id = int(callback.data.split(":")[1])
+
+    async with Session() as session:
+        proxy = await session.get(Proxy, proxy_id)
+
+    if not proxy:
+        return
+
+    proxy_dict = {
+        "host": proxy.host,
+        "port": proxy.port,
+        "username": proxy.username,
+        "password": proxy.password,
+        "type": proxy.type,
+    }
+
+    async def run():
+        ok, info = await test_proxy(proxy_dict)
+
+        async with Session() as session2:
+            proxy_db = await session2.get(Proxy, proxy_id)
+            if proxy_db:
+                proxy_db.is_active = ok
+                proxy_db.last_error = None if ok else info
+                await session2.commit()
+
+        status_text = "✅ Прокси работает" if ok else f"❌ Прокси не работает\n{info}"
+        try:
+            await callback.bot.send_message(callback.message.chat.id, status_text)
+        except Exception:
+            pass
+
+        try:
+            await render_proxy_menu(callback, callback.from_user.id)
+        except Exception:
+            logger.exception("render_proxy_menu failed")
+
+    asyncio.create_task(run())
