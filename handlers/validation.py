@@ -244,7 +244,8 @@ async def validation_handler(message: Message):
         await status_msg.edit_text(
             "📥 Файл принят. Подготавливаю данные…\n"
             f"Всего объявлений: <b>{total_offers}</b>\n"
-            f"С именем продавца: <b>{offers_with_name}</b>",
+            f"К валидации (имя ≥{MIN_NAME_TOKEN_LEN} букв / ник): <b>{offers_with_name}</b>\n"
+            f"Всего с полем имени: <b>{offers_name_any}</b>",
             parse_mode="HTML",
         )
     except Exception:
