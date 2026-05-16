@@ -24,6 +24,31 @@ def _is_start_message(event: TelegramObject) -> bool:
     return text.startswith("/start")
 
 
+def _is_non_private_message(event: TelegramObject) -> bool:
+    """В группах/каналах не проверяем доступ по Message (пин, сервисные апдейты и т.д.)."""
+    if not isinstance(event, Message):
+        return False
+    chat = event.chat
+    if chat is None:
+        return False
+    return chat.type in ("group", "supergroup", "channel")
+
+
+def _is_service_message(event: Message) -> bool:
+    """Сервисные сообщения (пин, вступление в чат) не должны вызывать отказ в доступе."""
+    if event.pinned_message is not None:
+        return True
+    if event.new_chat_members:
+        return True
+    if event.left_chat_member is not None:
+        return True
+    if event.group_chat_created or event.supergroup_chat_created:
+        return True
+    if event.migrate_to_chat_id or event.migrate_from_chat_id:
+        return True
+    return False
+
+
 async def user_has_bot_access(telegram_id: int) -> bool:
     tg_id = int(telegram_id)
     if await user_is_admin(tg_id):
@@ -51,6 +76,12 @@ class BotAccessMiddleware(BaseMiddleware):
         user = data.get("event_from_user")
         if user is None:
             return await handler(event, data)
+
+        if isinstance(event, Message):
+            if _is_non_private_message(event) or _is_service_message(event):
+                return await handler(event, data)
+            if getattr(user, "is_bot", False):
+                return await handler(event, data)
 
         if await user_is_admin(user.id):
             return await handler(event, data)

@@ -17,4 +17,11 @@ async def user_is_admin(telegram_id: int) -> bool:
         return True
     async with Session() as session:
         user = await get_or_create_user(session, tg_id)
-    return bool(getattr(user, "is_admin", False))
+        if bool(getattr(user, "is_admin", False)):
+            if not getattr(user, "is_banned", False) and not bool(
+                getattr(user, "access_granted", False)
+            ):
+                user.access_granted = True
+                await session.commit()
+            return True
+    return False
