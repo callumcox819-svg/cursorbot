@@ -81,22 +81,27 @@ def _is_probable_host(host: str) -> bool:
 
 
 def _normalize_proxy_type(t: str | None) -> str:
-    t = (t or "http").strip().lower()
-    # популярные синонимы
-    if t in ("https",):
-        return "http"  # aiohttp использует http:// для https-proxy
+    """Только SOCKS5 для рассылки."""
+    t = (t or "socks5").strip().lower()
     if t in ("socks", "sock5", "socksv5"):
         return "socks5"
     if t in ("socks5h",):
         return "socks5h"
-    if t in ("socks4", "socks4a"):
-        return t
-    if t in ("http", "socks5", "socks5h"):
-        return t
-    # если что-то странное — пусть будет http
+    if t in ("socks5",):
+        return "socks5"
+    if t in ("http", "https"):
+        return "http"
     if t.startswith("socks"):
         return "socks5"
-    return "http"
+    return "socks5"
+
+
+def _reject_non_socks5(parsed: dict) -> Optional[str]:
+    pt = _normalize_proxy_type(parsed.get("type"))
+    if pt in ("http", "https"):
+        return "Поддерживается только SOCKS5. HTTP/HTTPS прокси не подходят для рассылки."
+    parsed["type"] = "socks5"
+    return None
 
 
 def _strip_comments(s: str) -> str:
@@ -191,7 +196,7 @@ def parse_proxy_string(raw: str) -> Optional[dict]:
                     "port": port_i,
                     "username": user or None,
                     "password": pwd or None,
-                    "type": _normalize_proxy_type(proto or "http"),
+                    "type": _normalize_proxy_type(proto or "socks5"),
                 }
         except Exception:
             pass
@@ -210,7 +215,7 @@ def parse_proxy_string(raw: str) -> Optional[dict]:
                 "port": int(port_s.strip()),
                 "username": user.strip() or None,
                 "password": pwd.strip() or None,
-                "type": "http",
+                "type": "socks5",
             }
         except Exception:
             pass
@@ -233,7 +238,7 @@ def parse_proxy_string(raw: str) -> Optional[dict]:
             "port": port_i,
             "username": None,
             "password": None,
-            "type": "http",
+            "type": "socks5",
         }
 
     # ip:port:user:pass
@@ -250,7 +255,7 @@ def parse_proxy_string(raw: str) -> Optional[dict]:
             "port": port_i,
             "username": user or None,
             "password": pwd or None,
-            "type": "http",
+            "type": "socks5",
         }
 
     # ip:port:user:pass:type
@@ -368,7 +373,7 @@ def proxies_menu(proxies: List[Proxy]) -> InlineKeyboardMarkup:
 
     for p in proxies:
         status = "🟢" if p.is_active else "🔴"
-        ptype = (p.type or "http").lower()
+        ptype = (p.type or "socks5").lower()
         text = f"{status} {ptype} {p.host}:{p.port}"
 
         rows.append([
@@ -407,9 +412,9 @@ async def render_proxy_menu(message_or_cb, telegram_id: int):
     text = (
         "🧩 <b>Твои прокси</b>\n\n"
         f"Всего: {len(proxies)}\n"
-        f"Рабочих (веб+SMTP): {sum(1 for p in proxies if p.is_active)}\n"
+        f"Рабочих (SOCKS5+SMTP): {sum(1 for p in proxies if p.is_active)}\n"
         f"Плохих: {sum(1 for p in proxies if not p.is_active)}\n"
-        f"<i>Проверка = httpbin + туннель к smtp.gmail.com:587</i>"
+        f"<i>Только SOCKS5 · проверка: туннель + smtp.gmail.com:587</i>"
     )
 
     kb = proxies_menu(proxies)
@@ -446,7 +451,8 @@ async def proxy_add_menu(callback: CallbackQuery, state: FSMContext):
 
     await state.set_state(ProxyAddStates.waiting_for_list)
     await callback.message.edit_text(
-        "📝 Пришли список прокси (по одному на строку) ИЛИ карточкой (Тип/Хост/Порт/Логин/Пароль).\n\n"
+        "📝 <b>Только SOCKS5</b> (HTTP не поддерживается).\n"
+        "Пришли список прокси (по одному на строку) ИЛИ карточкой.\n\n"
         "<b>Примеры:</b>\n"
         "<code>socks5://user:pass@109.104.153.100:10811</code>\n"
         "<code>109.104.153.100:10811:user:pass:socks5</code>\n"
@@ -534,6 +540,15 @@ async def proxy_add_process(message: Message, state: FSMContext):
                 details.append(f"❌ `{preview}` — неправильный формат")
                 continue
 
+            err = _reject_non_socks5(parsed)
+            if err:
+                fail_count += 1
+                preview = original_text.replace("\n", " / ")
+                if len(preview) > 120:
+                    preview = preview[:120] + "…"
+                details.append(f"❌ `{preview}` — {err}")
+                continue
+
             ok, info = await test_proxy(parsed)
 
             proxy = Proxy(
@@ -542,7 +557,7 @@ async def proxy_add_process(message: Message, state: FSMContext):
                 port=parsed["port"],
                 username=parsed.get("username"),
                 password=parsed.get("password"),
-                type=parsed.get("type", "http"),
+                type="socks5",
                 is_active=ok,
                 last_error=None if ok else info,
             )

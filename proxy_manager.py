@@ -11,10 +11,8 @@ from models import Proxy, UserSetting
 
 logger = logging.getLogger(__name__)
 
-# 🔒 один глобальный lock на любые операции с SMTP proxy (smtplib wrap/reset)
 _PROXY_LOCK = asyncio.Lock()
 
-# Оригинальный socket-модуль внутри smtplib (чтобы вернуть назад)
 import socket as _stdlib_socket
 import smtplib as _smtplib
 
@@ -23,23 +21,19 @@ _SOCKET_GETADDRINFO_ORIG = None
 _SMTP_TEST_HOST = "smtp.gmail.com"
 _SMTP_TEST_PORT = 587
 
+SOCKS5_TYPES = frozenset({"socks5", "socks5h"})
 
-# ----------------------------
-# Choose proxy
-# ----------------------------
+
+def is_socks5_proxy(proxy: Proxy) -> bool:
+    t = (getattr(proxy, "proxy_type", None) or proxy.type or "socks5").lower().strip()
+    return t in SOCKS5_TYPES or t.startswith("socks5")
+
+
 async def choose_proxy_for_user(session, user_id: int) -> Optional[Proxy]:
     """
-    Возвращает один активный прокси пользователя.
-
-    Ротация управляется настройкой user_settings:
-      key = "proxy_rotation"
-        - "0" (по умолчанию) => первый активный прокси
-        - "1" => случайный активный прокси на каждую отправку
-
-    ВАЖНО: user_id тут = users.id (DB), НЕ telegram_id.
+    Возвращает один активный SOCKS5 прокси пользователя.
     """
     try:
-        # rotation flag
         rot = (
             await session.execute(
                 select(UserSetting.value)
@@ -52,23 +46,19 @@ async def choose_proxy_for_user(session, user_id: int) -> Optional[Proxy]:
 
         active_cond = or_(Proxy.is_active.is_(True), Proxy.is_active.is_(None))
 
-        if not rot_on:
-            q = (
+        def _base_q():
+            return (
                 select(Proxy)
                 .where(Proxy.user_id == int(user_id))
                 .where(active_cond)
-                .order_by(Proxy.id.asc())
-                .limit(1)
+                .where(Proxy.type.in_(list(SOCKS5_TYPES)))
             )
+
+        if not rot_on:
+            q = _base_q().order_by(Proxy.id.asc()).limit(1)
             return (await session.execute(q)).scalars().first()
 
-        # random
-        q_all = (
-            select(Proxy)
-            .where(Proxy.user_id == int(user_id))
-            .where(active_cond)
-        )
-        items = (await session.execute(q_all)).scalars().all()
+        items = (await session.execute(_base_q())).scalars().all()
         if not items:
             return None
         return random.choice(items)
@@ -77,70 +67,34 @@ async def choose_proxy_for_user(session, user_id: int) -> Optional[Proxy]:
         return None
 
 
-# ----------------------------
-# Low-level: apply/reset proxy ONLY for smtplib
-# ----------------------------
 def apply_proxy_to_smtplib(proxy: Proxy) -> None:
-    """
-    ВАЖНО:
-    НЕ трогаем глобальный socket.socket, иначе сломаешь Telegram (aiohttp).
-    Мы меняем только smtplib.socket -> socks, через wrapmodule.
-    """
+    """Только SOCKS5 → PySocks → smtplib."""
     global _SOCKET_GETADDRINFO_ORIG
 
-    import socks  # PySocks
+    import socks
     import smtplib
+
+    if not is_socks5_proxy(proxy):
+        raise ValueError(
+            f"Поддерживается только SOCKS5, получен: {(proxy.type or '?')!r}"
+        )
 
     host = (proxy.host or "").strip()
     port = int(proxy.port or 0)
     if not host or not port:
         raise ValueError("Proxy host/port is empty")
 
-    proxy_type = (getattr(proxy, "proxy_type", None) or proxy.type or "socks5").lower().strip()
     username = (proxy.username or "").strip() or None
     password = (proxy.password or "").strip() or None
 
-    if proxy_type in ("socks5", "socks5h"):
-        ptype = socks.SOCKS5
-        rdns = True  # ✅ важно: DNS через прокси (лечит gaierror при плохом DNS)
-    elif proxy_type in ("socks4", "socks4a"):
-        ptype = socks.SOCKS4
-        rdns = True
-    elif proxy_type in ("http", "https"):
-        ptype = socks.HTTP
-        # ✅ ВАЖНО: если rdns=False, PySocks делает локальный DNS-resolve.
-        # На Railway/Ubuntu он часто возвращает IPv6 (например для smtp.gmail.com),
-        # а PySocks не поддерживает IPv6 и падает с ошибкой:
-        #   "PySocks doesn't support IPv6: ('2a00:...')"
-        # Поэтому для SMTP включаем rdns=True даже для HTTP(S) прокси.
-        rdns = True
-        rdns = True
-    else:
-        ptype = socks.SOCKS5
-        rdns = True
-
     socks.set_default_proxy(
-        ptype,
+        socks.SOCKS5,
         host,
         port,
         username=username,
         password=password,
-        rdns=rdns,
+        rdns=True,
     )
-
-  # Только smtplib → PySocks; DNS только IPv4 (Railway иначе даёт AAAA → падение).
-    if _SMTP_CONNECT_ORIG is None:
-        _SMTP_CONNECT_ORIG = smtplib.SMTP.connect
-
-    def _smtp_connect_ipv4(self, host="", port=0, source_address=None):
-        target = (host or getattr(self, "host", "") or "").strip()
-        if target:
-            target = _ensure_smtp_host_ipv4(target)
-        if source_address is not None:
-            return _SMTP_CONNECT_ORIG(self, target, port, source_address)
-        return _SMTP_CONNECT_ORIG(self, target, port)
-
-    smtplib.SMTP.connect = _smtp_connect_ipv4  # type: ignore[method-assign]
 
     if _SOCKET_GETADDRINFO_ORIG is None:
         _SOCKET_GETADDRINFO_ORIG = _stdlib_socket.getaddrinfo
@@ -161,11 +115,14 @@ def apply_proxy_to_smtplib(proxy: Proxy) -> None:
     if hasattr(smtplib.socket, "getaddrinfo"):
         smtplib.socket.getaddrinfo = _getaddrinfo_ipv4  # type: ignore[attr-defined]
 
-    logger.info("SMTP proxy applied (smtplib only): %s://%s:%s rdns=%s", proxy_type, host, port, rdns)
+    logger.info("SMTP SOCKS5 applied: %s:%s rdns=True", host, port)
 
 
 def test_smtp_tunnel_sync(proxy: Proxy, *, timeout: int = 12) -> tuple[bool, str]:
-    """Та же цепочка, что при рассылке: PySocks → SMTP :587."""
+    """Проверка как при рассылке: SOCKS5 → SMTP :587."""
+    if not is_socks5_proxy(proxy):
+        return False, "Только SOCKS5 прокси"
+
     apply_proxy_to_smtplib(proxy)
     try:
         s = _smtplib.SMTP(_SMTP_TEST_HOST, _SMTP_TEST_PORT, timeout=timeout)
@@ -178,21 +135,12 @@ def test_smtp_tunnel_sync(proxy: Proxy, *, timeout: int = 12) -> tuple[bool, str
                 pass
         return True, f"SMTP OK ({_SMTP_TEST_HOST}:{_SMTP_TEST_PORT})"
     except Exception as e:
-        err = str(e).strip() or type(e).__name__
-        if "GeneralProxyError" in type(e).__name__ or "generalproxy" in err.lower():
-            err = (
-                f"{err} — прокси не пускает SMTP (порт 587). "
-                "Нужен SOCKS5 или HTTP с CONNECT к 587."
-            )
-        return False, f"{type(e).__name__}: {err}"
+        return False, f"{type(e).__name__}: {e}"
     finally:
         reset_smtplib_proxy()
 
 
 def reset_smtplib_proxy() -> None:
-    """
-    Возвращает стандартное поведение smtplib (убирает proxy wrapper).
-    """
     global _SOCKET_GETADDRINFO_ORIG
 
     import smtplib
@@ -207,18 +155,12 @@ def reset_smtplib_proxy() -> None:
         _stdlib_socket.getaddrinfo = _SOCKET_GETADDRINFO_ORIG  # type: ignore[assignment]
 
     smtplib.socket = _SMTP_SOCKET_ORIG
-
     logger.info("SMTP proxy reset (smtplib only)")
 
 
-# ----------------------------
-# ✅ Async context: safe apply/reset with lock
-# ----------------------------
 class ProxySMTPContext:
-    """
-    async with ProxySMTPContext(proxy):
-        ... SMTP send ...
-    """
+    """async with ProxySMTPContext(proxy): ... SMTP send ..."""
+
     def __init__(self, proxy: Proxy):
         self.proxy = proxy
         self._guard_token = None

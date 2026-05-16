@@ -258,15 +258,18 @@ async def start_sending(message: Message, fast: bool = False):
             return
 
         proxies_total = (
-            await session.execute(select(func.count(Proxy.id)).where(Proxy.user_id == db_user_id))
+            await session.execute(
+                select(func.count(Proxy.id))
+                .where(Proxy.user_id == db_user_id)
+                .where(Proxy.type.in_(["socks5", "socks5h"]))
+            )
         ).scalar() or 0
 
-        # ✅ Без прокси рассылку запускать нельзя
         if proxies_total <= 0:
             await tg_answer_safe(
                 message,
-                "❌ Рассылка без прокси запрещена.\n"
-                "Зайдите в «Прокси» и добавьте хотя бы один рабочий прокси, затем запустите рассылку снова.",
+                "❌ Нужен хотя бы один рабочий <b>SOCKS5</b> прокси.\n"
+                "HTTP не поддерживается. Добавьте socks5://… в «Прокси».",
                 reply_markup=main_menu_kb(tg_user_id),
             )
             return
@@ -290,8 +293,8 @@ async def start_sending(message: Message, fast: bool = False):
         if not proxy_in_use:
             await tg_answer_safe(
                 message,
-                "❌ Нет рабочих прокси после проверки.\n"
-                "Зайдите в «Прокси» → «Проверить прокси» или добавьте новый.",
+                "❌ Нет рабочих SOCKS5 после проверки (SOCKS5 + SMTP).\n"
+                "Зайдите в «Прокси» → «Проверить прокси» или добавьте socks5://…",
                 reply_markup=main_menu_kb(tg_user_id),
             )
             return

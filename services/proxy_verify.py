@@ -1,44 +1,35 @@
-"""Единая проверка прокси (добавление, меню, рассылка)."""
+"""Проверка SOCKS5 прокси: туннель + SMTP (как при рассылке)."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Optional, Tuple
+from typing import Any, Tuple
 from urllib.parse import urlsplit
 
 import aiohttp
+from aiohttp_socks import ProxyConnector  # type: ignore
 
 from models import Proxy
 
 logger = logging.getLogger(__name__)
 
-_HTTP_TEST_URLS = (
-    "http://httpbin.org/ip",
-    "http://example.com",
-    "http://icanhazip.com",
-)
-_SOCKS_TEST_URLS = (
-    "http://httpbin.org/ip",
-    "http://example.com",
-)
+_SOCKS5_SCHEMES = frozenset({"socks5", "socks5h"})
 
 
 def normalize_proxy_type(t: str | None) -> str:
-    t = (t or "http").strip().lower()
-    if t in ("https",):
-        return "http"
+    t = (t or "socks5").strip().lower()
     if t in ("socks", "sock5", "socksv5"):
         return "socks5"
     if t in ("socks5h",):
         return "socks5h"
-    if t in ("socks4", "socks4a"):
-        return t
-    if t in ("http", "socks5", "socks5h"):
-        return t
+    if t in ("socks5",):
+        return "socks5"
+    if t in ("http", "https"):
+        return "http"
     if t.startswith("socks"):
         return "socks5"
-    return "http"
+    return "socks5"
 
 
 def proxy_to_dict(proxy: Proxy | dict[str, Any]) -> dict[str, Any]:
@@ -49,7 +40,7 @@ def proxy_to_dict(proxy: Proxy | dict[str, Any]) -> dict[str, Any]:
         "port": int(proxy.port),
         "username": proxy.username,
         "password": proxy.password,
-        "type": proxy.type or "http",
+        "type": proxy.type or "socks5",
     }
 
 
@@ -65,102 +56,81 @@ def build_proxy_url(proxy: Proxy | dict[str, Any]) -> str:
     return f"{proxy_type}://{host}:{port}"
 
 
-async def _test_http_like_proxy(proxy_url: str, *, timeout: int = 10) -> Tuple[bool, str]:
-    timeout_cfg = aiohttp.ClientTimeout(total=timeout)
-    async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
-        last_error = "no response"
-        for url in _HTTP_TEST_URLS:
-            try:
-                async with session.get(url, proxy=proxy_url) as resp:
-                    if resp.status < 400:
-                        return True, f"HTTP-proxy OK ({resp.status}) via {url}"
-                    last_error = f"HTTP status {resp.status} ({url})"
-            except Exception as e:
-                last_error = f"{type(e).__name__}: {e} ({url})"
-                logger.warning("HTTP proxy check failed %s via %s", proxy_url, url)
-    return False, last_error
+def is_socks5_type(proxy_type: str) -> bool:
+    return normalize_proxy_type(proxy_type) in _SOCKS5_SCHEMES
 
 
-async def _test_socks_proxy(proxy_url: str, *, timeout: int = 10) -> Tuple[bool, str]:
-    try:
-        from aiohttp_socks import ProxyConnector  # type: ignore
-    except ImportError:
-        return False, "aiohttp_socks не установлен (pip install aiohttp_socks)"
-
+async def _test_socks5_handshake(proxy_url: str, *, timeout: int = 10) -> Tuple[bool, str]:
+    """Быстрая проверка SOCKS5 (httpbin через туннель)."""
     timeout_cfg = aiohttp.ClientTimeout(total=timeout)
     connector = ProxyConnector.from_url(proxy_url)
-    async with aiohttp.ClientSession(timeout=timeout_cfg, connector=connector) as session:
-        last_error = "no response"
-        for url in _SOCKS_TEST_URLS:
-            try:
-                async with session.get(url) as resp:
-                    if resp.status < 400:
-                        return True, f"SOCKS OK ({resp.status}) via {url}"
-                    last_error = f"HTTP status {resp.status} ({url})"
-            except Exception as e:
-                last_error = f"{type(e).__name__}: {e} ({url})"
-                logger.warning("SOCKS proxy check failed %s via %s", proxy_url, url)
-    return False, last_error
+    try:
+        async with aiohttp.ClientSession(timeout=timeout_cfg, connector=connector) as session:
+            async with session.get("http://httpbin.org/ip") as resp:
+                if resp.status < 400:
+                    return True, f"SOCKS5 OK ({resp.status})"
+                return False, f"SOCKS5 HTTP status {resp.status}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 def _proxy_row_from_dict(d: dict[str, Any]) -> Proxy:
-    p = Proxy(
+    return Proxy(
         host=str(d["host"]),
         port=int(d["port"]),
         username=d.get("username"),
         password=d.get("password"),
-        type=d.get("type") or "http",
+        type=normalize_proxy_type(d.get("type")),
     )
-    return p
 
 
 async def test_smtp_tunnel(proxy: Proxy | dict[str, Any], *, timeout: int = 12) -> Tuple[bool, str]:
     from proxy_manager import test_smtp_tunnel_sync
 
-    d = proxy_to_dict(proxy)
-    row = _proxy_row_from_dict(d)
+    row = _proxy_row_from_dict(proxy_to_dict(proxy))
     return await asyncio.to_thread(test_smtp_tunnel_sync, row, timeout=timeout)
 
 
 async def test_proxy(proxy: Proxy | dict[str, Any], *, timeout: int = 10) -> Tuple[bool, str]:
     """
-    Для рассылки важны оба теста:
-    - веб (httpbin) — как раньше;
-    - SMTP :587 через PySocks — как при /send.
+    Только SOCKS5:
+    1) SOCKS5 туннель (httpbin)
+    2) SMTP :587 через PySocks (как /send)
     """
     d = proxy_to_dict(proxy)
-    proxy_type = normalize_proxy_type(d.get("type"))
+    ptype = normalize_proxy_type(d.get("type"))
+
+    if not is_socks5_type(ptype):
+        return False, "Только SOCKS5. HTTP/HTTPS не поддерживаются для рассылки."
+
     proxy_url = build_proxy_url(d)
+    socks_ok, socks_info = await _test_socks5_handshake(proxy_url, timeout=timeout)
+    smtp_ok, smtp_info = await test_smtp_tunnel(proxy, timeout=max(timeout, 14))
 
-    if proxy_type in ("http",):
-        web_ok, web_info = await _test_http_like_proxy(proxy_url, timeout=timeout)
-    elif proxy_type.startswith("socks"):
-        web_ok, web_info = await _test_socks_proxy(proxy_url, timeout=timeout)
-    else:
-        return False, f"Неизвестный тип прокси: {proxy_type}"
-
-    smtp_ok, smtp_info = await test_smtp_tunnel(proxy, timeout=max(timeout, 12))
-
-    if web_ok and smtp_ok:
-        return True, f"{web_info} · {smtp_info}"
-    if web_ok and not smtp_ok:
-        return False, f"Веб OK, но SMTP нет: {smtp_info}"
-    if not web_ok and smtp_ok:
-        return False, f"SMTP OK, но веб нет: {web_info}"
-    return False, f"Веб: {web_info} · SMTP: {smtp_info}"
+    if socks_ok and smtp_ok:
+        return True, f"{socks_info} · {smtp_info}"
+    if socks_ok and not smtp_ok:
+        return False, f"SOCKS5 OK, SMTP нет: {smtp_info}"
+    if not socks_ok and smtp_ok:
+        return False, f"SMTP OK, SOCKS5 нет: {socks_info}"
+    return False, f"SOCKS5: {socks_info} · SMTP: {smtp_info}"
 
 
 async def test_proxy_url(proxy_url: str, *, timeout: int = 10) -> Tuple[bool, str]:
-    """Проверка по URL (для autocheck_proxies)."""
     p = (proxy_url or "").strip()
-    if not p:
-        return False, "empty proxy url"
-    kind = normalize_proxy_type(urlsplit(p).scheme or "http")
-    if kind in ("http",):
-        return await _test_http_like_proxy(p, timeout=timeout)
-    if kind.startswith("socks"):
-        return await _test_socks_proxy(p, timeout=timeout)
-    return False, f"Неизвестный тип прокси: {kind}"
+    scheme = normalize_proxy_type(urlsplit(p).scheme or "socks5")
+    if not is_socks5_type(scheme):
+        return False, "Только socks5://"
+    return await test_proxy(
+        {
+            "host": urlsplit(p).hostname or "",
+            "port": urlsplit(p).port or 1080,
+            "username": urlsplit(p).username,
+            "password": urlsplit(p).password,
+            "type": scheme,
+        },
+        timeout=timeout,
+    )
 
 
 async def refresh_proxies_status(
@@ -170,10 +140,6 @@ async def refresh_proxies_status(
     concurrency: int = 10,
     timeout: int = 10,
 ) -> tuple[int, int, int]:
-    """
-    Проверить все прокси пользователя и обновить is_active / last_error.
-    Returns: (ok_count, fail_count, total)
-    """
     from sqlalchemy import select as sa_select
 
     proxies = list(
