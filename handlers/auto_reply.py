@@ -413,10 +413,10 @@ class _Tpl:
     text: str
 
 
-def _load_templates(tg_id: int) -> list[_Tpl]:
+async def _load_templates(tg_id: int) -> list[_Tpl]:
     from handlers.templates import load_templates
 
-    return [_Tpl(title=t.title, text=t.text) for t in load_templates(int(tg_id))]
+    return [_Tpl(title=t.title, text=t.text) for t in await load_templates(int(tg_id))]
 
 
 def _templates_pick_kb(items: list[_Tpl]) -> InlineKeyboardMarkup:
@@ -429,7 +429,7 @@ def _templates_pick_kb(items: list[_Tpl]) -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data == "auto_pick_template")
 async def auto_pick_template(callback: CallbackQuery):
-    items = _load_templates(callback.from_user.id)
+    items = await _load_templates(callback.from_user.id)
     if not items:
         await callback.answer("Нет шаблонов. Добавь их в меню «⚡ Шаблоны».", show_alert=True)
         return
@@ -454,7 +454,7 @@ async def auto_set_template(callback: CallbackQuery):
         await callback.answer("Некорректный шаблон", show_alert=True)
         return
 
-    items = _load_templates(callback.from_user.id)
+    items = await _load_templates(callback.from_user.id)
     if tpl_idx < 0 or tpl_idx >= len(items):
         await callback.answer("Шаблон не найден", show_alert=True)
         return

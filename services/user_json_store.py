@@ -35,17 +35,6 @@ def _use_postgres() -> bool:
     return engine.dialect.name == "postgresql"
 
 
-def _sync_wait(coro):
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    import concurrent.futures
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result(timeout=60)
-
-
 async def load_json_blob(telegram_id: int, blob_key: str, *, default: Any = None) -> Any:
     if default is None:
         default = []
@@ -136,9 +125,3 @@ def _save_to_filesystem(telegram_id: int, blob_key: str, payload: str) -> None:
     path.write_text(payload, encoding="utf-8")
 
 
-def load_json_blob_sync(telegram_id: int, blob_key: str, *, default: Any = None) -> Any:
-    return _sync_wait(load_json_blob(telegram_id, blob_key, default=default))
-
-
-def save_json_blob_sync(telegram_id: int, blob_key: str, data: Any) -> None:
-    _sync_wait(save_json_blob(telegram_id, blob_key, data))

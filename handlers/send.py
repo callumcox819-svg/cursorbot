@@ -180,7 +180,7 @@ async def _build_message_for_target(session: AsyncSession, tg_user_id: int, tgt:
     try:
         from handlers.first_sms import pick_random_first_sms
 
-        base_text = pick_random_first_sms(tg_user_id, item_title)
+        base_text = await pick_random_first_sms(tg_user_id, item_title)
     except Exception:
         base_text = ("Hello! Is this item still available? " + (item_title or "OFFER")).strip()
 

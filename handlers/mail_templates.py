@@ -115,7 +115,7 @@ async def mail_tmpl_open(callback: CallbackQuery):
     if not meta:
         return await callback.answer("Письмо устарело", show_alert=True)
 
-    items = load_templates(callback.from_user.id)
+    items = await load_templates(callback.from_user.id)
     if not items:
         return await callback.answer("Нет шаблонов. Добавь их в ⚡ Шаблоны", show_alert=True)
 
@@ -146,7 +146,7 @@ async def mail_tmpl_send(callback: CallbackQuery):
     if not to_email:
         return await callback.answer("Не найден email получателя", show_alert=True)
 
-    items = load_templates(callback.from_user.id)
+    items = await load_templates(callback.from_user.id)
     if not items:
         return await callback.answer("Нет шаблонов. Добавь их в ⚡ Шаблоны", show_alert=True)
 

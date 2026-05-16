@@ -133,7 +133,7 @@ def settings_menu_kb(flags: dict[str, bool]) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text=dot(flags.get("smart_mode", False), "Умный режим"), callback_data="ref_toggle:smart_mode"),
-                InlineKeyboardButton(text="📄 Умные пресеты", callback_data="firstsms_open"),
+                InlineKeyboardButton(text="📄 Умные пресеты", callback_data="smart_presets_menu"),
             ],
             [
                 InlineKeyboardButton(text=dot(flags.get("spoofing", False), "Спуфинг"), callback_data="ref_toggle:spoofing"),
@@ -338,7 +338,7 @@ async def settings_templates(callback: CallbackQuery, state: FSMContext) -> None
     from handlers.templates import load_templates, templates_manage_kb, _render_manage
 
     await state.clear()
-    items = load_templates(callback.from_user.id)
+    items = await load_templates(callback.from_user.id)
     await callback.message.edit_text(
         _render_manage(items),
         reply_markup=templates_manage_kb(items),
@@ -856,7 +856,7 @@ async def ref_open(callback: CallbackQuery, state: FSMContext):
         # просто открываем существующие пресеты
         await callback.answer()
         from handlers.templates import load_templates, templates_manage_kb, _render_manage
-        items = load_templates(callback.from_user.id)
+        items = await load_templates(callback.from_user.id)
         await callback.message.edit_text(_render_manage(items), reply_markup=templates_manage_kb(items), parse_mode="HTML")
         return
 

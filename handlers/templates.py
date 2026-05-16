@@ -90,32 +90,40 @@ def _items_from_json(data: object) -> List[TemplateItem]:
     return out
 
 
-def load_templates(tg_id: int) -> List[TemplateItem]:
-    from services.user_json_store import load_json_blob_sync
+async def load_templates(tg_id: int) -> List[TemplateItem]:
+    from services.user_json_store import load_json_blob
 
-    data = load_json_blob_sync(int(tg_id), "templates", default=[])
+    data = await load_json_blob(int(tg_id), "templates", default=[])
     return _items_from_json(data)
 
 
-def save_templates(tg_id: int, items: List[TemplateItem]) -> None:
-    from services.user_json_store import save_json_blob_sync
+async def save_templates(tg_id: int, items: List[TemplateItem]) -> None:
+    from services.user_json_store import save_json_blob
 
     data = [{"title": it.title, "text": it.text} for it in items]
-    save_json_blob_sync(int(tg_id), "templates", data)
+    await save_json_blob(int(tg_id), "templates", data)
 
 
-def load_smart_templates(tg_id: int) -> List[TemplateItem]:
-    from services.user_json_store import load_json_blob_sync
+async def load_smart_templates(tg_id: int) -> List[TemplateItem]:
+    from services.user_json_store import load_json_blob
 
-    data = load_json_blob_sync(int(tg_id), "smart_templates", default=[])
+    data = await load_json_blob(int(tg_id), "smart_templates", default=[])
     return _items_from_json(data)
 
 
-def save_smart_templates(tg_id: int, items: List[TemplateItem]) -> None:
-    from services.user_json_store import save_json_blob_sync
+async def save_smart_templates(tg_id: int, items: List[TemplateItem]) -> None:
+    from services.user_json_store import save_json_blob
 
     data = [{"title": it.title, "text": it.text} for it in items]
-    save_json_blob_sync(int(tg_id), "smart_templates", data)
+    await save_json_blob(int(tg_id), "smart_templates", data)
+
+
+def _load_templates_sync(tg_id: int) -> List[TemplateItem]:
+    """Sync read from local JSON only (render_template / non-async callers)."""
+    from services.user_json_store import _load_from_filesystem
+
+    data = _load_from_filesystem(int(tg_id), "templates", default=[])
+    return _items_from_json(data)
 
 
 # =========================
@@ -236,7 +244,7 @@ async def tmpl_open_for_mail(call: CallbackQuery) -> None:
 
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
-    items = load_templates(int(user.telegram_id))
+    items = await load_templates(int(user.telegram_id))
     if not items:
         await call.answer("Шаблонов нет", show_alert=True)
         return
@@ -262,7 +270,7 @@ async def tmpl_send_for_mail(call: CallbackQuery) -> None:
 
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
-    items = load_templates(int(user.telegram_id))
+    items = await load_templates(int(user.telegram_id))
     if idx < 0 or idx >= len(items):
         await call.answer("Шаблон не найден", show_alert=True)
         return
@@ -313,7 +321,7 @@ def render_template(*, template_title: str | None = None, html_name: str | None 
         try:
             tg_id = int(ctx.get("tg_id") or ctx.get("telegram_id") or 0)
             if tg_id:
-                items = load_templates(tg_id)
+                items = _load_templates_sync(tg_id)
                 for it in items:
                     if (it.title or "").strip() == str(template_title).strip():
                         template_text = (it.text or "").strip()
@@ -356,7 +364,7 @@ async def presets_menu(call: CallbackQuery) -> None:
 async def presets_list(call: CallbackQuery) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
-    items = load_templates(int(user.telegram_id))
+    items = await load_templates(int(user.telegram_id))
     text = _render_presets(items, "🧾 <b>Ваши пресеты:</b>")
     await _safe_edit_text(call, text=text, reply_markup=_back_only_kb("presets_menu"), parse_mode="HTML")
     await call.answer()
@@ -366,7 +374,7 @@ async def presets_list(call: CallbackQuery) -> None:
 async def presets_delete_all(call: CallbackQuery) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
-    save_templates(int(user.telegram_id), [])
+    await save_templates(int(user.telegram_id), [])
     await presets_menu(call)
 
 
@@ -452,9 +460,9 @@ async def tmpl_add_text(message: Message, state: FSMContext) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, message.from_user.id)
 
-    items = load_templates(int(user.telegram_id))
+    items = await load_templates(int(user.telegram_id))
     items.append(TemplateItem(title=title, text=body))
-    save_templates(int(user.telegram_id), items)
+    await save_templates(int(user.telegram_id), items)
 
     restored = await _restore_presets_menu(message, data)
     await message.answer("✅ Текст добавлен.")
@@ -466,7 +474,7 @@ async def tmpl_add_text(message: Message, state: FSMContext) -> None:
 async def tmpl_rm_menu(call: CallbackQuery) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
-    items = load_templates(int(user.telegram_id))
+    items = await load_templates(int(user.telegram_id))
     if not items:
         await _safe_edit_text(
             call,
@@ -495,10 +503,10 @@ async def tmpl_rm_do(call: CallbackQuery) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
 
-    items = load_templates(int(user.telegram_id))
+    items = await load_templates(int(user.telegram_id))
     if 0 <= idx < len(items):
         items.pop(idx)
-        save_templates(int(user.telegram_id), items)
+        await save_templates(int(user.telegram_id), items)
 
     await presets_menu(call)
     await call.answer()
@@ -551,7 +559,7 @@ async def smart_presets_menu(call: CallbackQuery) -> None:
 async def smart_presets_list(call: CallbackQuery) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
-    items = load_smart_templates(int(user.telegram_id))
+    items = await load_smart_templates(int(user.telegram_id))
     text = _render_presets(items, "📄 <b>Ваши умные пресеты:</b>")
     await _safe_edit_text(call, text=text, reply_markup=_back_only_kb("smart_presets_menu"), parse_mode="HTML")
     await call.answer()
@@ -590,9 +598,9 @@ async def stmpl_add_text(message: Message, state: FSMContext) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, message.from_user.id)
 
-    items = load_smart_templates(int(user.telegram_id))
+    items = await load_smart_templates(int(user.telegram_id))
     items.append(TemplateItem(title=title, text=text))
-    save_smart_templates(int(user.telegram_id), items)
+    await save_smart_templates(int(user.telegram_id), items)
 
     restored = await _restore_smart_presets_menu(message, data)
     await message.answer("✅ Текст добавлен.")
@@ -604,7 +612,7 @@ async def stmpl_add_text(message: Message, state: FSMContext) -> None:
 async def stmpl_delete_all(call: CallbackQuery) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
-    save_smart_templates(int(user.telegram_id), [])
+    await save_smart_templates(int(user.telegram_id), [])
     await smart_presets_menu(call)
 
 
@@ -616,7 +624,7 @@ async def stmpl_delete_ask(call: CallbackQuery) -> None:
         return await call.answer()
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
-    items = load_smart_templates(int(user.telegram_id))
+    items = await load_smart_templates(int(user.telegram_id))
     if idx < 0 or idx >= len(items):
         return await call.answer()
     await _safe_edit_text(call, text=f"Удалить пресет <b>{items[idx].title}</b>?", reply_markup=smart_templates_delete_kb(idx), parse_mode="HTML")
@@ -631,10 +639,10 @@ async def stmpl_delete_ok(call: CallbackQuery) -> None:
         return await call.answer()
     async with Session() as session:
         user = await get_or_create_user(session, call.from_user.id)
-    items = load_smart_templates(int(user.telegram_id))
+    items = await load_smart_templates(int(user.telegram_id))
     if 0 <= idx < len(items):
         items.pop(idx)
-        save_smart_templates(int(user.telegram_id), items)
+        await save_smart_templates(int(user.telegram_id), items)
     await smart_presets_list(call)
 
 

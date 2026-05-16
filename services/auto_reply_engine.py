@@ -173,10 +173,10 @@ class _Tpl:
     text: str
 
 
-def _load_templates(tg_id: int) -> list[_Tpl]:
+async def _load_templates(tg_id: int) -> list[_Tpl]:
     from handlers.templates import load_templates
 
-    return [_Tpl(title=t.title, text=t.text) for t in load_templates(int(tg_id))]
+    return [_Tpl(title=t.title, text=t.text) for t in await load_templates(int(tg_id))]
 
 
 def _match_keywords(*, text: str, keywords: list[str], stopwords: list[str]) -> bool:
@@ -347,7 +347,7 @@ async def handle_auto_for_mail(mail_id: int, meta: dict) -> None:
 
         # 1) auto_send (text template)
         if auto_send:
-            tpl_items = _load_templates(int(getattr(user, "telegram_id", 0) or 0))
+            tpl_items = await _load_templates(int(getattr(user, "telegram_id", 0) or 0))
             tpl_idx = ln.get("template_idx", None)
             body_text = ""
             if tpl_idx is not None:

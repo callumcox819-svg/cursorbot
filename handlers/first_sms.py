@@ -22,10 +22,10 @@ class FirstSmsPreset:
     text: str
 
 
-def load_presets(tg_id: int) -> List[FirstSmsPreset]:
-    from services.user_json_store import load_json_blob_sync
+async def load_presets(tg_id: int) -> List[FirstSmsPreset]:
+    from services.user_json_store import load_json_blob
 
-    data = load_json_blob_sync(int(tg_id), "first_sms", default=[])
+    data = await load_json_blob(int(tg_id), "first_sms", default=[])
     out: List[FirstSmsPreset] = []
     for x in data if isinstance(data, list) else []:
         if isinstance(x, dict):
@@ -37,17 +37,17 @@ def load_presets(tg_id: int) -> List[FirstSmsPreset]:
     return out
 
 
-def save_presets(tg_id: int, items: List[FirstSmsPreset]) -> None:
-    from services.user_json_store import save_json_blob_sync
+async def save_presets(tg_id: int, items: List[FirstSmsPreset]) -> None:
+    from services.user_json_store import save_json_blob
 
-    save_json_blob_sync(int(tg_id), "first_sms", [{"text": t.text} for t in items])
+    await save_json_blob(int(tg_id), "first_sms", [{"text": t.text} for t in items])
 
 
-def pick_random_first_sms(tg_id: int, offer_title: str) -> str:
+async def pick_random_first_sms(tg_id: int, offer_title: str) -> str:
     """Pick random preset, apply spintax and OFFER placeholder."""
     from services.spintax import expand_spintax
 
-    items = load_presets(tg_id)
+    items = await load_presets(tg_id)
     base = items[random.randrange(len(items))].text if items else "Hello! Is this item still available? OFFER"
     txt = expand_spintax(base)
     title = (offer_title or "").strip()
@@ -111,7 +111,7 @@ class FsEdit(StatesGroup):
 @router.callback_query(F.data == "firstsms_open")
 async def firstsms_open(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    items = load_presets(callback.from_user.id)
+    items = await load_presets(callback.from_user.id)
     await callback.message.edit_text(
         _render_list(items),
         reply_markup=_manage_kb(bool(items)),
@@ -148,9 +148,9 @@ async def fsms_add_text(message: Message, state: FSMContext):
     if len(txt) < 2:
         await message.answer("Текст слишком короткий. Введи ещё раз.")
         return
-    items = load_presets(message.from_user.id)
+    items = await load_presets(message.from_user.id)
     items.append(FirstSmsPreset(text=txt))
-    save_presets(message.from_user.id, items)
+    await save_presets(message.from_user.id, items)
 
     # ✅ Важно: пресет добавляем ТОЛЬКО после нажатия кнопки "➕ Добавить пресет".
     # Поэтому после успешного добавления очищаем state, чтобы любые дальнейшие
@@ -188,7 +188,7 @@ async def fsms_add_text(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "fsms_del_all")
 async def fsms_del_all(callback: CallbackQuery, state: FSMContext):
-    save_presets(callback.from_user.id, [])
+    await save_presets(callback.from_user.id, [])
     await callback.answer("Удалено")
     # ✅ firstsms_open требует FSMContext, иначе падаем TypeError
     await firstsms_open(callback, state)
@@ -196,7 +196,7 @@ async def fsms_del_all(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "fsms_del")
 async def fsms_del_pick(callback: CallbackQuery):
-    items = load_presets(callback.from_user.id)
+    items = await load_presets(callback.from_user.id)
     if not items:
         await callback.answer("Пусто")
         return
@@ -205,21 +205,21 @@ async def fsms_del_pick(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("fsms_del:"))
-async def fsms_del_idx(callback: CallbackQuery):
+async def fsms_del_idx(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split(":")[1])
-    items = load_presets(callback.from_user.id)
+    items = await load_presets(callback.from_user.id)
     if idx < 0 or idx >= len(items):
         await callback.answer("Не найден", show_alert=True)
         return
     items.pop(idx)
-    save_presets(callback.from_user.id, items)
+    await save_presets(callback.from_user.id, items)
     await callback.answer("Удалено")
-    await firstsms_open(callback)
+    await firstsms_open(callback, state)
 
 
 @router.callback_query(F.data == "fsms_edit")
 async def fsms_edit_pick(callback: CallbackQuery, state: FSMContext):
-    items = load_presets(callback.from_user.id)
+    items = await load_presets(callback.from_user.id)
     if not items:
         await callback.answer("Пусто")
         return
@@ -233,7 +233,7 @@ async def fsms_edit_pick(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("fsms_edit:"))
 async def fsms_edit_choose(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split(":")[1])
-    items = load_presets(callback.from_user.id)
+    items = await load_presets(callback.from_user.id)
     if idx < 0 or idx >= len(items):
         await callback.answer("Не найден", show_alert=True)
         return
@@ -253,13 +253,13 @@ async def fsms_edit_text(message: Message, state: FSMContext):
     idx = int(data.get("idx", -1))
     back_chat_id = data.get("_back_chat_id")
     back_msg_id = data.get("_back_msg_id")
-    items = load_presets(message.from_user.id)
+    items = await load_presets(message.from_user.id)
     if idx < 0 or idx >= len(items):
         await message.answer("Пресет не найден.")
         await state.clear()
         return
     items[idx] = FirstSmsPreset(text=txt)
-    save_presets(message.from_user.id, items)
+    await save_presets(message.from_user.id, items)
     await state.clear()
 
     # Return to the menu.

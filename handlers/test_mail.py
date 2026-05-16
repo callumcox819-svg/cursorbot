@@ -91,7 +91,7 @@ async def test_mail_send(message: Message, state: FSMContext):
         offer_title = title_row[0] if title_row and title_row[0] else ""
 
     subject = random.choice(TEST_SUBJECTS)
-    body = pick_random_first_sms(message.from_user.id, offer_title)
+    body = await pick_random_first_sms(message.from_user.id, offer_title)
 
     try:
         async with async_session() as session_proxy:

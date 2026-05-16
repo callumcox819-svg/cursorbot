@@ -1502,7 +1502,7 @@ async def cb_mail_reply_mode(callback: CallbackQuery, state: FSMContext):
 
     # preset picker
     if mode == "preset":
-        items = load_templates(int(callback.from_user.id))
+        items = await load_templates(int(callback.from_user.id))
         if not items:
             return await callback.answer("Нет шаблонов. Добавь их в ⚡ Шаблоны", show_alert=True)
 
