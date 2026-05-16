@@ -1,3 +1,8 @@
 # Один экземпляр бота — иначе Telegram polling дублирует ответы.
 [deploy]
 numReplicas = 1
+
+# В Variables сервиса бота:
+#   DATABASE_URL = ${{Postgres.DATABASE_URL}}
+#   BOT_TOKEN = ...
+# Подробно: RAILWAY_DATABASE.txt

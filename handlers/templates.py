@@ -76,65 +76,46 @@ class TemplateItem:
 
 
 # =========================
-# STORAGE
+# STORAGE (Postgres на Railway / файлы локально)
 # =========================
-def _path(tg_id: int) -> str:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    return os.path.join(DATA_DIR, f"templates_{tg_id}.json")
+def _items_from_json(data: object) -> List[TemplateItem]:
+    out: List[TemplateItem] = []
+    for x in data if isinstance(data, list) else []:
+        if not isinstance(x, dict):
+            continue
+        title = str(x.get("title", "")).strip()
+        text = str(x.get("text", "")).strip()
+        if title and text:
+            out.append(TemplateItem(title=title, text=text))
+    return out
 
 
 def load_templates(tg_id: int) -> List[TemplateItem]:
-    p = _path(tg_id)
-    if not os.path.exists(p):
-        return []
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        out: List[TemplateItem] = []
-        for x in data if isinstance(data, list) else []:
-            title = str(x.get("title", "")).strip()
-            text = str(x.get("text", "")).strip()
-            if title and text:
-                out.append(TemplateItem(title=title, text=text))
-        return out
-    except Exception:
-        return []
+    from services.user_json_store import load_json_blob_sync
+
+    data = load_json_blob_sync(int(tg_id), "templates", default=[])
+    return _items_from_json(data)
 
 
 def save_templates(tg_id: int, items: List[TemplateItem]) -> None:
-    p = _path(tg_id)
-    data = [{"title": it.title, "text": it.text} for it in items]
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    from services.user_json_store import save_json_blob_sync
 
-def _path_smart(tg_id: int) -> str:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    return os.path.join(DATA_DIR, f"smart_templates_{tg_id}.json")
+    data = [{"title": it.title, "text": it.text} for it in items]
+    save_json_blob_sync(int(tg_id), "templates", data)
 
 
 def load_smart_templates(tg_id: int) -> List[TemplateItem]:
-    p = _path_smart(tg_id)
-    if not os.path.exists(p):
-        return []
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        out: List[TemplateItem] = []
-        for x in data if isinstance(data, list) else []:
-            title = str(x.get("title", "")).strip()
-            text = str(x.get("text", "")).strip()
-            if title and text:
-                out.append(TemplateItem(title=title, text=text))
-        return out
-    except Exception:
-        return []
+    from services.user_json_store import load_json_blob_sync
+
+    data = load_json_blob_sync(int(tg_id), "smart_templates", default=[])
+    return _items_from_json(data)
 
 
 def save_smart_templates(tg_id: int, items: List[TemplateItem]) -> None:
-    p = _path_smart(tg_id)
+    from services.user_json_store import save_json_blob_sync
+
     data = [{"title": it.title, "text": it.text} for it in items]
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    save_json_blob_sync(int(tg_id), "smart_templates", data)
 
 
 # =========================

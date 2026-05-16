@@ -171,7 +171,12 @@ async def main() -> None:
     )
 
     await init_db()
-    logger.info("✅ БД инициализирована (таблицы созданы при необходимости)")
+    from database import engine as _db_engine
+
+    logger.info(
+        "✅ БД готова (%s). Пользователи/аккаунты/офферы — в БД; пресеты — в Postgres при DATABASE_URL.",
+        _db_engine.dialect.name,
+    )
 
     dp = Dispatcher()
     dp.startup.register(_on_startup)

@@ -1,0 +1,30 @@
+Как подключить постоянную БД на Railway
+========================================
+
+1) В проекте Railway нажми «+ New» → «Database» → «PostgreSQL».
+   Дождись статуса Active.
+
+2) Открой сервис с ботом (не Postgres) → Variables.
+
+3) Добавь переменную:
+   DATABASE_URL = ${{Postgres.DATABASE_URL}}
+   (в UI Railway: «Add Reference» → выбери Postgres → DATABASE_URL)
+
+4) Убедись, что заданы также:
+   BOT_TOKEN = токен от @BotFather
+   (не ставь BOT_OPEN_ACCESS — бот закрытый)
+
+5) Redeploy бота. В логах должно быть:
+   «БД: PostgreSQL (данные сохраняются между перезапусками Railway)»
+
+6) Replicas = 1 (см. railway.toml).
+
+Что хранится в Postgres
+-----------------------
+- Пользователи (telegram_id, access_granted, sender_name, ключи API)
+- Почтовые аккаунты, прокси, домены, офферы, входящая почта
+- Настройки (user_settings)
+- Пресеты, умные пресеты, first_sms (таблица user_json_blobs)
+
+Папка data/html в репозитории — это шаблоны писем, они в git и не теряются.
+Локально без DATABASE_URL используется bot.db (SQLite).

@@ -28,6 +28,9 @@ elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL
 _engine_kwargs: dict = {"echo": False, "pool_pre_ping": True}
 if DATABASE_URL.startswith("sqlite"):
     _engine_kwargs["connect_args"] = {"timeout": 60}
+elif DATABASE_URL.startswith("postgresql"):
+    _engine_kwargs["pool_size"] = int(os.getenv("DB_POOL_SIZE", "5"))
+    _engine_kwargs["max_overflow"] = int(os.getenv("DB_MAX_OVERFLOW", "10"))
 
 engine = create_async_engine(DATABASE_URL, **_engine_kwargs)
 
@@ -118,6 +121,15 @@ async def _ensure_conversation_links_tg_message_id_column() -> None:
 
 
 async def init_db() -> None:
+    dialect = engine.dialect.name
+    if dialect == "postgresql":
+        log.info("БД: PostgreSQL (данные сохраняются между перезапусками Railway)")
+    else:
+        log.warning(
+            "БД: %s — для Railway добавьте Postgres и переменную DATABASE_URL",
+            dialect,
+        )
+
     # создаём таблицы если нет
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

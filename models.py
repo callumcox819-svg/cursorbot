@@ -233,6 +233,21 @@ class GlobalSentEmail(Base):
 # =========================
 # QUICK TEMPLATES
 # =========================
+class UserJsonBlob(Base):
+    """JSON-данные пользователя (пресеты и т.п.) — для Railway Postgres, не теряются при redeploy."""
+
+    __tablename__ = "user_json_blobs"
+    __table_args__ = (
+        UniqueConstraint("telegram_id", "blob_key", name="uq_user_json_blob_tg_key"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(BigInteger, nullable=False, index=True)
+    blob_key = Column(String(64), nullable=False, index=True)
+    payload = Column(Text, nullable=False, default="[]")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class QuickTemplate(Base):
     __tablename__ = "quick_templates"
 

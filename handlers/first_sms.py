@@ -22,35 +22,25 @@ class FirstSmsPreset:
     text: str
 
 
-def _path(tg_id: int) -> str:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    return os.path.join(DATA_DIR, f"first_sms_{tg_id}.json")
-
-
 def load_presets(tg_id: int) -> List[FirstSmsPreset]:
-    p = _path(tg_id)
-    if not os.path.exists(p):
-        return []
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        out: List[FirstSmsPreset] = []
-        for x in data if isinstance(data, list) else []:
-            if isinstance(x, dict):
-                txt = str(x.get("text", "")).strip()
-            else:
-                txt = str(x).strip()
-            if txt:
-                out.append(FirstSmsPreset(text=txt))
-        return out
-    except Exception:
-        return []
+    from services.user_json_store import load_json_blob_sync
+
+    data = load_json_blob_sync(int(tg_id), "first_sms", default=[])
+    out: List[FirstSmsPreset] = []
+    for x in data if isinstance(data, list) else []:
+        if isinstance(x, dict):
+            txt = str(x.get("text", "")).strip()
+        else:
+            txt = str(x).strip()
+        if txt:
+            out.append(FirstSmsPreset(text=txt))
+    return out
 
 
 def save_presets(tg_id: int, items: List[FirstSmsPreset]) -> None:
-    p = _path(tg_id)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump([{"text": t.text} for t in items], f, ensure_ascii=False, indent=2)
+    from services.user_json_store import save_json_blob_sync
+
+    save_json_blob_sync(int(tg_id), "first_sms", [{"text": t.text} for t in items])
 
 
 def pick_random_first_sms(tg_id: int, offer_title: str) -> str:

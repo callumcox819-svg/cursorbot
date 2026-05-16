@@ -174,22 +174,9 @@ class _Tpl:
 
 
 def _load_templates(tg_id: int) -> list[_Tpl]:
-    p = Path("data") / f"templates_{tg_id}.json"
-    if not p.exists():
-        return []
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        out: list[_Tpl] = []
-        if isinstance(data, list):
-            for x in data:
-                if isinstance(x, dict):
-                    title = str(x.get("title", "")).strip()
-                    text = str(x.get("text", "")).strip()
-                    if title and text:
-                        out.append(_Tpl(title=title, text=text))
-        return out
-    except Exception:
-        return []
+    from handlers.templates import load_templates
+
+    return [_Tpl(title=t.title, text=t.text) for t in load_templates(int(tg_id))]
 
 
 def _match_keywords(*, text: str, keywords: list[str], stopwords: list[str]) -> bool:
