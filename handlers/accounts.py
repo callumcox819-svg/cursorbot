@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import imaplib
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from aiogram import Router, F
@@ -100,16 +102,39 @@ async def _edit_add_progress(
     total: int,
     ok: int,
     fail: int,
+    workers: int = 1,
+    elapsed_sec: float | None = None,
 ) -> None:
+    speed = ""
+    if elapsed_sec and elapsed_sec > 0 and current > 0:
+        per_min = current / elapsed_sec * 60.0
+        speed = f"\n⚡ ~<b>{per_min:.1f}</b> акк./мин ({workers} потоков)"
     try:
         await status_msg.edit_text(
             "⏳ <b>Добавление аккаунтов</b>\n\n"
             f"Проверка IMAP: <b>{current}/{total}</b>\n"
-            f"✅ успешно: <b>{ok}</b> · ❌ ошибки: <b>{fail}</b>",
+            f"✅ успешно: <b>{ok}</b> · ❌ ошибки: <b>{fail}</b>"
+            f"{speed}",
             parse_mode="HTML",
         )
     except TelegramBadRequest:
         pass
+
+
+@dataclass
+class _AccountLineWork:
+    line: str
+    email: str
+    password: str
+
+
+@dataclass
+class _AccountCheckResult:
+    work: _AccountLineWork | None
+    fail_detail: str | None = None
+    ok: bool = False
+    provider: Optional[str] = None
+    err: Optional[str] = None
 
 
 def _trim_details(details: List[str], limit: int = 35) -> str:
@@ -128,23 +153,26 @@ async def _bulk_add_accounts(
     gmail_only: bool = False,
 ) -> Tuple[int, int, List[str]]:
     total = len(lines)
+    workers = max(1, min(8, int(os.getenv("ACCOUNTS_IMAP_CONCURRENCY", "4"))))
     status_msg = await message.answer(
-        f"⏳ <b>Добавление аккаунтов</b>\n\nПроверка IMAP: <b>0/{total}</b>",
+        "⏳ <b>Добавление аккаунтов</b>\n\n"
+        f"Проверка IMAP: <b>0/{total}</b>\n"
+        f"Параллельно: <b>{workers}</b> потоков",
         parse_mode="HTML",
     )
 
     ok_count = 0
     fail_count = 0
     details: List[str] = []
+    to_check: List[_AccountLineWork] = []
 
-    for i, line in enumerate(lines, start=1):
+    for line in lines:
         if ":" not in line:
             fail_count += 1
             if gmail_only:
                 details.append(f"❌ <code>{_e(line)}</code> — нет <code>:</code>")
             else:
                 details.append(f"❌ <code>{_e(line)}</code> — нет разделителя <code>:</code>")
-            await _edit_add_progress(status_msg, current=i, total=total, ok=ok_count, fail=fail_count)
             continue
 
         email, password = line.split(":", 1)
@@ -154,52 +182,81 @@ async def _bulk_add_accounts(
         if gmail_only and not _is_gmail_address(email):
             fail_count += 1
             details.append(f"❌ <code>{_e(email)}</code> — только @gmail.com / @googlemail.com")
-            await _edit_add_progress(status_msg, current=i, total=total, ok=ok_count, fail=fail_count)
             continue
 
         if not email or not password:
             fail_count += 1
             details.append(f"❌ <code>{_e(line)}</code> — пустой email или пароль")
-            await _edit_add_progress(status_msg, current=i, total=total, ok=ok_count, fail=fail_count)
             continue
 
-        ok, provider, err = await _imap_check_async(email, password)
-        if not ok:
+        to_check.append(_AccountLineWork(line=line, email=email, password=password))
+
+    check_total = len(to_check)
+    if not check_total:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        return ok_count, fail_count, details
+
+    sem = asyncio.Semaphore(workers)
+    done_checks = 0
+    t0 = asyncio.get_running_loop().time()
+
+    async def _run_imap(work: _AccountLineWork) -> _AccountCheckResult:
+        async with sem:
+            ok, provider, err = await _imap_check_async(work.email, work.password)
+        return _AccountCheckResult(work=work, ok=ok, provider=provider, err=err)
+
+    tasks = [asyncio.create_task(_run_imap(w)) for w in to_check]
+    for fut in asyncio.as_completed(tasks):
+        res = await fut
+        done_checks += 1
+        elapsed = asyncio.get_running_loop().time() - t0
+
+        if not res.ok:
             fail_count += 1
-            err_txt = _e(err or ("ошибка IMAP" if gmail_only else "ошибка при входе"))
-            details.append(f"❌ <code>{_e(email)}</code> — {err_txt}")
-            await _edit_add_progress(status_msg, current=i, total=total, ok=ok_count, fail=fail_count)
-            continue
-
-        existing_res = await session.execute(
-            select(EmailAccount).where(
-                EmailAccount.user_id == user.id,
-                EmailAccount.email == email,
-            )
-        )
-        existing = existing_res.scalar_one_or_none()
-        prov = provider or "gmail"
-        if existing:
-            existing.password = password
-            existing.provider = prov
-            existing.status = "active"
+            err_txt = _e(res.err or ("ошибка IMAP" if gmail_only else "ошибка при входе"))
+            details.append(f"❌ <code>{_e(res.work.email)}</code> — {err_txt}")
         else:
-            session.add(
-                EmailAccount(
-                    user_id=user.id,
-                    email=email,
-                    password=password,
-                    provider=prov,
-                    status="active",
+            work = res.work
+            existing_res = await session.execute(
+                select(EmailAccount).where(
+                    EmailAccount.user_id == user.id,
+                    EmailAccount.email == work.email,
                 )
             )
+            existing = existing_res.scalar_one_or_none()
+            prov = res.provider or "gmail"
+            if existing:
+                existing.password = work.password
+                existing.provider = prov
+                existing.status = "active"
+            else:
+                session.add(
+                    EmailAccount(
+                        user_id=user.id,
+                        email=work.email,
+                        password=work.password,
+                        provider=prov,
+                        status="active",
+                    )
+                )
+            ok_count += 1
+            if gmail_only:
+                details.append(f"✅ <code>{_e(work.email)}</code>")
+            else:
+                details.append(f"✅ <code>{_e(work.email)}</code> — добавлен ({_e(prov)})")
 
-        ok_count += 1
-        if gmail_only:
-            details.append(f"✅ <code>{_e(email)}</code>")
-        else:
-            details.append(f"✅ <code>{_e(email)}</code> — добавлен ({_e(prov)})")
-        await _edit_add_progress(status_msg, current=i, total=total, ok=ok_count, fail=fail_count)
+        await _edit_add_progress(
+            status_msg,
+            current=done_checks,
+            total=check_total,
+            ok=ok_count,
+            fail=fail_count,
+            workers=workers,
+            elapsed_sec=elapsed,
+        )
 
     try:
         await status_msg.delete()

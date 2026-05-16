@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from typing import Optional, List, Tuple, Dict
 
@@ -445,6 +446,8 @@ def proxies_menu(proxies: List[Proxy]) -> InlineKeyboardMarkup:
         ])
 
     rows.append([InlineKeyboardButton(text="➕ Добавить прокси", callback_data="proxy_add_menu")])
+    if proxies:
+        rows.append([InlineKeyboardButton(text="🔍 Проверить прокси", callback_data="proxies_check_all")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_back")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -708,6 +711,90 @@ async def proxy_delete(callback: CallbackQuery):
 # ======================
 #  Ручной тест прокси
 # ======================
+
+@router.callback_query(F.data == "proxies_check_all")
+async def proxies_check_all(callback: CallbackQuery) -> None:
+    try:
+        await callback.answer("⏳ Проверяю все прокси…", show_alert=False)
+    except TelegramBadRequest:
+        pass
+
+    telegram_id = callback.from_user.id
+    concurrency = max(1, min(10, int(os.getenv("PROXY_CHECK_CONCURRENCY", "5"))))
+
+    async with Session() as session:
+        user = (
+            await session.execute(select(User).where(User.telegram_id == telegram_id))
+        ).scalar_one_or_none()
+        if not user:
+            return await callback.message.edit_text("❌ Пользователь не найден.")
+
+        proxies = list(
+            (
+                await session.execute(select(Proxy).where(Proxy.user_id == user.id))
+            ).scalars()
+        )
+
+    if not proxies:
+        return await render_proxy_menu(callback, telegram_id)
+
+    total = len(proxies)
+    try:
+        await callback.message.edit_text(
+            f"⏳ <b>Проверка прокси</b>\n\n0/{total} · параллельно до {concurrency}",
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest:
+        pass
+
+    sem = asyncio.Semaphore(concurrency)
+    progress_lock = asyncio.Lock()
+    done = 0
+    ok_n = 0
+    fail_n = 0
+
+    async def _check_one(proxy: Proxy) -> Tuple[Proxy, bool, str]:
+        nonlocal done, ok_n, fail_n
+        proxy_dict = {
+            "host": proxy.host,
+            "port": proxy.port,
+            "username": proxy.username,
+            "password": proxy.password,
+            "type": proxy.type,
+        }
+        async with sem:
+            ok, info = await test_proxy(proxy_dict)
+        async with progress_lock:
+            done += 1
+            if ok:
+                ok_n += 1
+            else:
+                fail_n += 1
+            snap_done, snap_ok, snap_fail = done, ok_n, fail_n
+        if snap_done == total or snap_done % max(1, total // 5) == 0:
+            try:
+                await callback.message.edit_text(
+                    "⏳ <b>Проверка прокси</b>\n\n"
+                    f"Готово: <b>{snap_done}/{total}</b>\n"
+                    f"🟢 рабочих: <b>{snap_ok}</b> · 🔴 ошибок: <b>{snap_fail}</b>",
+                    parse_mode="HTML",
+                )
+            except TelegramBadRequest:
+                pass
+        return proxy, ok, info
+
+    results = await asyncio.gather(*[_check_one(p) for p in proxies])
+
+    async with Session() as session:
+        for proxy, ok, info in results:
+            row = await session.get(Proxy, proxy.id)
+            if row:
+                row.is_active = ok
+                row.last_error = None if ok else info
+        await session.commit()
+
+    await render_proxy_menu(callback, telegram_id)
+
 
 @router.callback_query(F.data.startswith("proxy_test:"))
 async def proxy_test(callback: CallbackQuery):
