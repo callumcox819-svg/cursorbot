@@ -95,6 +95,10 @@ class FsEdit(StatesGroup):
 @router.callback_query(F.data == "firstsms_open")
 async def firstsms_open(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    await state.update_data(
+        _back_chat_id=callback.message.chat.id,
+        _back_msg_id=callback.message.message_id,
+    )
     items = await load_presets(callback.from_user.id)
     await callback.message.edit_text(
         _render_list(items),
@@ -114,10 +118,11 @@ async def fsms_hide(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "fsms_add")
 async def fsms_add(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(
+        _back_chat_id=callback.message.chat.id,
+        _back_msg_id=callback.message.message_id,
+    )
     await state.set_state(FsAdd.text)
-    # Remember the menu message so we can return there after the user sends the text.
-    # This keeps the flow clean: add preset -> send text -> immediately see the preset list again.
-    await state.update_data(_back_chat_id=callback.message.chat.id, _back_msg_id=callback.message.message_id)
     await callback.message.answer(
         "➕ Отправь текст пресета одним сообщением.\n"
         "Можно использовать <code>OFFER</code> и спинтаксис <code>{a|b|c}</code>.",
@@ -145,9 +150,9 @@ async def fsms_add_text(message: Message, state: FSMContext):
     back_chat_id = data.get("_back_chat_id")
     back_msg_id = data.get("_back_msg_id")
 
-    # Try to edit the original menu message; if it no longer exists, send a fresh menu message.
-    try:
-        if back_chat_id and back_msg_id:
+    updated = False
+    if back_chat_id and back_msg_id:
+        try:
             await message.bot.edit_message_text(
                 _render_list(items),
                 chat_id=int(back_chat_id),
@@ -156,18 +161,17 @@ async def fsms_add_text(message: Message, state: FSMContext):
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
-            return  # меню обновлено, без лишнего спама
-    except Exception:
-        pass
-
-    # Fallback: just show the menu as a new message.
-    await message.answer(
-        _render_list(items),
-        reply_markup=_manage_kb(True),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-    await message.answer("✅ Пресет добавлен.")
+            updated = True
+        except Exception:
+            pass
+    if not updated:
+        await message.answer(
+            _render_list(items),
+            reply_markup=_manage_kb(True),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    await message.answer("✅ Добавлено.")
 
 
 @router.callback_query(F.data == "fsms_del_all")
