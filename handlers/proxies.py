@@ -407,8 +407,9 @@ async def render_proxy_menu(message_or_cb, telegram_id: int):
     text = (
         "🧩 <b>Твои прокси</b>\n\n"
         f"Всего: {len(proxies)}\n"
-        f"Рабочих: {sum(1 for p in proxies if p.is_active)}\n"
-        f"Плохих: {sum(1 for p in proxies if not p.is_active)}"
+        f"Рабочих (веб+SMTP): {sum(1 for p in proxies if p.is_active)}\n"
+        f"Плохих: {sum(1 for p in proxies if not p.is_active)}\n"
+        f"<i>Проверка = httpbin + туннель к smtp.gmail.com:587</i>"
     )
 
     kb = proxies_menu(proxies)

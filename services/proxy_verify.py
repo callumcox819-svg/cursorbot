@@ -103,16 +103,51 @@ async def _test_socks_proxy(proxy_url: str, *, timeout: int = 10) -> Tuple[bool,
     return False, last_error
 
 
+def _proxy_row_from_dict(d: dict[str, Any]) -> Proxy:
+    p = Proxy(
+        host=str(d["host"]),
+        port=int(d["port"]),
+        username=d.get("username"),
+        password=d.get("password"),
+        type=d.get("type") or "http",
+    )
+    return p
+
+
+async def test_smtp_tunnel(proxy: Proxy | dict[str, Any], *, timeout: int = 12) -> Tuple[bool, str]:
+    from proxy_manager import test_smtp_tunnel_sync
+
+    d = proxy_to_dict(proxy)
+    row = _proxy_row_from_dict(d)
+    return await asyncio.to_thread(test_smtp_tunnel_sync, row, timeout=timeout)
+
+
 async def test_proxy(proxy: Proxy | dict[str, Any], *, timeout: int = 10) -> Tuple[bool, str]:
+    """
+    Для рассылки важны оба теста:
+    - веб (httpbin) — как раньше;
+    - SMTP :587 через PySocks — как при /send.
+    """
     d = proxy_to_dict(proxy)
     proxy_type = normalize_proxy_type(d.get("type"))
     proxy_url = build_proxy_url(d)
 
     if proxy_type in ("http",):
-        return await _test_http_like_proxy(proxy_url, timeout=timeout)
-    if proxy_type.startswith("socks"):
-        return await _test_socks_proxy(proxy_url, timeout=timeout)
-    return False, f"Неизвестный тип прокси: {proxy_type}"
+        web_ok, web_info = await _test_http_like_proxy(proxy_url, timeout=timeout)
+    elif proxy_type.startswith("socks"):
+        web_ok, web_info = await _test_socks_proxy(proxy_url, timeout=timeout)
+    else:
+        return False, f"Неизвестный тип прокси: {proxy_type}"
+
+    smtp_ok, smtp_info = await test_smtp_tunnel(proxy, timeout=max(timeout, 12))
+
+    if web_ok and smtp_ok:
+        return True, f"{web_info} · {smtp_info}"
+    if web_ok and not smtp_ok:
+        return False, f"Веб OK, но SMTP нет: {smtp_info}"
+    if not web_ok and smtp_ok:
+        return False, f"SMTP OK, но веб нет: {web_info}"
+    return False, f"Веб: {web_info} · SMTP: {smtp_info}"
 
 
 async def test_proxy_url(proxy_url: str, *, timeout: int = 10) -> Tuple[bool, str]:

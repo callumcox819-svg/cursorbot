@@ -19,8 +19,9 @@ import socket as _stdlib_socket
 import smtplib as _smtplib
 
 _SMTP_SOCKET_ORIG = _smtplib.socket
-_SMTP_CONNECT_ORIG = None
 _SOCKET_GETADDRINFO_ORIG = None
+_SMTP_TEST_HOST = "smtp.gmail.com"
+_SMTP_TEST_PORT = 587
 
 
 # ----------------------------
@@ -76,33 +77,6 @@ async def choose_proxy_for_user(session, user_id: int) -> Optional[Proxy]:
         return None
 
 
-def _looks_like_ipv6(host: str) -> bool:
-    h = (host or "").strip()
-    if not h or h.startswith("."):
-        return False
-    if h.count(":") >= 2:
-        return True
-    if ":" in h and "." not in h:
-        return True
-    return False
-
-
-def _ensure_smtp_host_ipv4(host: str) -> str:
-    """PySocks не умеет IPv6 — для SMTP только IPv4."""
-    h = (host or "").strip()
-    if not h:
-        return h
-    if _looks_like_ipv6(h):
-        raise OSError(f"PySocks doesn't support IPv6: ({h!r},)")
-    parts = h.split(".")
-    if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
-        return h
-    infos = _stdlib_socket.getaddrinfo(h, None, _stdlib_socket.AF_INET, _stdlib_socket.SOCK_STREAM)
-    if not infos:
-        raise OSError(f"No IPv4 address for SMTP host {h!r}")
-    return str(infos[0][4][0])
-
-
 # ----------------------------
 # Low-level: apply/reset proxy ONLY for smtplib
 # ----------------------------
@@ -112,7 +86,7 @@ def apply_proxy_to_smtplib(proxy: Proxy) -> None:
     НЕ трогаем глобальный socket.socket, иначе сломаешь Telegram (aiohttp).
     Мы меняем только smtplib.socket -> socks, через wrapmodule.
     """
-    global _SMTP_CONNECT_ORIG, _SOCKET_GETADDRINFO_ORIG
+    global _SOCKET_GETADDRINFO_ORIG
 
     import socks  # PySocks
     import smtplib
@@ -190,11 +164,36 @@ def apply_proxy_to_smtplib(proxy: Proxy) -> None:
     logger.info("SMTP proxy applied (smtplib only): %s://%s:%s rdns=%s", proxy_type, host, port, rdns)
 
 
+def test_smtp_tunnel_sync(proxy: Proxy, *, timeout: int = 12) -> tuple[bool, str]:
+    """Та же цепочка, что при рассылке: PySocks → SMTP :587."""
+    apply_proxy_to_smtplib(proxy)
+    try:
+        s = _smtplib.SMTP(_SMTP_TEST_HOST, _SMTP_TEST_PORT, timeout=timeout)
+        try:
+            s.ehlo()
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+        return True, f"SMTP OK ({_SMTP_TEST_HOST}:{_SMTP_TEST_PORT})"
+    except Exception as e:
+        err = str(e).strip() or type(e).__name__
+        if "GeneralProxyError" in type(e).__name__ or "generalproxy" in err.lower():
+            err = (
+                f"{err} — прокси не пускает SMTP (порт 587). "
+                "Нужен SOCKS5 или HTTP с CONNECT к 587."
+            )
+        return False, f"{type(e).__name__}: {err}"
+    finally:
+        reset_smtplib_proxy()
+
+
 def reset_smtplib_proxy() -> None:
     """
     Возвращает стандартное поведение smtplib (убирает proxy wrapper).
     """
-    global _SMTP_CONNECT_ORIG, _SOCKET_GETADDRINFO_ORIG
+    global _SOCKET_GETADDRINFO_ORIG
 
     import smtplib
 
@@ -203,9 +202,6 @@ def reset_smtplib_proxy() -> None:
         socks.set_default_proxy()
     except Exception:
         pass
-
-    if _SMTP_CONNECT_ORIG is not None:
-        smtplib.SMTP.connect = _SMTP_CONNECT_ORIG  # type: ignore[method-assign]
 
     if _SOCKET_GETADDRINFO_ORIG is not None:
         _stdlib_socket.getaddrinfo = _SOCKET_GETADDRINFO_ORIG  # type: ignore[assignment]

@@ -169,6 +169,9 @@ _PROXY_PATTERNS = [
     r"network is unreachable",
     r"pysocks doesn't support ipv6",
     r"doesn't support ipv6",
+    r"generalproxyerror",
+    r"sockshttperror",
+    r"http proxy server did not return",
 ]
 
 _INVALID_CRED_PATTERNS = [
