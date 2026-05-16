@@ -37,7 +37,7 @@ from utils.preset_list_ui import (
 
 DATA_DIR = "data"
 MAX_TITLE_LEN = 40
-MAX_TEXT_LEN = 2000
+MAX_TEXT_LEN = 4000
 
 
 @dataclass
@@ -80,16 +80,16 @@ def _template_named_pairs(items: List[TemplateItem]) -> List[tuple[str, str]]:
 
 
 def parse_preset_name_dash_text(raw: str) -> tuple[str, str] | None:
-    """Формат: «Название - текст» (также — / –)."""
+    """Формат: «имя - текст» (дефис/тире, пробелы необязательны)."""
     s = (raw or "").strip()
     if len(s) < 4:
         return None
-    for sep in (" - ", " — ", " – "):
-        if sep in s:
-            name, text = s.split(sep, 1)
-            name, text = name.strip(), text.strip()
-            if name and len(text) >= 2:
-                return name[:MAX_TITLE_LEN], text[:MAX_TEXT_LEN]
+    m = re.match(r"^(.+?)\s*[-–—]\s*(.+)$", s, flags=re.DOTALL)
+    if not m:
+        return None
+    name, text = m.group(1).strip(), m.group(2).strip()
+    if name and len(text) >= 2:
+        return name[:MAX_TITLE_LEN], text[:MAX_TEXT_LEN]
     return None
 
 
@@ -393,11 +393,13 @@ def render_template(*, template_title: str | None = None, html_name: str | None 
 # =========================
 
 class PresetAdd(StatesGroup):
+    name = State()
     text = State()
 
 
 class PresetEdit(StatesGroup):
     idx = State()
+    name = State()
     text = State()
 
 
@@ -589,28 +591,53 @@ async def tmpl_add_start(call: CallbackQuery, state: FSMContext) -> None:
         _menu_chat_id=call.message.chat.id,
         _menu_msg_id=call.message.message_id,
     )
-    await state.set_state(PresetAdd.text)
+    await state.set_state(PresetAdd.name)
     prompt = await call.message.answer(
-        "➕ Отправь пресет одной строкой:\n"
-        "<code>Название - текст письма</code>\n\n"
-        "Пример:\n<code>Уточнение - Hallo, ist der Artikel noch da?</code>",
+        "➕ <b>Шаг 1/2.</b> Отправь <b>имя пресета</b> — оно будет на кнопке при ответе на письмо.\n\n"
+        "Пример: <code>новый пресет</code>",
         parse_mode="HTML",
     )
     await state.update_data(_prompt_msg_id=prompt.message_id)
     await call.answer()
 
 
+@router.message(PresetAdd.name)
+async def tmpl_add_name(message: Message, state: FSMContext) -> None:
+    title = (message.text or "").strip()[:MAX_TITLE_LEN]
+    if len(title) < 1:
+        return await message.answer("Имя не может быть пустым. Введи ещё раз.")
+    # Одной строкой «имя - текст» тоже можно (короткие пресеты)
+    parsed = parse_preset_name_dash_text(message.text or "")
+    if parsed:
+        title, body = parsed
+        data = await state.get_data()
+        await state.clear()
+        async with Session() as session:
+            tg_id = await _user_tg_id(session, message.from_user.id)
+        items = await load_templates(tg_id)
+        items.append(TemplateItem(title=title, text=body))
+        await save_templates(tg_id, items)
+        await _finish_presets_add(message, data, tg_id)
+        return
+    await state.update_data(preset_name=title)
+    await state.set_state(PresetAdd.text)
+    await message.answer(
+        "➕ <b>Шаг 2/2.</b> Отправь <b>текст пресета</b> — его получит адресат письма.\n"
+        "Можно длинное сообщение целиком одним текстом.",
+        parse_mode="HTML",
+    )
+
+
 @router.message(PresetAdd.text)
 async def tmpl_add_text(message: Message, state: FSMContext) -> None:
-    parsed = parse_preset_name_dash_text(message.text or "")
-    if not parsed:
-        return await message.answer(
-            "Нужен формат <code>Название - текст</code> (через дефис с пробелами).\n"
-            "Пример: <code>Ответ - Guten Tag!</code>",
-            parse_mode="HTML",
-        )
-    title, body = parsed
+    body = (message.text or "").strip()[:MAX_TEXT_LEN]
+    if len(body) < 2:
+        return await message.answer("Текст слишком короткий. Отправь ещё раз.")
     data = await state.get_data()
+    title = str(data.get("preset_name") or "").strip()[:MAX_TITLE_LEN]
+    if not title:
+        await state.clear()
+        return await message.answer("Имя пресета потеряно. Нажми «➕ Добавить пресет» снова.")
     await state.clear()
 
     async with Session() as session:
@@ -676,27 +703,39 @@ async def tmpl_preset_edit_choose(call: CallbackQuery, state: FSMContext) -> Non
     if idx < 0 or idx >= len(items):
         return await call.answer("Не найден", show_alert=True)
     await state.update_data(idx=idx)
-    await state.set_state(PresetEdit.text)
+    await state.set_state(PresetEdit.name)
     old = items[idx]
     await call.message.answer(
-        f"✏️ Отправь новую строку <code>Название - текст</code>.\n"
-        f"Сейчас: <code>{escape(old.title)} - …</code>",
+        f"✏️ <b>Шаг 1/2.</b> Новое имя пресета (сейчас: <code>{escape(old.title)}</code>):",
         parse_mode="HTML",
     )
     await call.answer()
 
 
+@router.message(PresetEdit.name)
+async def tmpl_preset_edit_name(message: Message, state: FSMContext) -> None:
+    title = (message.text or "").strip()[:MAX_TITLE_LEN]
+    if len(title) < 1:
+        return await message.answer("Имя не может быть пустым.")
+    await state.update_data(preset_name=title)
+    await state.set_state(PresetEdit.text)
+    await message.answer(
+        "✏️ <b>Шаг 2/2.</b> Отправь новый текст письма для этого пресета:",
+        parse_mode="HTML",
+    )
+
+
 @router.message(PresetEdit.text)
 async def tmpl_preset_edit_text(message: Message, state: FSMContext) -> None:
-    parsed = parse_preset_name_dash_text(message.text or "")
-    if not parsed:
-        return await message.answer(
-            "Нужен формат <code>Название - текст</code>.",
-            parse_mode="HTML",
-        )
-    title, body = parsed
+    body = (message.text or "").strip()[:MAX_TEXT_LEN]
+    if len(body) < 2:
+        return await message.answer("Текст слишком короткий. Введи ещё раз.")
     data = await state.get_data()
     idx = int(data.get("idx", -1))
+    title = str(data.get("preset_name") or "").strip()[:MAX_TITLE_LEN]
+    if not title:
+        await state.clear()
+        return await message.answer("Имя не задано. Начни изменение заново.")
     await state.clear()
 
     async with Session() as session:
