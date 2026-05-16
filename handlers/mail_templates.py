@@ -27,10 +27,11 @@ def _templates_kb(items: List[TemplateItem], acc_id: int, uid: str) -> InlineKey
     # UI requirement: this screen is "Отправить пресет" and must show user templates.
     # We display them as numbered presets (as in the reference UX).
     for i, t in enumerate(items[:30]):
+        label = (t.title or f"Пресет #{i + 1}").strip()[:40]
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"Пресет #{i+1}",
+                    text=label,
                     callback_data=f"mail_tmpl_send:{i}:{acc_id}:{uid}",
                 )
             ]

@@ -83,10 +83,11 @@ def _kb_preset_pick(items: list[TemplateItem], acc_id: int, uid: str):
     rows: list[list[InlineKeyboardButton]] = []
 
     for i, t in enumerate(items[:30]):
+        label = (t.title or f"Пресет #{i + 1}").strip()[:40]
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"Пресет #{i+1}",
+                    text=label,
                     callback_data=f"mail_tmpl_send:{i}:{acc_id}:{uid}",
                 )
             ]

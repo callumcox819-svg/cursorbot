@@ -27,6 +27,9 @@ router = Router()
 from utils.preset_list_ui import (
     NOTE_REGULAR_PRESETS,
     NOTE_SMART_PRESETS,
+    REGULAR_PRESETS_EMPTY_HINT,
+    named_presets_pick_kb,
+    render_named_presets_page,
     render_text_presets_page,
     text_presets_manage_kb,
     text_presets_pick_kb,
@@ -70,6 +73,24 @@ def _items_from_json(data: object) -> List[TemplateItem]:
 
 def _template_texts(items: List[TemplateItem]) -> List[str]:
     return [(it.text or "").strip() for it in items if (it.text or "").strip()]
+
+
+def _template_named_pairs(items: List[TemplateItem]) -> List[tuple[str, str]]:
+    return [((it.title or "").strip(), (it.text or "").strip()) for it in items if (it.text or "").strip()]
+
+
+def parse_preset_name_dash_text(raw: str) -> tuple[str, str] | None:
+    """Формат: «Название - текст» (также — / –)."""
+    s = (raw or "").strip()
+    if len(s) < 4:
+        return None
+    for sep in (" - ", " — ", " – "):
+        if sep in s:
+            name, text = s.split(sep, 1)
+            name, text = name.strip(), text.strip()
+            if name and len(text) >= 2:
+                return name[:MAX_TITLE_LEN], text[:MAX_TEXT_LEN]
+    return None
 
 
 def _smart_presets_kb(has_any: bool) -> InlineKeyboardMarkup:
@@ -475,10 +496,15 @@ async def _hide_old_menu_markup(bot, state_data: dict) -> None:
 
 async def _send_presets_menu_message(message: Message, tg_id: int) -> None:
     items = await load_templates(tg_id)
-    texts = _template_texts(items)
+    pairs = _template_named_pairs(items)
     await message.answer(
-        render_text_presets_page("🧾 <b>Ваши пресеты:</b>", texts, footer_note=NOTE_REGULAR_PRESETS),
-        reply_markup=_regular_presets_kb(bool(texts)),
+        render_named_presets_page(
+            "🧾 <b>Ваши пресеты:</b>",
+            pairs,
+            empty_hint=REGULAR_PRESETS_EMPTY_HINT,
+            footer_note=NOTE_REGULAR_PRESETS,
+        ),
+        reply_markup=_regular_presets_kb(bool(pairs)),
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
@@ -526,10 +552,15 @@ async def presets_menu(call: CallbackQuery, state: FSMContext) -> None:
     async with Session() as session:
         tg_id = await _user_tg_id(session, call.from_user.id)
     items = await load_templates(tg_id)
-    texts = _template_texts(items)
+    pairs = _template_named_pairs(items)
     await call.message.edit_text(
-        render_text_presets_page("🧾 <b>Ваши пресеты:</b>", texts, footer_note=NOTE_REGULAR_PRESETS),
-        reply_markup=_regular_presets_kb(bool(texts)),
+        render_named_presets_page(
+            "🧾 <b>Ваши пресеты:</b>",
+            pairs,
+            empty_hint=REGULAR_PRESETS_EMPTY_HINT,
+            footer_note=NOTE_REGULAR_PRESETS,
+        ),
+        reply_markup=_regular_presets_kb(bool(pairs)),
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
@@ -560,8 +591,9 @@ async def tmpl_add_start(call: CallbackQuery, state: FSMContext) -> None:
     )
     await state.set_state(PresetAdd.text)
     prompt = await call.message.answer(
-        "➕ Отправь текст пресета одним сообщением.\n"
-        "Можно <code>OFFER</code> и спинтаксис <code>{a|b|c}</code>.",
+        "➕ Отправь пресет одной строкой:\n"
+        "<code>Название - текст письма</code>\n\n"
+        "Пример:\n<code>Уточнение - Hallo, ist der Artikel noch da?</code>",
         parse_mode="HTML",
     )
     await state.update_data(_prompt_msg_id=prompt.message_id)
@@ -570,17 +602,21 @@ async def tmpl_add_start(call: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(PresetAdd.text)
 async def tmpl_add_text(message: Message, state: FSMContext) -> None:
-    body = (message.text or "").strip()[:MAX_TEXT_LEN]
-    if len(body) < 2:
-        return await message.answer("Текст слишком короткий. Отправь ещё раз.")
+    parsed = parse_preset_name_dash_text(message.text or "")
+    if not parsed:
+        return await message.answer(
+            "Нужен формат <code>Название - текст</code> (через дефис с пробелами).\n"
+            "Пример: <code>Ответ - Guten Tag!</code>",
+            parse_mode="HTML",
+        )
+    title, body = parsed
     data = await state.get_data()
     await state.clear()
 
     async with Session() as session:
         tg_id = await _user_tg_id(session, message.from_user.id)
     items = await load_templates(tg_id)
-    short = body[:40] + ("…" if len(body) > 40 else "")
-    items.append(TemplateItem(title=short, text=body))
+    items.append(TemplateItem(title=title, text=body))
     await save_templates(tg_id, items)
     await _finish_presets_add(message, data, tg_id)
 
@@ -592,9 +628,10 @@ async def tmpl_preset_del_pick(call: CallbackQuery) -> None:
     items = await load_templates(tg_id)
     if not items:
         return await call.answer("Пусто")
+    pairs = _template_named_pairs(items)
     await call.message.edit_text(
         "🗑 Выбери пресет для удаления:",
-        reply_markup=text_presets_pick_kb(len(items), "tmpl_preset_del", "presets_menu"),
+        reply_markup=named_presets_pick_kb(pairs, "tmpl_preset_del", "presets_menu"),
     )
     await call.answer()
 
@@ -622,9 +659,10 @@ async def tmpl_preset_edit_pick(call: CallbackQuery, state: FSMContext) -> None:
         return await call.answer("Пусто")
     await state.update_data(_menu_chat_id=call.message.chat.id, _menu_msg_id=call.message.message_id)
     await state.set_state(PresetEdit.idx)
+    pairs = _template_named_pairs(items)
     await call.message.edit_text(
         "✏️ Выбери пресет для изменения:",
-        reply_markup=text_presets_pick_kb(len(items), "tmpl_preset_edit", "presets_menu"),
+        reply_markup=named_presets_pick_kb(pairs, "tmpl_preset_edit", "presets_menu"),
     )
     await call.answer()
 
@@ -639,15 +677,24 @@ async def tmpl_preset_edit_choose(call: CallbackQuery, state: FSMContext) -> Non
         return await call.answer("Не найден", show_alert=True)
     await state.update_data(idx=idx)
     await state.set_state(PresetEdit.text)
-    await call.message.answer("✏️ Отправь новый текст пресета одним сообщением.")
+    old = items[idx]
+    await call.message.answer(
+        f"✏️ Отправь новую строку <code>Название - текст</code>.\n"
+        f"Сейчас: <code>{escape(old.title)} - …</code>",
+        parse_mode="HTML",
+    )
     await call.answer()
 
 
 @router.message(PresetEdit.text)
 async def tmpl_preset_edit_text(message: Message, state: FSMContext) -> None:
-    body = (message.text or "").strip()[:MAX_TEXT_LEN]
-    if len(body) < 2:
-        return await message.answer("Текст слишком короткий. Введи ещё раз.")
+    parsed = parse_preset_name_dash_text(message.text or "")
+    if not parsed:
+        return await message.answer(
+            "Нужен формат <code>Название - текст</code>.",
+            parse_mode="HTML",
+        )
+    title, body = parsed
     data = await state.get_data()
     idx = int(data.get("idx", -1))
     await state.clear()
@@ -657,8 +704,7 @@ async def tmpl_preset_edit_text(message: Message, state: FSMContext) -> None:
     items = await load_templates(tg_id)
     if idx < 0 or idx >= len(items):
         return await message.answer("Пресет не найден.")
-    short = body[:40] + ("…" if len(body) > 40 else "")
-    items[idx] = TemplateItem(title=short, text=body)
+    items[idx] = TemplateItem(title=title, text=body)
     await save_templates(tg_id, items)
     await _hide_old_menu_markup(message.bot, data)
     await message.answer("✅ Сохранено.")
