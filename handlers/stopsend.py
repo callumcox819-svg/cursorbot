@@ -11,18 +11,18 @@ logger = logging.getLogger(__name__)
 router = Router(name="stopsend")
 
 
-@router.message(Command("stopsend"))
-@router.message(F.text == "⏹ Остановить рассылку")
+@router.message(Command("stop", "stopsend"))
+@router.message(F.text.in_({"⏹ Остановить рассылку", "/stop", "/stopsend"}))
 async def cmd_stopsend(message: Message) -> None:
     """
     Пользовательская команда остановки рассылки.
     """
-    from handlers.send import get_sending_state
+    from handlers.send import get_sending_state, set_sending_state
 
     user_id = message.from_user.id
     state = get_sending_state(user_id)
 
-    if not state:
+    if not state or not state.is_running:
         await message.answer(
             "Сейчас для тебя нет активной рассылки.\n"
             "Запустить можно командой /send или кнопкой в меню.",
@@ -39,6 +39,7 @@ async def cmd_stopsend(message: Message) -> None:
         return
 
     state.is_stopping = True
+    set_sending_state(user_id, state=state)
     await message.answer(
         "⏹ Я пометил рассылку на остановку.\n"
         "После отправки ближайших писем процесс завершится.",
@@ -61,5 +62,8 @@ def stop_sending_for_user(user_id: int) -> bool:
     if not state:
         return False
 
+    from handlers.send import set_sending_state
+
     state.is_stopping = True
+    set_sending_state(user_id, state=state)
     return True

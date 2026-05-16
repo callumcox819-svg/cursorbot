@@ -25,6 +25,7 @@ _ROUTER_BOOT_ORDER: Tuple[str, ...] = (
     "handlers.start",
     "handlers.settings",
     "handlers.send",
+    "handlers.stopsend",
 )
 
 
