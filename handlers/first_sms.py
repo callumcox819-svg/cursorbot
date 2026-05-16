@@ -123,11 +123,12 @@ async def fsms_add(callback: CallbackQuery, state: FSMContext):
         _back_msg_id=callback.message.message_id,
     )
     await state.set_state(FsAdd.text)
-    await callback.message.answer(
+    prompt = await callback.message.answer(
         "➕ Отправь текст пресета одним сообщением.\n"
         "Можно использовать <code>OFFER</code> и спинтаксис <code>{a|b|c}</code>.",
         parse_mode="HTML",
     )
+    await state.update_data(_prompt_msg_id=prompt.message_id)
     await callback.answer()
 
 
@@ -150,28 +151,28 @@ async def fsms_add_text(message: Message, state: FSMContext):
     back_chat_id = data.get("_back_chat_id")
     back_msg_id = data.get("_back_msg_id")
 
-    updated = False
-    if back_chat_id and back_msg_id:
+    prompt_id = data.get("_prompt_msg_id")
+    if prompt_id:
         try:
-            await message.bot.edit_message_text(
-                _render_list(items),
-                chat_id=int(back_chat_id),
-                message_id=int(back_msg_id),
-                reply_markup=_manage_kb(True),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-            updated = True
+            await message.bot.delete_message(message.chat.id, int(prompt_id))
         except Exception:
             pass
-    if not updated:
-        await message.answer(
-            _render_list(items),
-            reply_markup=_manage_kb(True),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+    if back_chat_id and back_msg_id:
+        try:
+            await message.bot.edit_message_reply_markup(
+                chat_id=int(back_chat_id),
+                message_id=int(back_msg_id),
+                reply_markup=None,
+            )
+        except Exception:
+            pass
     await message.answer("✅ Добавлено.")
+    await message.answer(
+        _render_list(items),
+        reply_markup=_manage_kb(True),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 @router.callback_query(F.data == "fsms_del_all")

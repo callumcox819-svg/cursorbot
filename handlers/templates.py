@@ -455,35 +455,65 @@ async def _restore_smart_list(message: Message, state_data: dict, tg_id: int) ->
     )
 
 
+async def _delete_message_safe(bot, chat_id: int, message_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def _hide_old_menu_markup(bot, state_data: dict) -> None:
+    chat_id = state_data.get("_menu_chat_id")
+    msg_id = state_data.get("_menu_msg_id")
+    if not chat_id or not msg_id:
+        return
+    try:
+        await bot.edit_message_reply_markup(chat_id=int(chat_id), message_id=int(msg_id), reply_markup=None)
+    except Exception:
+        pass
+
+
+async def _send_presets_menu_message(message: Message, tg_id: int) -> None:
+    items = await load_templates(tg_id)
+    texts = _template_texts(items)
+    await message.answer(
+        render_text_presets_page("🧾 <b>Ваши пресеты:</b>", texts, footer_note=NOTE_REGULAR_PRESETS),
+        reply_markup=_regular_presets_kb(bool(texts)),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+async def _send_smart_menu_message(message: Message, tg_id: int) -> None:
+    texts = await load_smart_texts(tg_id)
+    await message.answer(
+        render_text_presets_page(
+            "📄 <b>Ваши умные пресеты:</b>",
+            texts,
+            footer_note=NOTE_SMART_PRESETS,
+        ),
+        reply_markup=_smart_presets_kb(bool(texts)),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
 async def _finish_presets_add(message: Message, state_data: dict, tg_id: int) -> None:
-    restored = await _restore_presets_list(message, state_data, tg_id)
-    if not restored:
-        items = await load_templates(tg_id)
-        texts = _template_texts(items)
-        await message.answer(
-            render_text_presets_page("🧾 <b>Ваши пресеты:</b>", texts, footer_note=NOTE_REGULAR_PRESETS),
-            reply_markup=_regular_presets_kb(bool(texts)),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+    prompt_id = state_data.get("_prompt_msg_id")
+    if prompt_id:
+        await _delete_message_safe(message.bot, message.chat.id, int(prompt_id))
+    await _hide_old_menu_markup(message.bot, state_data)
     await message.answer("✅ Добавлено.")
+    await _send_presets_menu_message(message, tg_id)
 
 
 async def _finish_smart_add(message: Message, state_data: dict, tg_id: int) -> None:
-    restored = await _restore_smart_list(message, state_data, tg_id)
-    if not restored:
-        texts = await load_smart_texts(tg_id)
-        await message.answer(
-            render_text_presets_page(
-                "📄 <b>Ваши умные пресеты:</b>",
-                texts,
-                footer_note=NOTE_SMART_PRESETS,
-            ),
-            reply_markup=_smart_presets_kb(bool(texts)),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+    prompt_id = state_data.get("_prompt_msg_id")
+    if prompt_id:
+        await _delete_message_safe(message.bot, message.chat.id, int(prompt_id))
+    await _hide_old_menu_markup(message.bot, state_data)
     await message.answer("✅ Добавлено.")
+    await _send_smart_menu_message(message, tg_id)
 
 
 @router.callback_query(F.data == "presets_menu")
@@ -529,11 +559,12 @@ async def tmpl_add_start(call: CallbackQuery, state: FSMContext) -> None:
         _menu_msg_id=call.message.message_id,
     )
     await state.set_state(PresetAdd.text)
-    await call.message.answer(
+    prompt = await call.message.answer(
         "➕ Отправь текст пресета одним сообщением.\n"
         "Можно <code>OFFER</code> и спинтаксис <code>{a|b|c}</code>.",
         parse_mode="HTML",
     )
+    await state.update_data(_prompt_msg_id=prompt.message_id)
     await call.answer()
 
 
@@ -629,15 +660,9 @@ async def tmpl_preset_edit_text(message: Message, state: FSMContext) -> None:
     short = body[:40] + ("…" if len(body) > 40 else "")
     items[idx] = TemplateItem(title=short, text=body)
     await save_templates(tg_id, items)
-    if not await _restore_presets_list(message, data, tg_id):
-        texts = _template_texts(items)
-        await message.answer(
-            render_text_presets_page("🧾 <b>Ваши пресеты:</b>", texts, footer_note=NOTE_REGULAR_PRESETS),
-            reply_markup=_regular_presets_kb(bool(texts)),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+    await _hide_old_menu_markup(message.bot, data)
     await message.answer("✅ Сохранено.")
+    await _send_presets_menu_message(message, tg_id)
 
 
 @router.callback_query(F.data == "smart_presets_menu")
@@ -677,11 +702,12 @@ async def stmpl_add_start(call: CallbackQuery, state: FSMContext) -> None:
         _menu_msg_id=call.message.message_id,
     )
     await state.set_state(SmartTmplAdd.text)
-    await call.message.answer(
+    prompt = await call.message.answer(
         "➕ Отправь текст пресета одним сообщением.\n"
         "Можно <code>OFFER</code> и спинтаксис <code>{a|b|c}</code>.",
         parse_mode="HTML",
     )
+    await state.update_data(_prompt_msg_id=prompt.message_id)
     await call.answer()
 
 
@@ -784,15 +810,6 @@ async def stmpl_edit_text(message: Message, state: FSMContext) -> None:
         return await message.answer("Пресет не найден.")
     items[idx] = text
     await save_smart_texts(tg_id, items)
-    if not await _restore_smart_list(message, data, tg_id):
-        await message.answer(
-            render_text_presets_page(
-                "📄 <b>Ваши умные пресеты:</b>",
-                items,
-                footer_note=NOTE_SMART_PRESETS,
-            ),
-            reply_markup=_smart_presets_kb(bool(items)),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+    await _hide_old_menu_markup(message.bot, data)
     await message.answer("✅ Сохранено.")
+    await _send_smart_menu_message(message, tg_id)
