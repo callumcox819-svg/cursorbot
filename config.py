@@ -3,7 +3,7 @@ import os
 
 class Config:
     # 🔐 Бот токен
-    BOT_TOKEN = os.getenv("BOT_TOKEN", "8499678750:AAFhKLIaG1cEaJ_guhDfwWnqsF-2K0Rn68k")
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "8499678750:AAFD4eHSX1YoBaFbbJUXSac8hWIj8RAeMec")
 
     # 👑 Админы (Telegram ID)
     ADMIN_IDS = [7416000184, 6606783602]
