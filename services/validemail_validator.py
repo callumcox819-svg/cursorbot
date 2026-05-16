@@ -17,6 +17,7 @@ from services.validemail_fast import validate_emails_fast
 from services.seller_name import (
     MIN_NAME_TOKEN_LEN,
     normalize_seller_name,
+    pick_handle_locals,
     pick_name_tokens,
     seller_name_eligible_for_validation,
     seller_name_from_item,
@@ -86,22 +87,27 @@ def _make_local_part_variants(name: str, *, require_first_and_last: bool) -> lis
     """
     Несколько типичных local-part для одного продавца.
     Реальные люди часто используют не только first.last.
-    """
-    tokens = _pick_alpha_tokens(name)
-    if require_first_and_last and len(tokens) < 2:
-        return []
-    if not tokens:
-        return []
-
+  """
     out: list[str] = []
     seen: set[str] = set()
 
     def _add(local: str) -> None:
-        local = re.sub(r"\.+", ".", (local or "").lower()).strip(".")
+        local = re.sub(r"[^a-z0-9._+\-]", "", (local or "").lower())
+        local = re.sub(r"\.+", ".", local).strip(".")
         if not local or local in seen:
             return
         seen.add(local)
         out.append(local)
+
+    # Ники: alinafor20 → сразу как local-part
+    for handle in pick_handle_locals(name):
+        _add(handle)
+
+    tokens = _pick_alpha_tokens(name)
+    if require_first_and_last and len(tokens) < 2:
+        return out
+    if not tokens:
+        return out
 
     if len(tokens) == 1:
         _add(tokens[0])

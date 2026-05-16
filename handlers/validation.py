@@ -323,7 +323,7 @@ async def validation_handler(message: Message):
         dom_preview += f" … (+{len(domains) - 8})"
     progress_msg = await message.answer(
         f"🔎 Запуск валидации…\n"
-        f"Схема: <b>имя (слово ≥{MIN_NAME_TOKEN_LEN} букв)</b> → логин → <b>@ваши домены</b> → ValidEmail\n"
+        f"Схема: <b>имя (слово ≥{MIN_NAME_TOKEN_LEN} букв или ник alinafor20)</b> → логин → <b>@ваши домены</b> → ValidEmail\n"
         f"Домены ({len(domains)}): <code>{dom_preview}</code>\n"
         f"Ключей API: <b>{n_keys}</b> | параллельно: <b>{cfg.concurrency}</b>",
         parse_mode="HTML",

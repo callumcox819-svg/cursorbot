@@ -39,7 +39,7 @@ def normalize_seller_name(raw: str) -> str:
 
 
 def pick_name_tokens(name: str, *, min_len: int = MIN_NAME_TOKEN_LEN) -> list[str]:
-    """Буквенные части имени (каждая >= min_len символов)."""
+    """Буквенные части имени (каждая >= min_len символов, только буквы)."""
     s = normalize_seller_name(name)
     if not s:
         return []
@@ -59,6 +59,44 @@ def pick_name_tokens(name: str, *, min_len: int = MIN_NAME_TOKEN_LEN) -> list[st
     return out
 
 
+def _is_handle_token(h: str, *, min_len: int = MIN_NAME_TOKEN_LEN) -> bool:
+    """Ник вида alinafor20: латиница+цифры, >= min_len, есть хотя бы одна буква."""
+    if len(h) < min_len or len(h) > 64:
+        return False
+    if not h.isalnum():
+        return False
+    return any(c.isalpha() for c in h)
+
+
+def pick_handle_locals(name: str, *, min_len: int = MIN_NAME_TOKEN_LEN) -> list[str]:
+    """
+    Никнеймы из профиля: alinafor20, coolguy99 и т.п.
+    — одно слово в имени или часть с цифрами (не короче min_len).
+    """
+    s = normalize_seller_name(name)
+    if not s:
+        return []
+
+    parts = [p for p in re.split(r"[\s\-']+", s) if p.strip()]
+    out: list[str] = []
+    seen: set[str] = set()
+    single_part = len(parts) <= 1
+
+    for p in parts:
+        h = re.sub(r"[^A-Za-z0-9]", "", p)
+        if not _is_handle_token(h, min_len=min_len):
+            continue
+        if single_part or any(c.isdigit() for c in h):
+            hl = h.lower()
+            if hl not in seen:
+                seen.add(hl)
+                out.append(hl)
+    return out
+
+
 def seller_name_eligible_for_validation(name: str, *, min_token_len: int = MIN_NAME_TOKEN_LEN) -> bool:
-    """Имя подходит для имя@домен, если есть хотя бы одно слово >= min_token_len."""
-    return len(pick_name_tokens(name, min_len=min_token_len)) >= 1
+    """Имя подходит для имя@домен: слово из букв >=4 или ник (alinafor20)."""
+    return bool(
+        pick_name_tokens(name, min_len=min_token_len)
+        or pick_handle_locals(name, min_len=min_token_len)
+    )
