@@ -394,6 +394,10 @@ async def _quick_gmail_begin(message: Message, state: FSMContext) -> None:
 # Reply «⚡ Быстрое добавление» — bot._bind_main_reply_keyboard
 
 async def quick_gmail_from_main_menu(message: Message, state: FSMContext) -> None:
+    from services.bot_access import ensure_message_access
+
+    if not await ensure_message_access(message):
+        return
     await _quick_gmail_begin(message, state)
 
 

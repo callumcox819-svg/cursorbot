@@ -16,6 +16,11 @@ async def cmd_stopsend(message: Message) -> None:
     """
     Пользовательская команда остановки рассылки.
     """
+    from services.bot_access import ensure_message_access
+
+    if not await ensure_message_access(message):
+        return
+
     from handlers.send import get_sending_state
 
     user_id = message.from_user.id

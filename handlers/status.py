@@ -136,6 +136,11 @@ async def _collect_db_stats(tg_user_id: int) -> tuple[int, int, int]:
 
 @router.message(Command("statussend"))
 async def cmd_statussend(message: Message) -> None:
+    from services.bot_access import ensure_message_access
+
+    if not await ensure_message_access(message):
+        return
+
     tg_user_id = message.from_user.id
     st = get_sending_state(tg_user_id)
 

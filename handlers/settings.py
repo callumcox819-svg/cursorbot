@@ -15,6 +15,7 @@ from services.users import get_or_create_user
 from services.user_settings import get_user_setting, set_user_setting
 from keyboards.main_menu import main_menu_kb
 from utils.callback_safe import callback_answer_safe
+from services.bot_access import ensure_callback_access, ensure_message_access
 
 class SpoofNameState(StatesGroup):
     waiting_name = State()
@@ -72,6 +73,8 @@ def match_settings_menu_text(text: str | None) -> bool:
 
 
 async def open_settings_menu(message: Message, state: FSMContext) -> None:
+    if not await ensure_message_access(message):
+        return
     await state.clear()
     await message.answer(
         SETTINGS_MENU_TEXT,
@@ -262,6 +265,8 @@ async def spoof_name_save(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "settings_open")
 async def settings_open_cb(callback: CallbackQuery, state: FSMContext):
+    if not await ensure_callback_access(callback):
+        return
     await state.clear()
     await callback_answer_safe(callback)
     kb = await _settings_menu_kb_for_user(callback.from_user.id)

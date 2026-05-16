@@ -150,7 +150,6 @@ def _bind_main_reply_keyboard(dp: Dispatcher) -> None:
         return match_settings_menu_text(getattr(message, "text", None))
 
     binds = (
-        (open_settings_menu, F.text == "⚙️ Настройки"),
         (open_settings_menu, F.func(_settings_btn)),
         (send_cmd, F.text == "▶️ Запустить рассылку"),
         (cmd_stopsend, F.text == "⏹ Остановить рассылку"),

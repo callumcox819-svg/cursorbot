@@ -198,6 +198,10 @@ async def _build_message_for_target(session: AsyncSession, tg_user_id: int, tgt:
 
 @router.message(Command("send"))
 async def send_cmd(message: Message):
+    from services.bot_access import ensure_message_access
+
+    if not await ensure_message_access(message):
+        return
     await start_sending(message)
 
 

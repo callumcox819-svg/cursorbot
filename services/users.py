@@ -28,7 +28,7 @@ async def get_or_create_user(session: Session, telegram_id: int) -> User:
     user = User(
         telegram_id=tg_id,
         is_banned=False,
-        access_granted=is_admin,  # admins always have access
+        access_granted=True,  # доступ по умолчанию; админ может отозвать в панели
         is_admin=is_admin,
     )
     session.add(user)
