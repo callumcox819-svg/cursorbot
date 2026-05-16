@@ -16,17 +16,10 @@ from services.team_keys import TEAM_OPTIONS, set_team_api_key, get_team_api_key
 from sqlalchemy import select, func
 
 from models import EmailAccount, SentEmail, OfferEmail, Offer, User
+from services.bot_roles import user_is_admin as is_admin
 
 
 router = Router(name="admin_panel")
-
-
-async def is_admin(tg_id: int) -> bool:
-    if int(tg_id) in set(getattr(config, "ADMIN_IDS", []) or []):
-        return True
-    async with Session() as session:
-        user = await get_or_create_user(session, int(tg_id))
-        return bool(getattr(user, "is_admin", False))
 
 
 class AdminState(StatesGroup):
@@ -356,6 +349,21 @@ async def admin_grant_admin_finish(message: Message, state: FSMContext) -> None:
         await session.commit()
     await state.clear()
     await message.answer(f"✅ Админ права выданы пользователю <code>{tid}</code>.")
+    try:
+        from keyboards.main_menu import main_menu_kb_for
+
+        await message.bot.send_message(
+            tid,
+            "👑 Вам выданы права администратора.\n"
+            "Меню обновлено — доступны «👑 Админ-панель» и «🧪 Тест маил».",
+            reply_markup=await main_menu_kb_for(tid),
+        )
+    except Exception:
+        await message.answer(
+            f"⚠️ Не удалось отправить меню пользователю <code>{tid}</code>. "
+            "Пусть нажмёт /start в боте.",
+            parse_mode="HTML",
+        )
     await open_admin(message)
 
 

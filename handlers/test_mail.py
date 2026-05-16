@@ -32,13 +32,11 @@ TEST_SUBJECTS = [
 ]
 
 
-def _is_super_admin(tg_id: int) -> bool:
-    return int(tg_id) in set(getattr(config, "ADMIN_IDS", []))
-
-
 @router.message(F.text == "🧪 Тест маил")
 async def test_mail_start(message: Message, state: FSMContext):
-    if not _is_super_admin(message.from_user.id):
+    from services.bot_roles import user_is_admin
+
+    if not await user_is_admin(message.from_user.id):
         return
     await state.set_state(TestMailStates.waiting_email)
     await message.answer("🧪 Введите email для теста (или '-' чтобы отменить):")
@@ -46,7 +44,9 @@ async def test_mail_start(message: Message, state: FSMContext):
 
 @router.message(TestMailStates.waiting_email)
 async def test_mail_send(message: Message, state: FSMContext):
-    if not _is_super_admin(message.from_user.id):
+    from services.bot_roles import user_is_admin
+
+    if not await user_is_admin(message.from_user.id):
         await state.clear()
         return
 

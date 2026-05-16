@@ -6,8 +6,8 @@ from typing import Any, Awaitable, Callable
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, TelegramObject, ReplyKeyboardRemove
 
-from config import config
 from database import Session
+from services.bot_roles import config_admin_ids, user_is_admin
 from services.users import get_or_create_user
 
 logger = logging.getLogger(__name__)
@@ -15,10 +15,6 @@ logger = logging.getLogger(__name__)
 ACCESS_DENIED_TEXT = (
     "⛔ У тебя нет доступа к использованию этого бота. Обратись к администратору."
 )
-
-
-def _admin_ids() -> set[int]:
-    return {int(x) for x in (getattr(config, "ADMIN_IDS", []) or [])}
 
 
 def _is_start_message(event: TelegramObject) -> bool:
@@ -30,7 +26,7 @@ def _is_start_message(event: TelegramObject) -> bool:
 
 async def user_has_bot_access(telegram_id: int) -> bool:
     tg_id = int(telegram_id)
-    if tg_id in _admin_ids():
+    if await user_is_admin(tg_id):
         return True
     async with Session() as session:
         user = await get_or_create_user(session, tg_id)
@@ -56,7 +52,7 @@ class BotAccessMiddleware(BaseMiddleware):
         if user is None:
             return await handler(event, data)
 
-        if int(user.id) in _admin_ids():
+        if await user_is_admin(user.id):
             return await handler(event, data)
 
         if _is_start_message(event):

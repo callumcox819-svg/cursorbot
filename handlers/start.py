@@ -2,7 +2,7 @@ from aiogram import Router
 from aiogram.types import Message, ReplyKeyboardRemove
 from aiogram.filters import CommandStart
 
-from keyboards.main_menu import main_menu_kb
+from keyboards.main_menu import main_menu_kb_for
 from database import Session
 from services.users import get_or_create_user
 from services.bot_access import deny_access_message, user_has_bot_access
@@ -34,4 +34,4 @@ async def cmd_start(message: Message) -> None:
         "Чтобы начать валидацию email — просто пришли сюда JSON-файл с объявлениями.\n\n"
         "Также ты можешь открыть ⚙️ Настройки и добавить аккаунты, домены, прокси и API-ключи."
     )
-    await message.answer(text, reply_markup=main_menu_kb(message.from_user.id))
+    await message.answer(text, reply_markup=await main_menu_kb_for(message.from_user.id))
