@@ -17,6 +17,7 @@ from services.users import get_or_create_user
 from config import config
 from services.validemail_keys import resolve_validemail_api_keys
 from services.validemail_validator import ValidationConfig, validate_offers
+from services.offer_storage import save_all_offers_from_import
 
 router = Router()
 
@@ -439,21 +440,12 @@ async def validation_handler(message: Message):
         await updater
 
     validated_count = len(validated or [])
-    remaining_final = max(0, total_offers - validated_count)
 
-    if not validated:
-        return await progress_msg.edit_text(
-            "✅ Валидация завершена: 0 результатов.\n\n"
-            f"👁 Просмотрено: {total_offers}\n"
-            f"✅ Валидировано: 0\n"
-            f"⏳ Осталось: {total_offers}",
-            parse_mode="HTML",
-        )
-
-    await progress_msg.edit_text("💾 Сохраняю в базу…")
-
-    output: List[dict] = []
-    saved_email_count = 0
+    await progress_msg.edit_text(
+        "💾 Сохраняю все объявления в базу…\n"
+        f"В файле: <b>{total_offers}</b> · с email: <b>{validated_count}</b>",
+        parse_mode="HTML",
+    )
 
     async with Session() as session:
         user = await get_or_create_user(session, tg_id)
@@ -474,100 +466,14 @@ async def validation_handler(message: Message):
             await session.execute(delete(Offer).where(Offer.user_id == user.id))
             await session.commit()
 
-        for row in validated:
-            raw = row.get("raw") or {}
-
-            # Вариант B: аккуратно нормализуем ключевые поля с fallback'ами
-            person_name = str(
-                row.get("person_name")
-                or raw.get("person_name")
-                or raw.get("name")
-                or raw.get("item_person_name")
-                or ""
-            ).strip()
-
-            title = str(
-                row.get("title")
-                or raw.get("title")
-                or raw.get("item_title")
-                or ""
-            ).strip()
-
-            price = str(
-                row.get("price")
-                or raw.get("price")
-                or raw.get("item_price")
-                or ""
-            ).strip()
-
-            link = str(
-                row.get("link")
-                or raw.get("link")
-                or raw.get("item_link")
-                or ""
-            ).strip()
-
-            photo = str(
-                row.get("photo")
-                or raw.get("photo")
-                or raw.get("image")
-                or raw.get("img")
-                or ""
-            ).strip()
-
-                        # Берём максимум 2 валидные почты (в порядке приоритетных доменов).
-            picked: list[str] = []
-            seen = set()
-            for e in (row.get("emails") or []):
-                e2 = _norm_email(str(e or ""))
-                if not e2:
-                    continue
-                if e2 in seen:
-                    continue
-                seen.add(e2)
-                picked.append(e2)
-                if len(picked) >= 2:
-                    break
-
-            # ✅ ТЗ: если не найдено ни одной валидной почты — НИЧЕГО не сохраняем в БД
-            if not picked:
-                continue
-
-            offer = Offer(
-                user_id=user.id,
-                person_name=person_name,
-                title=title,
-                price=price,
-                link=link,
-                photo=photo,
-            )
-            session.add(offer)
-            await session.flush()
-
-            for em in picked:
-                session.add(OfferEmail(offer_id=offer.id, email=em))
-                saved_email_count += 1
-
-            # Обновляем сырые данные, чтобы в итоговом JSON были согласованные поля
-            if person_name:
-                raw["person_name"] = person_name
-                raw.setdefault("name", person_name)
-                raw.setdefault("item_person_name", person_name)
-            if title:
-                raw["title"] = title
-                raw.setdefault("item_title", title)
-            if price:
-                raw["price"] = price
-                raw.setdefault("item_price", price)
-            if link:
-                raw["link"] = link
-                raw.setdefault("item_link", link)
-
-            raw["validated_emails"] = list(picked)
-            raw["offer_id"] = int(offer.id)
-
-            output.append(raw)
-
+        offers_saved, offers_with_email, saved_email_count, output = await save_all_offers_from_import(
+            session,
+            user_id=int(user.id),
+            items=items,
+            validated_rows=validated or [],
+            norm_email=_norm_email,
+            max_emails_per_offer=2,
+        )
         await session.commit()
 
     out_path = os.path.join(
@@ -581,9 +487,9 @@ async def validation_handler(message: Message):
     await message.answer_document(
         FSInputFile(out_path),
         caption=(
-            f"👁 Просмотрено: {total_offers}\n"
-            f"✅ Валидировано: {len(output)}\n"
-            f"⏳ Без email: {remaining_final}\n"
-            f"📧 Email сохранено: {saved_email_count}"
+            f"💾 Сохранено в БД: {offers_saved}/{total_offers}\n"
+            f"✅ С валидным email: {offers_with_email}\n"
+            f"⏳ Без email (данные есть): {max(0, offers_saved - offers_with_email)}\n"
+            f"📧 Email записей: {saved_email_count}"
         ),
     )

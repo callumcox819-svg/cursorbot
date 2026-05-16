@@ -24,8 +24,7 @@ from models import EmailAccount, User, ConversationLink, Offer, OfferEmail, Inco
 from services.auto_reply_engine import handle_auto_for_mail
 from services.link_id import link_id_from_generated_url
 from services.user_settings import get_user_setting
-
-from difflib import SequenceMatcher
+from services.offer_matching import resolve_offer_for_incoming as _resolve_offer_for_incoming
 
 logger = logging.getLogger(__name__)
 
@@ -102,159 +101,6 @@ def _canon_email(email: str) -> str:
         local = local.replace(".", "")
         domain = "gmail.com"
     return f"{local}@{domain}"
-
-
-def _norm_subject(subject: str) -> str:
-    s = (subject or "").strip()
-    if not s:
-        return ""
-    s = re.sub(r"^(re|aw|fw|fwd)\s*:\s*", "", s, flags=re.I).strip()
-    m = re.search(r"\bOFFER\s*:\s*(.+)$", s, flags=re.I)
-    if m:
-        s = m.group(1).strip()
-    return s
-
-
-def _ratio(a: str, b: str) -> float:
-    a = (a or "").strip().lower()
-    b = (b or "").strip().lower()
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, a, b).ratio()
-
-
-async def _resolve_offer_for_incoming(
-    session,
-    *,
-    user_id: int,
-    from_email: str,
-    subject: str,
-    from_name: str,
-) -> tuple[int | None, int | None]:
-    """Resolve Offer for incoming mail.
-
-    ✅ Главная цель: стабильно находить offer_id (и дальше ad_url из Offer.link),
-    даже если email в БД и в письме отличается точками/+tag (особенно Gmail) или доменом.
-    UI/кнопки/flow не трогаем — только повышаем шанс корректного матча.
-    """
-    fe_raw = (from_email or "").strip().lower()
-    fe_can = _canon_email(fe_raw)
-
-    subj = _norm_subject(subject)
-    fn = (from_name or "").strip()
-
-    # --- 1) Быстрые SQL-матчи по OfferEmail ---
-    q = (
-        sa_select(OfferEmail, Offer)
-        .join(Offer, Offer.id == OfferEmail.offer_id)
-        .where(Offer.user_id == int(user_id))
-    )
-
-    conds = []
-    if fe_raw:
-        conds.append(func.lower(OfferEmail.email) == fe_raw)
-
-    if fe_can and "@" in fe_can:
-        local_can, domain_can = fe_can.split("@", 1)
-
-        # Gmail: игнорируем точки
-        if domain_can in ("gmail.com", "googlemail.com"):
-            conds.append(func.replace(func.lower(OfferEmail.email), ".", "") == fe_can.replace(".", ""))
-
-        # local-part match (first.last@domain -> first.last@ANY)
-        if local_can:
-            conds.append(func.lower(OfferEmail.email).like(local_can + "@%"))
-
-    rows = []
-    if conds:
-        rows = (await session.execute(q.where(sa_or(*conds)).order_by(Offer.id.desc()).limit(50))).all()
-
-    # --- 2) Если SQL ничего не вернул — python-side canonical fallback ---
-    # Это покрывает случаи: +tag, googlemail/gmail, точки, и т.п.
-    if not rows and fe_can:
-        try:
-            all_rows = (
-                await session.execute(
-                    sa_select(OfferEmail, Offer)
-                    .join(Offer, Offer.id == OfferEmail.offer_id)
-                    .where(Offer.user_id == int(user_id))
-                    .order_by(Offer.id.desc())
-                    .limit(800)
-                )
-            ).all()
-            for oe, off in all_rows:
-                if _canon_email((oe.email or "").strip().lower()) == fe_can:
-                    rows.append((oe, off))
-                    break
-        except Exception:
-            # не роняем обработчик
-            rows = []
-
-    # --- 3) Если всё ещё нет — мягкий fallback по теме/имени (когда продавец пишет с другого email) ---
-    if not rows:
-        if subj:
-            try:
-                offers = (
-                    await session.execute(
-                        sa_select(Offer)
-                        .where(Offer.user_id == int(user_id))
-                        .order_by(Offer.id.desc())
-                        .limit(250)
-                    )
-                ).scalars().all()
-
-                best_offer_id = None
-                best_score = 0.0
-                for off in offers:
-                    score = 0.0
-                    title = (off.title or "").strip()
-                    if title:
-                        r = _ratio(subj, title)
-                        score += 100.0 * r
-                        if subj.lower() in title.lower() or title.lower() in subj.lower():
-                            score += 10.0
-                    if fn and (off.person_name or "").strip():
-                        score += 20.0 * _ratio(fn, off.person_name)
-                    if score > best_score:
-                        best_score = score
-                        best_offer_id = int(off.id)
-
-                # порог, чтобы не матчить случайно по мусорной теме
-                if best_offer_id is not None and best_score >= 70.0:
-                    return best_offer_id, None
-            except Exception:
-                pass
-        return None, None
-
-    # Выбираем лучшую пару OfferEmail+Offer
-    best_offer_id: int | None = None
-    best_offer_email_id: int | None = None
-    best_score = -1.0
-
-    for oe, off in rows:
-        score = 0.0
-        oe_raw = (oe.email or "").strip().lower()
-        oe_can = _canon_email(oe_raw)
-
-        if oe_can and oe_can == fe_can:
-            score += 100.0
-        elif oe_raw and oe_raw == fe_raw:
-            score += 70.0
-
-        if subj and (off.title or ""):
-            score += 50.0 * _ratio(subj, off.title)
-            if subj.lower() in (off.title or "").lower() or (off.title or "").lower() in subj.lower():
-                score += 10.0
-
-        if fn and (off.person_name or ""):
-            score += 20.0 * _ratio(fn, off.person_name)
-
-        if score > best_score:
-            best_score = score
-            best_offer_id = int(off.id)
-            best_offer_email_id = int(oe.id)
-
-    return best_offer_id, best_offer_email_id
 
 
 def _calc_backoff(streak: int) -> int:
@@ -1094,6 +940,7 @@ async def _process_mails_for_account(
                         from_email=from_email_clean,
                         subject=subject or "",
                         from_name=from_name or "",
+                        body_text=body_clean or "",
                     )
 
                     existing = (

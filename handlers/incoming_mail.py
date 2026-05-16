@@ -22,6 +22,7 @@ from services.gag_keys import gag_default_version, gag_generate_endpoint, get_us
 from services.goo_network import generate_single_parse
 from services.gag_network import generate_gag_url, GAGError
 from services.incoming_mail_worker import FULL_META, _try_pin, build_mail_card_from_mail
+from services.offer_matching import resolve_offer_for_incoming
 from services.smtp_proxy_send import send_email_via_account_with_proxy
 from services.translate import translate_to_ru, _strip_html
 
@@ -885,6 +886,32 @@ async def cb_create_goo_link_from_db(callback: CallbackQuery):
                 url = url.strip()
                 break
             reasons.append("не найден Offer.link по OfferEmail")
+
+            # 5) поиск по title / price / имени / raw_json (все поля из парсера)
+            oid, _ = await resolve_offer_for_incoming(
+                session,
+                user_id=int(tg_user.id),
+                from_email=contact_email,
+                subject=(getattr(mail, "subject", "") or ""),
+                from_name=(getattr(mail, "from_name", "") or ""),
+                body_text=(getattr(mail, "body", "") or ""),
+            )
+            if oid:
+                off_link = (
+                    await session.execute(
+                        sa_select(Offer.link)
+                        .where(Offer.id == int(oid))
+                        .where(Offer.user_id == int(tg_user.id))
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if off_link and str(off_link).strip():
+                    url = str(off_link).strip()
+                    if not mail.resolved_offer_id:
+                        mail.resolved_offer_id = int(oid)
+                        await session.commit()
+                    break
+            reasons.append("не найден Offer по title/price/имени")
 
         if not url:
             reason_text = "\n".join([f"• { _e(r) }" for r in (reasons or ["не удалось получить ссылку из БД"])])

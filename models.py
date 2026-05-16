@@ -187,6 +187,7 @@ class Offer(Base):
     photo = Column(Text, nullable=True)
 
     person_name = Column(String, nullable=True)
+    raw_json = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
