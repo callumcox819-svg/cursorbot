@@ -5,7 +5,6 @@ import json
 import logging
 import re
 import time
-import unicodedata
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
@@ -15,6 +14,13 @@ from sqlalchemy import select
 from database import Session
 from models import User
 from services.validemail_fast import validate_emails_fast
+from services.seller_name import (
+    MIN_NAME_TOKEN_LEN,
+    normalize_seller_name,
+    pick_name_tokens,
+    seller_name_eligible_for_validation,
+    seller_name_from_item,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +36,8 @@ class ValidationConfig:
 
     concurrency: int = 12
     max_emails_per_seller: int = 4
-    min_len: int = 3
-    max_len: int = 32
+    min_len: int = MIN_NAME_TOKEN_LEN
+    max_len: int = 40
     require_first_and_last: bool = False
 
     user_blacklist: list[str] | None = None
@@ -42,45 +48,12 @@ class ValidationConfig:
 # Helpers: name normalization
 # -------------------------
 
-def _strip_accents(text: str) -> str:
-    if not text:
-        return ""
-    normalized = unicodedata.normalize("NFD", text)
-    return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
-
-
 def _normalize_name(raw: str) -> str:
-    if not raw:
-        return ""
-    s = " ".join(str(raw).strip().split())
-    s = s.replace("ß", "ss").replace("ẞ", "SS")
-    s = _strip_accents(s)
-    s = s.replace("’", "'").replace("`", "'")
-    return s
-
-
-_ALPHA_TOKEN_RE = re.compile(r"[A-Za-z]{2,}", re.UNICODE)
+    return normalize_seller_name(raw)
 
 
 def _pick_alpha_tokens(name: str) -> list[str]:
-    """Буквенные токены имени (>=2 букв): слова, дефисы, апострофы."""
-    s = _normalize_name(name)
-    if not s:
-        return []
-
-    s2 = re.sub(r"[^A-Za-z0-9.\s'\-]", " ", s)
-    parts = re.split(r"[\s\-']+", s2.strip())
-
-    alpha: list[str] = []
-    seen: set[str] = set()
-    for p in parts:
-        p = p.strip(".")
-        if len(p) >= 2 and p.isalpha():
-            pl = p.lower()
-            if pl not in seen:
-                seen.add(pl)
-                alpha.append(pl)
-    return alpha
+    return pick_name_tokens(name, min_len=MIN_NAME_TOKEN_LEN)
 
 
 def _pick_first_last_alpha_tokens(name: str) -> tuple[str, str]:
@@ -91,6 +64,8 @@ def _pick_first_last_alpha_tokens(name: str) -> tuple[str, str]:
 
 
 def _name_is_usable(name: str, *, require_first_and_last: bool) -> bool:
+    if not seller_name_eligible_for_validation(name):
+        return False
     tokens = _pick_alpha_tokens(name)
     if require_first_and_last:
         return len(tokens) >= 2
@@ -268,13 +243,7 @@ async def _validate_offers_old(
         if not isinstance(it, dict):
             continue
 
-        raw_name = str(
-            it.get("item_person_name")
-            or it.get("person_name")
-            or it.get("name")
-            or it.get("seller")
-            or ""
-        ).strip()
+        raw_name = seller_name_from_item(it)
 
         if not _name_is_usable(raw_name, require_first_and_last=require_fl):
             continue

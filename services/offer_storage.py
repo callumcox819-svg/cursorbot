@@ -117,7 +117,20 @@ async def save_all_offers_from_import(
         fields = fields_from_item(it)
         picked = emails_from_validated_row(vrow, norm_email)
 
-        payload = dict(it)
+        # 100% полей из парсера — для генерации ссылок и матча по всем данным.
+        payload = json.loads(json.dumps(it, ensure_ascii=False, default=str))
+        if isinstance(payload, dict):
+            payload.setdefault(
+                "item_person_name",
+                str(
+                    it.get("item_person_name")
+                    or it.get("person_name")
+                    or it.get("name")
+                    or ""
+                ).strip(),
+            )
+        else:
+            payload = dict(it)
         if picked:
             payload["validated_emails"] = list(picked)
 

@@ -18,6 +18,7 @@ from config import config
 from services.validemail_keys import resolve_validemail_api_keys
 from services.validemail_validator import ValidationConfig, validate_offers
 from services.offer_storage import save_all_offers_from_import
+from services.seller_name import MIN_NAME_TOKEN_LEN, seller_name_eligible_for_validation, seller_name_from_item
 
 router = Router()
 
@@ -233,24 +234,11 @@ async def validation_handler(message: Message):
         return await status_msg.edit_text("❌ В файле не найдено записей.")
 
     # --- UI статистика (не влияет на логику валидации) ---
-    def _has_any_name(name: str) -> bool:
-        good = [p for p in _WORD_RE.findall(name or "") if len(p) >= 2]
-        return len(good) >= 1
-
     total_offers = len(items)
     offers_with_name = sum(
-        1
-        for it in items
-        if _has_any_name(
-            str(
-                it.get("item_person_name")
-                or it.get("person_name")
-                or it.get("name")
-                or it.get("seller")
-                or ""
-            )
-        )
+        1 for it in items if seller_name_eligible_for_validation(seller_name_from_item(it))
     )
+    offers_name_any = sum(1 for it in items if seller_name_from_item(it))
 
     try:
         await status_msg.edit_text(
@@ -326,7 +314,7 @@ async def validation_handler(message: Message):
         max_emails_per_seller=3,
         require_first_and_last=REQUIRE_FIRST_AND_LAST,
         max_len=40,
-        min_len=2,
+        min_len=MIN_NAME_TOKEN_LEN,
     )
 
     n_keys = len(api_keys)
@@ -335,7 +323,7 @@ async def validation_handler(message: Message):
         dom_preview += f" … (+{len(domains) - 8})"
     progress_msg = await message.answer(
         f"🔎 Запуск валидации…\n"
-        f"Схема: <b>имя продавца</b> → варианты логина → <b>@домен</b> → ValidEmail\n"
+        f"Схема: <b>имя (слово ≥{MIN_NAME_TOKEN_LEN} букв)</b> → логин → <b>@ваши домены</b> → ValidEmail\n"
         f"Домены ({len(domains)}): <code>{dom_preview}</code>\n"
         f"Ключей API: <b>{n_keys}</b> | параллельно: <b>{cfg.concurrency}</b>",
         parse_mode="HTML",
