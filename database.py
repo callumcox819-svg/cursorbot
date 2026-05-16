@@ -17,7 +17,14 @@ DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 # Это убирает падение вида: "Could not parse SQLAlchemy URL from string ''".
 if not DATABASE_URL:
     DATABASE_URL = "sqlite+aiosqlite:///./bot.db"
-    log.warning("DATABASE_URL is empty. Falling back to %s", DATABASE_URL)
+    if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_NAME"):
+        log.error(
+            "Railway: переменная DATABASE_URL ПУСТАЯ. Удалите пустую переменную в Variables, "
+            "добавьте Reference на Postgres → DATABASE_URL (или вставьте URL из Postgres → Connect). "
+            "См. RAILWAY_DATABASE.txt"
+        )
+    else:
+        log.warning("DATABASE_URL is empty. Falling back to %s", DATABASE_URL)
 
 # Railway часто отдаёт postgres://, а SQLAlchemy asyncpg хочет postgresql+asyncpg://
 if DATABASE_URL.startswith("postgres://"):

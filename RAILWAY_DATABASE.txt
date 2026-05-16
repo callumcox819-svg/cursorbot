@@ -1,30 +1,60 @@
-Как подключить постоянную БД на Railway
-========================================
+Как подключить Postgres на Railway (если в логах «sqlite» или DATABASE_URL пустой)
+==================================================================================
 
-1) В проекте Railway нажми «+ New» → «Database» → «PostgreSQL».
-   Дождись статуса Active.
+ПРОБЛЕМА: в Variables у cursorbot DATABASE_URL = <empty string>
+→ бот не видит базу и пишет в bot.db (данные пропадают при redeploy).
 
-2) Открой сервис с ботом (не Postgres) → Variables.
+ШАГ 1 — Postgres в проекте
+--------------------------
+В canvas должен быть отдельный блок «PostgreSQL» (не только cursorbot).
+Если нет: + New → Database → PostgreSQL.
 
-3) Добавь переменную:
-   DATABASE_URL = ${{Postgres.DATABASE_URL}}
-   (в UI Railway: «Add Reference» → выбери Postgres → DATABASE_URL)
+ШАГ 2 — УДАЛИ пустую переменную
+--------------------------------
+Сервис cursorbot → Variables → удали переменную DATABASE_URL,
+если значение пустое (<empty string>).
 
-4) Убедись, что заданы также:
+НЕ вводи вручную текст:  ${{Postgres.DATABASE_URL}}
+В новом Railway это часто НЕ подставляется и остаётся пустой строкой.
+
+ШАГ 2б — правильно: Reference (ссылка)
+---------------------------------------
+1. cursorbot → Variables → «+ New Variable»
+2. Выбери тип **Variable Reference** (не обычный Variable)
+3. Service: твой Postgres (имя как на canvas, например Postgres)
+4. Variable: **DATABASE_URL**
+5. Save
+
+Должно быть примерно так:
+   DATABASE_URL  →  ${{Postgres.DATABASE_URL}}   (иконка ссылки, не пусто)
+
+ШАГ 2в — альтернатива: вставить URL вручную
+--------------------------------------------
+1. Открой сервис **PostgreSQL** (не cursorbot)
+2. Вкладка **Connect** или **Variables** — скопируй **DATABASE_URL**
+   (начинается с postgresql:// или postgres://)
+3. cursorbot → Variables → + New Variable
+4. Name: DATABASE_URL
+5. Value: вставь скопированный URL целиком
+6. Save
+
+ШАГ 3 — Redeploy
+------------------
+cursorbot → Deployments → **Redeploy** (или Apply 1 Change).
+
+ШАГ 4 — проверка логов
+------------------------
+Должно быть:
+   БД: PostgreSQL (данные сохраняются между перезапусками Railway)
+
+НЕ должно быть:
+   DATABASE_URL is empty
+   БД: sqlite
+
+Переменные бота
+---------------
    BOT_TOKEN = токен от @BotFather
-   (не ставь BOT_OPEN_ACCESS — бот закрытый)
+   DATABASE_URL = Reference на Postgres ИЛИ полный URL (не пусто!)
+   Replicas = 1
 
-5) Redeploy бота. В логах должно быть:
-   «БД: PostgreSQL (данные сохраняются между перезапусками Railway)»
-
-6) Replicas = 1 (см. railway.toml).
-
-Что хранится в Postgres
------------------------
-- Пользователи (telegram_id, access_granted, sender_name, ключи API)
-- Почтовые аккаунты, прокси, домены, офферы, входящая почта
-- Настройки (user_settings)
-- Пресеты, умные пресеты, first_sms (таблица user_json_blobs)
-
-Папка data/html в репозитории — это шаблоны писем, они в git и не теряются.
-Локально без DATABASE_URL используется bot.db (SQLite).
+Не ставь BOT_OPEN_ACCESS (бот закрытый).
