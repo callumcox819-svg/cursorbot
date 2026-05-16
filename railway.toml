@@ -1,0 +1,3 @@
+# Один экземпляр бота — иначе Telegram polling дублирует ответы.
+[deploy]
+numReplicas = 1

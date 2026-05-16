@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import List, Tuple
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
@@ -136,76 +136,6 @@ def _release_single_instance_lock() -> None:
         pass
 
 
-def _bind_main_reply_keyboard(dp: Dispatcher) -> None:
-    """Кнопки главного меню на корне Dispatcher — до всех роутеров."""
-    from aiogram.types import Message
-
-    from handlers.accounts import quick_gmail_from_main_menu
-    from handlers.settings import match_settings_menu_text, open_settings_menu
-    from handlers.send import send_cmd
-    from handlers.stopsend import cmd_stopsend
-    from handlers.status import cmd_statussend
-
-    def _settings_btn(message: Message) -> bool:
-        return match_settings_menu_text(getattr(message, "text", None))
-
-    binds = (
-        (open_settings_menu, F.func(_settings_btn)),
-        (send_cmd, F.text == "▶️ Запустить рассылку"),
-        (cmd_stopsend, F.text == "⏹ Остановить рассылку"),
-        (cmd_statussend, F.text == "📊 Статус рассылки"),
-        (
-            quick_gmail_from_main_menu,
-            F.text.in_({"⚡ Быстрое добавление", "⚡ Быстрое добавление (Gmail)"}),
-        ),
-    )
-    for handler, flt in binds:
-        dp.message.register(handler, flt)
-
-    logger.info("Привязано %d обработчиков reply-клавиатуры к Dispatcher", len(binds))
-
-
-def _bind_settings_main_keyboard_callbacks(dp: Dispatcher) -> None:
-    """Колбэки главного меню «Настройки» на корне Dispatcher — до тяжёлых роутеров."""
-    from handlers.accounts import open_accounts_from_settings
-    from handlers.api_keys import goo_show_key, goo_show_profile
-    from handlers.first_sms import firstsms_open
-    from handlers.proxies import open_proxies
-    from handlers.settings import (
-        _force_settings_menu,
-        priority_menu,
-        ref_hide,
-        ref_toggle,
-        settings_open_cb,
-        settings_timings,
-        spoof_name_menu,
-    )
-    from handlers.templates import presets_menu
-
-    _DEPRECATED_SETTINGS_ALIASES = frozenset(
-        {"settings_menu", "goo:settings", "goo_settings", "settings_main"}
-    )
-
-    for cb, flt in (
-        (settings_open_cb, F.data == "settings_open"),
-        (priority_menu, F.data == "priority_menu"),
-        (presets_menu, F.data == "presets_menu"),
-        (firstsms_open, F.data == "firstsms_open"),
-        (spoof_name_menu, F.data == "spoof_name_menu"),
-        (open_accounts_from_settings, F.data == "settings_accounts"),
-        (open_proxies, F.data == "settings_proxies"),
-        (settings_timings, F.data == "settings_timings"),
-        (goo_show_key, F.data.in_({"goo_show:key", "gag_show:key"})),
-        (goo_show_profile, F.data.in_({"goo_show:profile", "gag_show:profile"})),
-        (ref_hide, F.data == "ref_hide"),
-        (_force_settings_menu, F.data.in_(_DEPRECATED_SETTINGS_ALIASES)),
-        (ref_toggle, F.data.startswith("ref_toggle:")),
-    ):
-        dp.callback_query.register(cb, flt)
-
-    logger.info("Привязано %d колбэков главного меню «Настройки» к Dispatcher", 13)
-
-
 async def _on_startup(bot: Bot) -> None:
     wh = await bot.get_webhook_info()
     if wh.url:
@@ -247,8 +177,10 @@ async def main() -> None:
     dp.startup.register(_on_startup)
     dp.errors.register(_on_error)
 
-    _bind_main_reply_keyboard(dp)
-    _bind_settings_main_keyboard_callbacks(dp)
+    from middlewares.bot_access import BotAccessMiddleware
+
+    dp.message.middleware(BotAccessMiddleware())
+    dp.callback_query.middleware(BotAccessMiddleware())
 
     for mod_name, r in _load_all_routers("handlers"):
         dp.include_router(r)
@@ -263,7 +195,13 @@ async def main() -> None:
         }
     )
 
-    logger.info("✅ Bot started. Launching polling... (allowed_updates=%s)", allowed)
+    me = await bot.get_me()
+    logger.info(
+        "✅ Bot @%s (id=%s). Polling… На Railway держите 1 реплику — иначе ответы дублируются.",
+        me.username,
+        me.id,
+    )
+    logger.info("allowed_updates=%s", allowed)
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)

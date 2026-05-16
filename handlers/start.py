@@ -1,5 +1,5 @@
 from aiogram import Router
-from aiogram.types import Message
+from aiogram.types import Message, ReplyKeyboardRemove
 from aiogram.filters import CommandStart
 
 from keyboards.main_menu import main_menu_kb
@@ -15,7 +15,10 @@ async def cmd_start(message: Message) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, int(message.from_user.id))
         if getattr(user, "is_banned", False):
-            await message.answer("⛔ Вы заблокированы администратором.")
+            await message.answer(
+                "⛔ Вы заблокированы администратором.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
             return
 
     if not await user_has_bot_access(message.from_user.id):
