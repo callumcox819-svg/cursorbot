@@ -308,22 +308,12 @@ async def validation_handler(message: Message):
         seen: set[str] = set()
         domains: list[str] = []
 
-        # Domains for validation (strict to your requirement):
-        # - if user has set a priority list: validate ONLY those domains, in that exact order.
-        #   They may be not saved in the Domain table — that's OK.
-        # - otherwise: validate all saved domains (DB order).
-        if pr:
-            for d in pr:
-                d = str(d or "").strip().lower()
-                if d and d not in seen:
-                    seen.add(d)
-                    domains.append(d)
-        else:
-            for d in db_domains:
-                d = str(d or "").strip().lower()
-                if d and d not in seen:
-                    seen.add(d)
-                    domains.append(d)
+        # Приоритетные домены первыми, затем остальные из БД (больше шансов найти email).
+        for d in pr + db_domains:
+            d = str(d or "").strip().lower()
+            if d and d not in seen:
+                seen.add(d)
+                domains.append(d)
 
 
         if not domains:
@@ -333,9 +323,10 @@ async def validation_handler(message: Message):
         validemail_api_keys=api_keys,
         validation_url=config.VALIDEMAIL_URL,
         concurrency=max(4, int(getattr(config, "VALIDEMAIL_CONCURRENCY", 12) or 12)),
-        max_emails_per_seller=2,
+        max_emails_per_seller=3,
         require_first_and_last=REQUIRE_FIRST_AND_LAST,
-        max_len=32,
+        max_len=40,
+        min_len=2,
     )
 
     n_keys = len(api_keys)

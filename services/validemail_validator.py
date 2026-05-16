@@ -60,6 +60,10 @@ def _normalize_name(raw: str) -> str:
 
 
 _ALPHA_TOKEN_RE = re.compile(r"[A-Za-z]{2,}", re.UNICODE)
+_EMAIL_IN_TEXT_RE = re.compile(
+    r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
+    re.UNICODE,
+)
 
 
 def _pick_alpha_tokens(name: str) -> list[str]:
@@ -98,28 +102,70 @@ def _name_has_first_last(name: str) -> bool:
 
 
 def _make_local_part_from_name(name: str, *, require_first_and_last: bool) -> str:
+    """Один основной local-part (first.last или одно слово)."""
+    variants = _make_local_part_variants(name, require_first_and_last=require_first_and_last)
+    return variants[0] if variants else ""
+
+
+def _make_local_part_variants(name: str, *, require_first_and_last: bool) -> list[str]:
     """
-    local-part для email: first.last или одно слово, если фамилии нет.
+    Несколько типичных local-part для одного продавца.
+    Реальные люди часто используют не только first.last.
     """
     tokens = _pick_alpha_tokens(name)
-    if require_first_and_last:
-        if len(tokens) < 2:
-            return ""
-        first, last = tokens[0], tokens[-1]
-        local = f"{first}.{last}"
-    else:
-        if not tokens:
-            return ""
-        if len(tokens) == 1:
-            local = tokens[0]
-        else:
-            local = f"{tokens[0]}.{tokens[-1]}"
-    local = re.sub(r"\.+", ".", local).strip(".")
-    return local.lower()
+    if require_first_and_last and len(tokens) < 2:
+        return []
+    if not tokens:
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(local: str) -> None:
+        local = re.sub(r"\.+", ".", (local or "").lower()).strip(".")
+        if not local or local in seen:
+            return
+        seen.add(local)
+        out.append(local)
+
+    if len(tokens) == 1:
+        _add(tokens[0])
+        return out
+
+    first, last = tokens[0], tokens[-1]
+    if len(first) < 1 or len(last) < 1:
+        return out
+
+    _add(f"{first}.{last}")
+    _add(f"{first}{last}")
+    _add(f"{first}_{last}")
+    if len(last) >= 2:
+        _add(f"{first}{last[0]}")
+    if len(first) >= 1:
+        _add(f"{first[0]}{last}")
+    _add(f"{last}.{first}")
+    _add(f"{last}{first}")
+    if len(tokens) >= 3:
+        mid = tokens[1]
+        if len(mid) >= 2:
+            _add(f"{first}.{mid}.{last}")
+    return out
 
 
-def _make_local_part_first_last(name: str) -> str:
-    return _make_local_part_from_name(name, require_first_and_last=True)
+def _scan_emails_in_item(item: dict[str, Any]) -> list[str]:
+    """Email из полей парсера и из текста описания."""
+    found = list(_extract_emails_from_offer(item))
+    seen = {e.lower() for e in found}
+    for key in ("item_desc", "description", "desc", "item_title", "title"):
+        text = str(item.get(key) or "")
+        if "@" not in text:
+            continue
+        for m in _EMAIL_IN_TEXT_RE.findall(text):
+            e = m.strip().lower()
+            if e and e not in seen:
+                seen.add(e)
+                found.append(e)
+    return found
 
 
 def _is_blacklisted(name: str, user_blacklist: Iterable[str] | None) -> bool:
@@ -247,18 +293,22 @@ async def _validate_offers_old(
         if _is_blacklisted(raw_name, user_blacklist):
             continue
 
-        local = _make_local_part_from_name(raw_name, require_first_and_last=require_fl)
-        if not local:
-            continue
+        locals_list: list[str] = []
+        for local in _make_local_part_variants(raw_name, require_first_and_last=require_fl):
+            ln = _len_for_limits(local)
+            if int(cfg.min_len) <= ln <= int(cfg.max_len):
+                locals_list.append(local)
 
-        ln = _len_for_limits(local)
-        if not (int(cfg.min_len) <= ln <= int(cfg.max_len)):
+        preset_emails = [e.strip().lower() for e in _scan_emails_in_item(it) if "@" in e]
+
+        if not locals_list and not preset_emails:
             continue
 
         prepared.append({
             "raw": it,
             "person_name": raw_name,
-            "local": local,
+            "locals": locals_list,
+            "preset_emails": preset_emails,
             "title": str(it.get("item_title") or it.get("title") or "").strip(),
             "price": str(it.get("item_price") or it.get("price") or "").strip(),
             "link": str(it.get("item_link") or it.get("link") or it.get("url") or "").strip(),
@@ -279,8 +329,10 @@ async def _validate_offers_old(
     # хранит найденные валидные emails по индексу prepared
     found_by_idx: list[list[str]] = [[] for _ in prepared]
 
-    # общий прогресс (примерный): максимум prepared*domains
-    overall_total = len(prepared) * len(domains_clean)
+    # общий прогресс (оценка): варианты local-part × домены + готовые email из JSON
+    locals_per = sum(len(p.get("locals") or []) for p in prepared)
+    preset_per = sum(len(p.get("preset_emails") or []) for p in prepared)
+    overall_total = max(1, locals_per * len(domains_clean) + preset_per)
     overall_done = 0
 
     if stats is not None:
@@ -300,7 +352,42 @@ async def _validate_offers_old(
             api_keys = [single]
     url = str(cfg.validation_url or DEFAULT_VALIDEMAIL_URL).strip()
 
-    # 2) идём по доменам по приоритету (один домен = один батч)
+    # 2a) сначала проверяем email, уже указанные в JSON / описании
+    need_preset = [i for i, f in enumerate(found_by_idx) if len(f) < per_seller_limit]
+    if need_preset:
+        preset_batch: list[str] = []
+        preset_to_idx: dict[str, int] = {}
+        for i in need_preset:
+            for em in prepared[i].get("preset_emails") or []:
+                key = em.strip().lower()
+                if not key or key in preset_to_idx:
+                    continue
+                preset_to_idx[key] = i
+                preset_batch.append(key)
+        if preset_batch:
+            preset_results = await validate_emails_fast(
+                preset_batch,
+                api_keys=api_keys,
+                concurrency=limit,
+                url=url,
+                use_ssl_verify=bool(cfg.use_ssl_verify),
+                progress_cb=progress_cb,
+            )
+            overall_done += len(preset_batch)
+            if stats is not None:
+                stats["emails_checked"] = overall_done
+            for e, ok, _raw in preset_results:
+                if not ok:
+                    continue
+                key = (e or "").strip().lower()
+                idx = preset_to_idx.get(key)
+                if idx is None:
+                    continue
+                lst = found_by_idx[idx]
+                if len(lst) < per_seller_limit and key not in lst:
+                    lst.append(key)
+
+    # 2b) идём по доменам по приоритету (несколько local-part на продавца)
     for dom in domains_clean:
         # индексы офферов, которым ещё нужны email
         need_idx = [i for i, f in enumerate(found_by_idx) if len(f) < per_seller_limit]
@@ -311,11 +398,11 @@ async def _validate_offers_old(
         batch_emails: list[str] = []
         email_to_idx: dict[str, int] = {}
         for i in need_idx:
-            local = prepared[i]["local"]
-            cand = f"{local}@{dom}".lower()
-            if cand not in email_to_idx:  # дедуп внутри батча
-                email_to_idx[cand] = i
-                batch_emails.append(cand)
+            for local in prepared[i].get("locals") or []:
+                cand = f"{local}@{dom}".lower()
+                if cand not in email_to_idx:  # дедуп внутри батча
+                    email_to_idx[cand] = i
+                    batch_emails.append(cand)
 
         if not batch_emails:
             continue
