@@ -24,45 +24,13 @@ from services.sender import send_email_via_account
 router = Router()
 
 
-def presets_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Показать пресеты", callback_data="presets_list")],
-            [
-                InlineKeyboardButton(text="➕ Добавить пресет", callback_data="tmpl_add"),
-                InlineKeyboardButton(text="🗑 Удалить пресет", callback_data="tmpl_rm_menu"),
-            ],
-            [InlineKeyboardButton(text="🗑 Удалить все", callback_data="tmpl_delall")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open")],
-        ]
-    )
-
-
-def presets_delete_choose_kb(items: List[TemplateItem]) -> InlineKeyboardMarkup:
-    kb: List[List[InlineKeyboardButton]] = []
-    for i, it in enumerate(items):
-        title = it.title[:32]
-        kb.append([InlineKeyboardButton(text=f"🗑 {title}", callback_data=f"tmpl_rm:{i}")])
-    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="presets_menu")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-
-
-def smart_presets_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📋 Показать пресеты", callback_data="smart_presets_list"),
-            ],
-            [
-                InlineKeyboardButton(text="➕ Добавить пресет", callback_data="stmpl_add"),
-                InlineKeyboardButton(text="🗑 Удалить все", callback_data="stmpl_delall"),
-            ],
-            [
-                InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open"),
-            ],
-        ]
-    )
+from utils.preset_list_ui import (
+    NOTE_REGULAR_PRESETS,
+    NOTE_SMART_PRESETS,
+    render_text_presets_page,
+    text_presets_manage_kb,
+    text_presets_pick_kb,
+)
 
 DATA_DIR = "data"
 MAX_TITLE_LEN = 40
@@ -81,13 +49,51 @@ class TemplateItem:
 def _items_from_json(data: object) -> List[TemplateItem]:
     out: List[TemplateItem] = []
     for x in data if isinstance(data, list) else []:
+        if isinstance(x, str):
+            text = x.strip()
+            if text:
+                short = text[:40] + ("…" if len(text) > 40 else "")
+                out.append(TemplateItem(title=short, text=text))
+            continue
         if not isinstance(x, dict):
             continue
         title = str(x.get("title", "")).strip()
         text = str(x.get("text", "")).strip()
-        if title and text:
+        if not text and title:
+            text = title
+        if text:
+            if not title:
+                title = text[:40] + ("…" if len(text) > 40 else "")
             out.append(TemplateItem(title=title, text=text))
     return out
+
+
+def _template_texts(items: List[TemplateItem]) -> List[str]:
+    return [(it.text or "").strip() for it in items if (it.text or "").strip()]
+
+
+def _smart_presets_kb(has_any: bool) -> InlineKeyboardMarkup:
+    return text_presets_manage_kb(
+        add_cb="stmpl_add",
+        edit_cb="stmpl_edit",
+        del_cb="stmpl_del",
+        del_all_cb="stmpl_delall",
+        back_cb="settings_open",
+        hide_cb="stmpl_hide",
+        has_any=has_any,
+    )
+
+
+def _regular_presets_kb(has_any: bool) -> InlineKeyboardMarkup:
+    return text_presets_manage_kb(
+        add_cb="tmpl_add",
+        edit_cb="tmpl_preset_edit",
+        del_cb="tmpl_preset_del",
+        del_all_cb="tmpl_delall",
+        back_cb="settings_open",
+        hide_cb="tmpl_preset_hide",
+        has_any=has_any,
+    )
 
 
 async def load_templates(tg_id: int) -> List[TemplateItem]:
@@ -206,45 +212,6 @@ def _render_manage(items: List[TemplateItem]) -> str:
     return "\n".join(lines)
 
 
-def _render_presets(items: List[TemplateItem], header_html: str) -> str:
-    """Рендер списка пресетов (для меню Пресеты/Умные пресеты) в виде как на видео."""
-    if not items:
-        return f"{header_html}\n\nПока пресетов нет."
-
-    out: List[str] = [f"{header_html}\n"]
-    for i, it in enumerate(items, start=1):
-        title = escape(it.title)
-        body = escape(it.text)
-        out.append(
-            f"<b>Пресет #{i}</b>\n"
-            f"<u>{title}</u>\n"
-            f"<blockquote>{body}</blockquote>"
-        )
-    return "\n\n".join(out)
-
-
-def _render_smart_presets(texts: List[str], header_html: str) -> str:
-    if not texts:
-        return (
-            f"{header_html}\n\n"
-            "Пока нет текстов.\n"
-            "Нажми «➕ Добавить пресет» и отправь текст одним сообщением.\n\n"
-            "<b>OFFER</b> — подставится название товара.\n"
-            "<b>Спинтаксис:</b> <code>{Hallo|Hi}</code>\n"
-            "При рассылке бот выбирает текст случайно."
-        )
-    out: List[str] = [f"{header_html}\n"]
-    for i, raw in enumerate(texts[:20], start=1):
-        preview = raw.strip().replace("\n", " ")
-        if len(preview) > 200:
-            preview = preview[:197] + "…"
-        out.append(f"<b>#{i}</b>\n<blockquote>{escape(preview)}</blockquote>")
-    if len(texts) > 20:
-        out.append(f"\n…и ещё {len(texts) - 20}")
-    out.append("\n<b>OFFER</b> · спинтаксис <code>{a|b}</code> · случайная ротация при рассылке")
-    return "\n\n".join(out)
-
-
 async def _safe_edit_text(
     call: CallbackQuery,
     *,
@@ -276,7 +243,8 @@ def _back_only_kb(back_cb: str) -> InlineKeyboardMarkup:
 def _quick_templates_kb(items: List[TemplateItem], acc_id: int, uid: str) -> InlineKeyboardMarkup:
     kb: List[List[InlineKeyboardButton]] = []
     for i, it in enumerate(items):
-        kb.append([InlineKeyboardButton(text=it.title[:40], callback_data=f"tmpl_send:{acc_id}:{uid}:{i}")])
+        label = (it.text or it.title or "")[:40]
+        kb.append([InlineKeyboardButton(text=label, callback_data=f"tmpl_send:{acc_id}:{uid}:{i}")])
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"tmpl_close:{acc_id}:{uid}")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -400,225 +368,256 @@ def render_template(*, template_title: str | None = None, html_name: str | None 
     html_text = re.sub(r"\{([A-Z0-9_]+)\}", repl, html_text)
     return html_text
 # =========================
-# PRESETS MENU (как на видео)
-# =========================
-
-@router.callback_query(F.data == "presets_menu")
-async def presets_menu(call: CallbackQuery) -> None:
-    await call.message.edit_text(
-        "🧾 <b>Пресеты</b>\n\nВыберите действие:",
-        reply_markup=presets_menu_kb(),
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-
-@router.callback_query(F.data == "presets_list")
-async def presets_list(call: CallbackQuery) -> None:
-    async with Session() as session:
-        user = await get_or_create_user(session, call.from_user.id)
-    items = await load_templates(int(user.telegram_id))
-    text = _render_presets(items, "🧾 <b>Ваши пресеты:</b>")
-    await _safe_edit_text(call, text=text, reply_markup=_back_only_kb("presets_menu"), parse_mode="HTML")
-    await call.answer()
-
-
-@router.callback_query(F.data == "tmpl_delall")
-async def presets_delete_all(call: CallbackQuery) -> None:
-    async with Session() as session:
-        user = await get_or_create_user(session, call.from_user.id)
-    await save_templates(int(user.telegram_id), [])
-    await presets_menu(call)
-
-
-# =========================
-# PRESETS ADD/DELETE (пресеты)
+# PRESETS / SMART PRESETS (единый экран как на скрине)
 # =========================
 
 class PresetAdd(StatesGroup):
-    title = State()
     text = State()
 
 
-_PRESETS_MENU_TEXT = "🧾 <b>Пресеты</b>\n\nВыберите действие:"
-_SMART_PRESETS_MENU_TEXT = (
-    "📄 <b>Умные пресеты</b>\n\n"
-    "Только текст письма — без названия. Несколько вариантов → случайный при каждой рассылке.\n\n"
-    "Выберите действие:"
-)
+class PresetEdit(StatesGroup):
+    idx = State()
+    text = State()
 
-
-async def _restore_presets_menu(message: Message, state_data: dict) -> bool:
-    chat_id = state_data.get("_menu_chat_id")
-    msg_id = state_data.get("_menu_msg_id")
-    if not chat_id or not msg_id:
-        return False
-    try:
-        await message.bot.edit_message_text(
-            _PRESETS_MENU_TEXT,
-            chat_id=int(chat_id),
-            message_id=int(msg_id),
-            reply_markup=presets_menu_kb(),
-            parse_mode="HTML",
-        )
-        return True
-    except Exception:
-        return False
-
-
-async def _restore_smart_presets_menu(message: Message, state_data: dict) -> bool:
-    chat_id = state_data.get("_menu_chat_id")
-    msg_id = state_data.get("_menu_msg_id")
-    if not chat_id or not msg_id:
-        return False
-    try:
-        await message.bot.edit_message_text(
-            _SMART_PRESETS_MENU_TEXT,
-            chat_id=int(chat_id),
-            message_id=int(msg_id),
-            reply_markup=smart_presets_menu_kb(),
-            parse_mode="HTML",
-        )
-        return True
-    except Exception:
-        return False
-
-
-@router.callback_query(F.data == "tmpl_add")
-async def tmpl_add_start(call: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(PresetAdd.title)
-    await state.update_data(
-        _menu_chat_id=call.message.chat.id,
-        _menu_msg_id=call.message.message_id,
-    )
-    await call.message.answer("Введите название пресета:")
-    await call.answer()
-
-
-@router.message(PresetAdd.title)
-async def tmpl_add_title(message: Message, state: FSMContext) -> None:
-    title = (message.text or "").strip()[:MAX_TITLE_LEN]
-    if not title:
-        return await message.answer("Название не может быть пустым. Введите ещё раз:")
-    await state.update_data(title=title)
-    await state.set_state(PresetAdd.text)
-    await message.answer("Отправьте текст пресета:")
-
-
-@router.message(PresetAdd.text)
-async def tmpl_add_text(message: Message, state: FSMContext) -> None:
-    body = (message.text or "").strip()[:MAX_TEXT_LEN]
-    if not body:
-        return await message.answer("Текст не может быть пустым. Отправьте ещё раз:")
-    data = await state.get_data()
-    title = str(data.get("title") or "").strip()[:MAX_TITLE_LEN]
-    await state.clear()
-
-    async with Session() as session:
-        user = await get_or_create_user(session, message.from_user.id)
-
-    items = await load_templates(int(user.telegram_id))
-    items.append(TemplateItem(title=title, text=body))
-    await save_templates(int(user.telegram_id), items)
-
-    restored = await _restore_presets_menu(message, data)
-    await message.answer("✅ Текст добавлен.")
-    if not restored:
-        await message.answer(_PRESETS_MENU_TEXT, reply_markup=presets_menu_kb(), parse_mode="HTML")
-
-
-@router.callback_query(F.data == "tmpl_rm_menu")
-async def tmpl_rm_menu(call: CallbackQuery) -> None:
-    async with Session() as session:
-        user = await get_or_create_user(session, call.from_user.id)
-    items = await load_templates(int(user.telegram_id))
-    if not items:
-        await _safe_edit_text(
-            call,
-            text="🧾 <b>Пресеты</b>\n\nПока пресетов нет.",
-            reply_markup=_back_only_kb("presets_menu"),
-            parse_mode="HTML",
-        )
-        return await call.answer()
-
-    await _safe_edit_text(
-        call,
-        text="🧾 <b>Удаление пресета</b>\n\nВыберите пресет для удаления:",
-        reply_markup=presets_delete_choose_kb(items),
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("tmpl_rm:"))
-async def tmpl_rm_do(call: CallbackQuery) -> None:
-    try:
-        idx = int(call.data.split(":", 1)[1])
-    except Exception:
-        return await call.answer()
-
-    async with Session() as session:
-        user = await get_or_create_user(session, call.from_user.id)
-
-    items = await load_templates(int(user.telegram_id))
-    if 0 <= idx < len(items):
-        items.pop(idx)
-        await save_templates(int(user.telegram_id), items)
-
-    await presets_menu(call)
-    await call.answer()
-
-
-# =========================
-# SMART PRESETS (умные пресеты)
-# =========================
 
 class SmartTmplAdd(StatesGroup):
     text = State()
 
 
-def smart_templates_manage_kb(items: List[TemplateItem], back_cb: str) -> InlineKeyboardMarkup:
-    kb: List[List[InlineKeyboardButton]] = []
-    for i, it in enumerate(items):
-        kb.append(
-            [
-                InlineKeyboardButton(text=f"✏️ {it.title[:30]}", callback_data=f"stmpl_view:{i}"),
-                InlineKeyboardButton(text="🗑️", callback_data=f"stmpl_del:{i}"),
-            ]
+class SmartTmplEdit(StatesGroup):
+    idx = State()
+    text = State()
+
+
+async def _user_tg_id(session, from_user_id: int) -> int:
+    user = await get_or_create_user(session, from_user_id)
+    return int(user.telegram_id)
+
+
+async def _restore_presets_list(message: Message, state_data: dict, tg_id: int) -> bool:
+    chat_id = state_data.get("_menu_chat_id")
+    msg_id = state_data.get("_menu_msg_id")
+    if not chat_id or not msg_id:
+        return False
+    items = await load_templates(tg_id)
+    texts = _template_texts(items)
+    try:
+        await message.bot.edit_message_text(
+            render_text_presets_page("🧾 <b>Ваши пресеты:</b>", texts, footer_note=NOTE_REGULAR_PRESETS),
+            chat_id=int(chat_id),
+            message_id=int(msg_id),
+            reply_markup=_regular_presets_kb(bool(texts)),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
-    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
+        return True
+    except Exception:
+        return False
 
 
-def smart_templates_delete_kb(idx: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Удалить", callback_data=f"stmpl_del_ok:{idx}"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data="stmpl_del_cancel"),
-            ]
-        ]
-    )
+async def _restore_smart_list(message: Message, state_data: dict, tg_id: int) -> bool:
+    chat_id = state_data.get("_menu_chat_id")
+    msg_id = state_data.get("_menu_msg_id")
+    if not chat_id or not msg_id:
+        return False
+    texts = await load_smart_texts(tg_id)
+    try:
+        await message.bot.edit_message_text(
+            render_text_presets_page(
+                "📄 <b>Ваши умные пресеты:</b>",
+                texts,
+                footer_note=NOTE_SMART_PRESETS,
+            ),
+            chat_id=int(chat_id),
+            message_id=int(msg_id),
+            reply_markup=_smart_presets_kb(bool(texts)),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return True
+    except Exception:
+        return False
 
 
-@router.callback_query(F.data == "smart_presets_menu")
-async def smart_presets_menu(call: CallbackQuery) -> None:
+@router.callback_query(F.data == "presets_menu")
+async def presets_menu(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    async with Session() as session:
+        tg_id = await _user_tg_id(session, call.from_user.id)
+    items = await load_templates(tg_id)
+    texts = _template_texts(items)
     await call.message.edit_text(
-        _SMART_PRESETS_MENU_TEXT,
-        reply_markup=smart_presets_menu_kb(),
+        render_text_presets_page("🧾 <b>Ваши пресеты:</b>", texts, footer_note=NOTE_REGULAR_PRESETS),
+        reply_markup=_regular_presets_kb(bool(texts)),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "tmpl_delall")
+async def presets_delete_all(call: CallbackQuery, state: FSMContext) -> None:
+    async with Session() as session:
+        tg_id = await _user_tg_id(session, call.from_user.id)
+    await save_templates(tg_id, [])
+    await call.answer("Удалено")
+    await presets_menu(call, state)
+
+
+@router.callback_query(F.data == "tmpl_preset_hide")
+async def tmpl_preset_hide(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.answer("Скрыто")
+
+
+@router.callback_query(F.data == "tmpl_add")
+async def tmpl_add_start(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(PresetAdd.text)
+    await state.update_data(
+        _menu_chat_id=call.message.chat.id,
+        _menu_msg_id=call.message.message_id,
+    )
+    await call.message.answer(
+        "➕ Отправь текст пресета одним сообщением.\n"
+        "Можно <code>OFFER</code> и спинтаксис <code>{a|b|c}</code>.",
         parse_mode="HTML",
     )
     await call.answer()
 
 
-@router.callback_query(F.data == "smart_presets_list")
-async def smart_presets_list(call: CallbackQuery) -> None:
+@router.message(PresetAdd.text)
+async def tmpl_add_text(message: Message, state: FSMContext) -> None:
+    body = (message.text or "").strip()[:MAX_TEXT_LEN]
+    if len(body) < 2:
+        return await message.answer("Текст слишком короткий. Отправь ещё раз.")
+    data = await state.get_data()
+    await state.clear()
+
     async with Session() as session:
-        user = await get_or_create_user(session, call.from_user.id)
-    items = await load_smart_texts(int(user.telegram_id))
-    text = _render_smart_presets(items, "📄 <b>Ваши умные пресеты:</b>")
-    await _safe_edit_text(call, text=text, reply_markup=_back_only_kb("smart_presets_menu"), parse_mode="HTML")
+        tg_id = await _user_tg_id(session, message.from_user.id)
+    items = await load_templates(tg_id)
+    short = body[:40] + ("…" if len(body) > 40 else "")
+    items.append(TemplateItem(title=short, text=body))
+    await save_templates(tg_id, items)
+
+    if await _restore_presets_list(message, data, tg_id):
+        return
+    texts = _template_texts(items)
+    await message.answer(
+        render_text_presets_page("🧾 <b>Ваши пресеты:</b>", texts, footer_note=NOTE_REGULAR_PRESETS),
+        reply_markup=_regular_presets_kb(True),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await message.answer("✅ Пресет добавлен.")
+
+
+@router.callback_query(F.data == "tmpl_preset_del")
+async def tmpl_preset_del_pick(call: CallbackQuery) -> None:
+    async with Session() as session:
+        tg_id = await _user_tg_id(session, call.from_user.id)
+    items = await load_templates(tg_id)
+    if not items:
+        return await call.answer("Пусто")
+    await call.message.edit_text(
+        "🗑 Выбери пресет для удаления:",
+        reply_markup=text_presets_pick_kb(len(items), "tmpl_preset_del", "presets_menu"),
+    )
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("tmpl_preset_del:"))
+async def tmpl_preset_del_idx(call: CallbackQuery, state: FSMContext) -> None:
+    idx = int(call.data.split(":")[1])
+    async with Session() as session:
+        tg_id = await _user_tg_id(session, call.from_user.id)
+    items = await load_templates(tg_id)
+    if idx < 0 or idx >= len(items):
+        return await call.answer("Не найден", show_alert=True)
+    items.pop(idx)
+    await save_templates(tg_id, items)
+    await call.answer("Удалено")
+    await presets_menu(call, state)
+
+
+@router.callback_query(F.data == "tmpl_preset_edit")
+async def tmpl_preset_edit_pick(call: CallbackQuery, state: FSMContext) -> None:
+    async with Session() as session:
+        tg_id = await _user_tg_id(session, call.from_user.id)
+    items = await load_templates(tg_id)
+    if not items:
+        return await call.answer("Пусто")
+    await state.update_data(_menu_chat_id=call.message.chat.id, _menu_msg_id=call.message.message_id)
+    await state.set_state(PresetEdit.idx)
+    await call.message.edit_text(
+        "✏️ Выбери пресет для изменения:",
+        reply_markup=text_presets_pick_kb(len(items), "tmpl_preset_edit", "presets_menu"),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("tmpl_preset_edit:"))
+async def tmpl_preset_edit_choose(call: CallbackQuery, state: FSMContext) -> None:
+    idx = int(call.data.split(":")[1])
+    async with Session() as session:
+        tg_id = await _user_tg_id(session, call.from_user.id)
+    items = await load_templates(tg_id)
+    if idx < 0 or idx >= len(items):
+        return await call.answer("Не найден", show_alert=True)
+    await state.update_data(idx=idx)
+    await state.set_state(PresetEdit.text)
+    await call.message.answer("✏️ Отправь новый текст пресета одним сообщением.")
+    await call.answer()
+
+
+@router.message(PresetEdit.text)
+async def tmpl_preset_edit_text(message: Message, state: FSMContext) -> None:
+    body = (message.text or "").strip()[:MAX_TEXT_LEN]
+    if len(body) < 2:
+        return await message.answer("Текст слишком короткий. Введи ещё раз.")
+    data = await state.get_data()
+    idx = int(data.get("idx", -1))
+    await state.clear()
+
+    async with Session() as session:
+        tg_id = await _user_tg_id(session, message.from_user.id)
+    items = await load_templates(tg_id)
+    if idx < 0 or idx >= len(items):
+        return await message.answer("Пресет не найден.")
+    short = body[:40] + ("…" if len(body) > 40 else "")
+    items[idx] = TemplateItem(title=short, text=body)
+    await save_templates(tg_id, items)
+
+    if await _restore_presets_list(message, data, tg_id):
+        return
+    await message.answer("✅ Пресет обновлён.")
+
+
+@router.callback_query(F.data == "smart_presets_menu")
+async def smart_presets_menu(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    async with Session() as session:
+        tg_id = await _user_tg_id(session, call.from_user.id)
+    texts = await load_smart_texts(tg_id)
+    await call.message.edit_text(
+        render_text_presets_page(
+            "📄 <b>Ваши умные пресеты:</b>",
+            texts,
+            footer_note=NOTE_SMART_PRESETS,
+        ),
+        reply_markup=_smart_presets_kb(bool(texts)),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "stmpl_hide")
+async def stmpl_hide(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.answer("Скрыто")
 
 
 @router.callback_query(F.data == "stmpl_add")
@@ -629,9 +628,8 @@ async def stmpl_add_start(call: CallbackQuery, state: FSMContext) -> None:
         _menu_msg_id=call.message.message_id,
     )
     await call.message.answer(
-        "➕ Отправь <b>текст пресета</b> одним сообщением.\n\n"
-        "<code>OFFER</code> — название товара\n"
-        "Спинтаксис: <code>{Hallo|Hi}</code>",
+        "➕ Отправь текст пресета одним сообщением.\n"
+        "Можно <code>OFFER</code> и спинтаксис <code>{a|b|c}</code>.",
         parse_mode="HTML",
     )
     await call.answer()
@@ -646,63 +644,110 @@ async def stmpl_add_text(message: Message, state: FSMContext) -> None:
     await state.clear()
 
     async with Session() as session:
-        user = await get_or_create_user(session, message.from_user.id)
-
-    items = await load_smart_texts(int(user.telegram_id))
+        tg_id = await _user_tg_id(session, message.from_user.id)
+    items = await load_smart_texts(tg_id)
     items.append(text)
-    await save_smart_texts(int(user.telegram_id), items)
+    await save_smart_texts(tg_id, items)
 
-    restored = await _restore_smart_presets_menu(message, data)
-    await message.answer("✅ Текст добавлен.")
-    if not restored:
-        await message.answer(_SMART_PRESETS_MENU_TEXT, reply_markup=smart_presets_menu_kb(), parse_mode="HTML")
+    if await _restore_smart_list(message, data, tg_id):
+        return
+    await message.answer(
+        render_text_presets_page(
+            "📄 <b>Ваши умные пресеты:</b>",
+            items,
+            footer_note=NOTE_SMART_PRESETS,
+        ),
+        reply_markup=_smart_presets_kb(True),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await message.answer("✅ Пресет добавлен.")
 
 
 @router.callback_query(F.data == "stmpl_delall")
-async def stmpl_delete_all(call: CallbackQuery) -> None:
+async def stmpl_delete_all(call: CallbackQuery, state: FSMContext) -> None:
     async with Session() as session:
-        user = await get_or_create_user(session, call.from_user.id)
-    await save_smart_texts(int(user.telegram_id), [])
-    await smart_presets_menu(call)
+        tg_id = await _user_tg_id(session, call.from_user.id)
+    await save_smart_texts(tg_id, [])
+    await call.answer("Удалено")
+    await smart_presets_menu(call, state)
 
 
-@router.callback_query(F.data.startswith("stmpl_del:"))
-async def stmpl_delete_ask(call: CallbackQuery) -> None:
-    try:
-        idx = int((call.data or "").split(":", 1)[1])
-    except Exception:
-        return await call.answer()
+@router.callback_query(F.data == "stmpl_del")
+async def stmpl_del_pick(call: CallbackQuery) -> None:
     async with Session() as session:
-        user = await get_or_create_user(session, call.from_user.id)
-    items = await load_smart_texts(int(user.telegram_id))
-    if idx < 0 or idx >= len(items):
-        return await call.answer()
-    preview = escape(items[idx][:120] + ("…" if len(items[idx]) > 120 else ""))
-    await _safe_edit_text(
-        call,
-        text=f"Удалить этот пресет?\n\n<blockquote>{preview}</blockquote>",
-        reply_markup=smart_templates_delete_kb(idx),
-        parse_mode="HTML",
+        tg_id = await _user_tg_id(session, call.from_user.id)
+    items = await load_smart_texts(tg_id)
+    if not items:
+        return await call.answer("Пусто")
+    await call.message.edit_text(
+        "🗑 Выбери пресет для удаления:",
+        reply_markup=text_presets_pick_kb(len(items), "stmpl_del", "smart_presets_menu"),
     )
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("stmpl_del_ok:"))
-async def stmpl_delete_ok(call: CallbackQuery) -> None:
-    try:
-        idx = int((call.data or "").split(":", 1)[1])
-    except Exception:
-        return await call.answer()
+@router.callback_query(F.data.startswith("stmpl_del:"))
+async def stmpl_del_idx(call: CallbackQuery, state: FSMContext) -> None:
+    idx = int(call.data.split(":")[1])
     async with Session() as session:
-        user = await get_or_create_user(session, call.from_user.id)
-    items = await load_smart_texts(int(user.telegram_id))
-    if 0 <= idx < len(items):
-        items.pop(idx)
-        await save_smart_texts(int(user.telegram_id), items)
-    await smart_presets_list(call)
+        tg_id = await _user_tg_id(session, call.from_user.id)
+    items = await load_smart_texts(tg_id)
+    if idx < 0 or idx >= len(items):
+        return await call.answer("Не найден", show_alert=True)
+    items.pop(idx)
+    await save_smart_texts(tg_id, items)
+    await call.answer("Удалено")
+    await smart_presets_menu(call, state)
 
 
-@router.callback_query(F.data == "stmpl_del_cancel")
-async def stmpl_delete_cancel(call: CallbackQuery) -> None:
-    await smart_presets_list(call)
+@router.callback_query(F.data == "stmpl_edit")
+async def stmpl_edit_pick(call: CallbackQuery, state: FSMContext) -> None:
+    async with Session() as session:
+        tg_id = await _user_tg_id(session, call.from_user.id)
+    items = await load_smart_texts(tg_id)
+    if not items:
+        return await call.answer("Пусто")
+    await state.update_data(_menu_chat_id=call.message.chat.id, _menu_msg_id=call.message.message_id)
+    await state.set_state(SmartTmplEdit.idx)
+    await call.message.edit_text(
+        "✏️ Выбери пресет для изменения:",
+        reply_markup=text_presets_pick_kb(len(items), "stmpl_edit", "smart_presets_menu"),
+    )
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("stmpl_edit:"))
+async def stmpl_edit_choose(call: CallbackQuery, state: FSMContext) -> None:
+    idx = int(call.data.split(":")[1])
+    async with Session() as session:
+        tg_id = await _user_tg_id(session, call.from_user.id)
+    items = await load_smart_texts(tg_id)
+    if idx < 0 or idx >= len(items):
+        return await call.answer("Не найден", show_alert=True)
+    await state.update_data(idx=idx)
+    await state.set_state(SmartTmplEdit.text)
+    await call.message.answer("✏️ Отправь новый текст пресета одним сообщением.")
+    await call.answer()
+
+
+@router.message(SmartTmplEdit.text)
+async def stmpl_edit_text(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()[:MAX_TEXT_LEN]
+    if len(text) < 2:
+        return await message.answer("Текст слишком короткий. Введи ещё раз.")
+    data = await state.get_data()
+    idx = int(data.get("idx", -1))
+    await state.clear()
+
+    async with Session() as session:
+        tg_id = await _user_tg_id(session, message.from_user.id)
+    items = await load_smart_texts(tg_id)
+    if idx < 0 or idx >= len(items):
+        return await message.answer("Пресет не найден.")
+    items[idx] = text
+    await save_smart_texts(tg_id, items)
+
+    if await _restore_smart_list(message, data, tg_id):
+        return
+    await message.answer("✅ Пресет обновлён.")

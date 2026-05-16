@@ -334,17 +334,10 @@ async def sender_name_menu(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "settings_templates")
 async def settings_templates(callback: CallbackQuery, state: FSMContext) -> None:
-    """Open templates manage screen using existing templates module."""
-    from handlers.templates import load_templates, templates_manage_kb, _render_manage
+    """Open presets list (same UI as умные пресеты)."""
+    from handlers.templates import presets_menu
 
-    await state.clear()
-    items = await load_templates(callback.from_user.id)
-    await callback.message.edit_text(
-        _render_manage(items),
-        reply_markup=templates_manage_kb(items),
-        parse_mode="HTML",
-    )
-    await callback.answer()
+    await presets_menu(callback, state)
 
 
 @router.callback_query(F.data == "html_nick_menu")
@@ -853,11 +846,10 @@ async def ref_open(callback: CallbackQuery, state: FSMContext):
         return
 
     if screen == "smart_presets":
-        # просто открываем существующие пресеты
         await callback.answer()
-        from handlers.templates import load_templates, templates_manage_kb, _render_manage
-        items = await load_templates(callback.from_user.id)
-        await callback.message.edit_text(_render_manage(items), reply_markup=templates_manage_kb(items), parse_mode="HTML")
+        from handlers.templates import smart_presets_menu
+
+        await smart_presets_menu(callback, state)
         return
 
     if screen in {"cases", "scenario_name", "rotation"}:

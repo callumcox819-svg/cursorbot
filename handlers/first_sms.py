@@ -11,6 +11,8 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
+from utils.preset_list_ui import NOTE_SMART_PRESETS, render_text_presets_page, text_presets_manage_kb, text_presets_pick_kb
+
 
 router = Router()
 
@@ -57,46 +59,28 @@ async def pick_random_first_sms(tg_id: int, offer_title: str) -> str:
 
 
 def _manage_kb(has_any: bool) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="➕ Добавить пресет", callback_data="fsms_add")]]
-    rows.append([InlineKeyboardButton(text="✏️ Изменить пресет", callback_data="fsms_edit")])
-    if has_any:
-        rows.append([InlineKeyboardButton(text="🗑 Удалить пресет", callback_data="fsms_del")])
-        rows.append([InlineKeyboardButton(text="🗑 Удалить все", callback_data="fsms_del_all")])
-    rows.append([
-        InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open"),
-        InlineKeyboardButton(text="🌿 Скрыть", callback_data="fsms_hide"),
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return text_presets_manage_kb(
+        add_cb="fsms_add",
+        edit_cb="fsms_edit",
+        del_cb="fsms_del",
+        del_all_cb="fsms_del_all",
+        back_cb="settings_open",
+        hide_cb="fsms_hide",
+        has_any=has_any,
+    )
 
 
-def _pick_kb(items: List[FirstSmsPreset], action: str) -> InlineKeyboardMarkup:
-    rows = []
-    for i, _ in enumerate(items[:40], start=1):
-        rows.append([InlineKeyboardButton(text=f"Пресет #{i}", callback_data=f"fsms_{action}:{i-1}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="firstsms_open")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def _pick_kb(count: int, action: str) -> InlineKeyboardMarkup:
+    return text_presets_pick_kb(count, f"fsms_{action}", "firstsms_open")
 
 
 def _render_list(items: List[FirstSmsPreset]) -> str:
-    if not items:
-        return (
-            "📄 <b>Умные пресеты</b>\n\n"
-            "Пока нет пресетов.\n"
-            "Добавь несколько вариантов — бот будет выбирать случайно.\n\n"
-            "<b>Переменная:</b> <code>OFFER</code> — подставится название товара.\n"
-            "<b>Спинтаксис:</b> <code>{Привет|Здравствуйте}</code>\n"
-        )
-    out = ["📄 <b>Умные пресеты</b>", ""]
-    for i, p in enumerate(items[:20], start=1):
-        # show in mono-like code but not too long
-        txt = p.text.strip().replace("\n", " ")
-        if len(txt) > 120:
-            txt = txt[:117] + "…"
-        out.append(f"<b>Пресет #{i}</b>\n<code>{txt}</code>\n")
-    if len(items) > 20:
-        out.append(f"…и ещё {len(items)-20}")
-    out.append("\n<b>Переменная:</b> <code>OFFER</code>\n<b>Спинтаксис:</b> <code>{a|b|c}</code>")
-    return "\n".join(out)
+    texts = [p.text for p in items]
+    return render_text_presets_page(
+        "📄 <b>Ваши умные пресеты:</b>",
+        texts,
+        footer_note=NOTE_SMART_PRESETS,
+    )
 
 
 class FsAdd(StatesGroup):
@@ -200,7 +184,7 @@ async def fsms_del_pick(callback: CallbackQuery):
     if not items:
         await callback.answer("Пусто")
         return
-    await callback.message.edit_text("🗑 Выбери пресет для удаления:", reply_markup=_pick_kb(items, "del"))
+    await callback.message.edit_text("🗑 Выбери пресет для удаления:", reply_markup=_pick_kb(len(items), "del"))
     await callback.answer()
 
 
@@ -226,7 +210,7 @@ async def fsms_edit_pick(callback: CallbackQuery, state: FSMContext):
     # Remember where to return after editing.
     await state.update_data(_back_chat_id=callback.message.chat.id, _back_msg_id=callback.message.message_id)
     await state.set_state(FsEdit.idx)
-    await callback.message.edit_text("✏️ Выбери пресет для изменения:", reply_markup=_pick_kb(items, "edit"))
+    await callback.message.edit_text("✏️ Выбери пресет для изменения:", reply_markup=_pick_kb(len(items), "edit"))
     await callback.answer()
 
 
