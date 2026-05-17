@@ -1293,8 +1293,12 @@ _EVENT_QUEUES: Dict[int, asyncio.Queue] = {}
 _ACCOUNTS_MAP_CACHE: tuple[list[tuple[EmailAccount, int]], float] | None = None
 _ACCOUNTS_MAP_CACHE_TTL_SEC = float(__import__("os").getenv("IMAP_ACCOUNTS_CACHE_SEC", "45"))
 _MAX_IMAP_CONCURRENT = max(1, int(__import__("os").getenv("MAX_IMAP_CONCURRENT", "6")))
-# per_user — пауза IMAP только у того, кто шлёт /send; all — пауза для всех; off — не паузим
-_IMAP_MAILING_PAUSE = (__import__("os").getenv("IMAP_MAILING_PAUSE", "per_user") or "per_user").strip().lower()
+# per_user — не опрашивать ящики того, кто шлёт /send
+# slow — опрос реже при рассылке (почта приходит, бот не душится)
+# off — без замедления; all — пауза для всех
+_IMAP_MAILING_PAUSE = (__import__("os").getenv("IMAP_MAILING_PAUSE", "slow") or "slow").strip().lower()
+_IMAP_POLL_SECONDS_MAILING = max(30, int(__import__("os").getenv("INCOMING_MAIL_POLL_SECONDS_MAILING", "90")))
+_IMAP_MAX_CONCURRENT_MAILING = max(1, int(__import__("os").getenv("MAX_IMAP_CONCURRENT_MAILING", "4")))
 _IMAP_BATCH_YIELD_SEC = max(0.0, float(__import__("os").getenv("IMAP_BATCH_YIELD_SEC", "0.08")))
 _IMAP_SLOT_SEM: asyncio.Semaphore | None = None
 
@@ -1610,11 +1614,25 @@ async def _poll_account_once(bot: Bot, acc: EmailAccount, tg_id: int) -> None:
     _BACKOFF_UNTIL.pop(acc_id, None)
 
 
-async def _poll_accounts_batch(bot: Bot, batch: list[tuple[EmailAccount, int]]) -> None:
+async def _mailing_telegram_ids() -> frozenset[int]:
+    from services.sending_state import active_mailing_telegram_ids
+    from services.mailing_active_db import mailing_telegram_ids_from_db
+
+    return active_mailing_telegram_ids() | await mailing_telegram_ids_from_db()
+
+
+async def _poll_accounts_batch(
+    bot: Bot,
+    batch: list[tuple[EmailAccount, int]],
+    *,
+    max_concurrent: int | None = None,
+) -> None:
     if not batch:
         return
+    limit = max_concurrent or _MAX_IMAP_CONCURRENT
+    chunk = batch[:limit]
     results = await asyncio.gather(
-        *[_poll_account_once(bot, acc, tg_id) for acc, tg_id in batch],
+        *[_poll_account_once(bot, acc, tg_id) for acc, tg_id in chunk],
         return_exceptions=True,
     )
     for r in results:
@@ -1632,17 +1650,28 @@ async def _idle_manager_loop(bot: Bot, *, poll_seconds: int) -> None:
     )
 
     while True:
+        cycle_pause = int(poll_seconds)
         try:
-            from services.sending_state import active_mailing_telegram_ids
+            mailing = await _mailing_telegram_ids()
+            effective_max = _MAX_IMAP_CONCURRENT
 
-            mailing = active_mailing_telegram_ids()
             if _IMAP_MAILING_PAUSE == "all" and mailing:
                 logger.info(
                     "IMAP: пауза для всех — рассылка у tg=%s (режим all)",
                     ",".join(str(x) for x in sorted(mailing)[:5]),
                 )
-                await asyncio.sleep(max(5, int(poll_seconds)))
+                await asyncio.sleep(max(5, cycle_pause))
                 continue
+
+            if mailing and _IMAP_MAILING_PAUSE == "slow":
+                cycle_pause = max(cycle_pause, _IMAP_POLL_SECONDS_MAILING)
+                effective_max = min(effective_max, _IMAP_MAX_CONCURRENT_MAILING)
+                logger.info(
+                    "IMAP: slow mode — рассылка tg=%s, пауза цикла %ss, concurrent=%s",
+                    ",".join(str(x) for x in sorted(mailing)[:3]),
+                    cycle_pause,
+                    effective_max,
+                )
 
             now = _now()
             accounts = await _refresh_accounts_map()
@@ -1658,24 +1687,24 @@ async def _idle_manager_loop(bot: Bot, *, poll_seconds: int) -> None:
                     )
 
             if not eligible:
-                await asyncio.sleep(max(5, int(poll_seconds)))
+                await asyncio.sleep(max(5, cycle_pause))
                 continue
 
             batch: list[tuple[EmailAccount, int]] = []
             for item in eligible:
                 batch.append(item)
-                if len(batch) >= _MAX_IMAP_CONCURRENT:
-                    await _poll_accounts_batch(bot, batch)
+                if len(batch) >= effective_max:
+                    await _poll_accounts_batch(bot, batch, max_concurrent=effective_max)
                     batch = []
                     if _IMAP_BATCH_YIELD_SEC > 0:
                         await asyncio.sleep(_IMAP_BATCH_YIELD_SEC)
             if batch:
-                await _poll_accounts_batch(bot, batch)
+                await _poll_accounts_batch(bot, batch, max_concurrent=effective_max)
 
         except Exception:
             logger.exception("Incoming mail manager loop error")
 
-        await asyncio.sleep(max(5, int(poll_seconds)))
+        await asyncio.sleep(max(5, cycle_pause))
 
 
 def incoming_mail_diag_snapshot() -> dict[str, Any]:

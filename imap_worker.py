@@ -82,7 +82,7 @@ async def main() -> None:
 
     # На dedicated-воркере по умолчанию выше параллелизм, чем в bot.py (там 6).
     os.environ.setdefault("MAX_IMAP_CONCURRENT", "16")
-    os.environ.setdefault("IMAP_MAILING_PAUSE", "per_user")
+    os.environ.setdefault("IMAP_MAILING_PAUSE", "slow")
 
     poll_seconds = int(os.getenv("INCOMING_MAIL_POLL_SECONDS", "20"))
     delay = int(os.getenv("INCOMING_MAIL_START_DELAY_SEC", "15"))

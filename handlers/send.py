@@ -288,6 +288,10 @@ async def start_sending(message: Message):
         )
         set_sending_state(tg_user_id, state=state)
 
+    from services.mailing_active_db import set_mailing_active
+
+    await set_mailing_active(tg_user_id, active=True)
+
     await tg_answer_safe(
         message,
         "✅ Рассылка запущена (NORMAL).\n"
@@ -593,5 +597,11 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
         if state.is_running:
             state.is_running = False
             set_sending_state(tg_user_id, state=state)
+        try:
+            from services.mailing_active_db import set_mailing_active
+
+            await set_mailing_active(tg_user_id, active=False)
+        except Exception:
+            logger.exception("clear mailing_active flag tg=%s", tg_user_id)
         if entered_main_loop:
             await _notify_sending_finished(bot=bot, chat_id=chat_id, tg_user_id=tg_user_id)
