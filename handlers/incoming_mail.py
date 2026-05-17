@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import html
 import re
+from dataclasses import dataclass, field
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, Message
@@ -13,7 +14,16 @@ from aiogram.fsm.state import StatesGroup, State
 from sqlalchemy import select as sa_select, func, select
 
 from database import Session
-from models import EmailAccount, ConversationLink, Offer, OfferEmail, IncomingMail, User, UserSetting
+from models import (
+    EmailAccount,
+    ConversationLink,
+    Offer,
+    OfferEmail,
+    IncomingMail,
+    User,
+    UserSetting,
+    QuickTemplate,
+)
 
 from services.users import get_or_create_user
 from services.user_settings import get_user_setting
@@ -38,6 +48,7 @@ from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 router = Router()
 
 _INCOMING_SMTP_TIMEOUT = 25
+REPLY_CHOICE_TEXT = "Выберите вариант"
 
 COUNTRY_KEY = "country"
 GAG_PROFILE_TITLE_KEY = "gag_profile_title"
@@ -49,7 +60,111 @@ HTML_SIGNATURE_KEY = "html_signature"
 HTML_SUBJECT_KEY = "html_subject_theme"
 
 
-async def _bg_incoming_smtp(callback: CallbackQuery, user_id: int, coro_fn) -> bool:
+@dataclass
+class ReplyNotifyCtx:
+    anchor_message_id: int
+    to_email: str
+    account_email: str
+    incoming_from: str
+    body_text: str
+    is_preset: bool = False
+    is_html: bool = False
+    cleanup_message_ids: list[int] = field(default_factory=list)
+
+
+def _preview_reply_body(body: str, *, is_html: bool = False, max_len: int = 220) -> str:
+    t = (body or "").strip()
+    if is_html:
+        t = _strip_html(t) or "HTML-письмо"
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) > max_len:
+        return t[: max_len - 1] + "…"
+    return t
+
+
+async def _delete_message_safe(bot, chat_id: int, message_id: int | None) -> None:
+    if not message_id:
+        return
+    try:
+        await bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
+    except Exception:
+        pass
+
+
+async def _notify_reply_sent(bot, chat_id: int, ctx: ReplyNotifyCtx) -> None:
+    for mid in ctx.cleanup_message_ids:
+        await _delete_message_safe(bot, chat_id, mid)
+
+    preview = _preview_reply_body(ctx.body_text, is_html=ctx.is_html)
+    from_acc = _e(ctx.account_email or "—")
+    to_addr = _e(ctx.to_email or "—")
+    incoming = _e(ctx.incoming_from or ctx.to_email or "—")
+
+    main = (
+        f"⚡️ <code>{from_acc}</code> — <b>{_e(preview)}</b> — <code>{to_addr}</code>\n\n"
+        f"успешно отправлен на <code>{to_addr}</code> с аккаунта <code>{from_acc}</code> ⚡️\n"
+        f"От кого было входящее: <code>{incoming}</code>"
+    )
+
+    try:
+        await bot.send_message(
+            int(chat_id),
+            main,
+            parse_mode="HTML",
+            reply_to_message_id=int(ctx.anchor_message_id),
+        )
+    except Exception:
+        await bot.send_message(int(chat_id), main, parse_mode="HTML")
+
+    if ctx.is_preset:
+        try:
+            await bot.send_message(
+                int(chat_id),
+                "✅ Пресет отправлен",
+                reply_to_message_id=int(ctx.anchor_message_id),
+            )
+        except Exception:
+            await bot.send_message(int(chat_id), "✅ Пресет отправлен")
+
+
+def _reply_notify_from_state(
+    data: dict,
+    *,
+    body_text: str,
+    is_preset: bool = False,
+    is_html: bool = False,
+    extra_cleanup: list[int] | None = None,
+) -> ReplyNotifyCtx | None:
+    anchor = data.get("anchor_message_id")
+    if not anchor:
+        return None
+    cleanup: list[int] = []
+    ui = data.get("ui_message_id")
+    if ui:
+        cleanup.append(int(ui))
+    if extra_cleanup:
+        for mid in extra_cleanup:
+            if mid and int(mid) not in cleanup:
+                cleanup.append(int(mid))
+    return ReplyNotifyCtx(
+        anchor_message_id=int(anchor),
+        to_email=str(data.get("to_email") or ""),
+        account_email=str(data.get("account_email") or ""),
+        incoming_from=str(data.get("to_email") or ""),
+        body_text=body_text,
+        is_preset=is_preset,
+        is_html=is_html,
+        cleanup_message_ids=cleanup,
+    )
+
+
+async def _bg_incoming_smtp(
+    callback: CallbackQuery,
+    user_id: int,
+    coro_fn,
+    *,
+    notify: ReplyNotifyCtx | None = None,
+) -> bool:
     """SMTP в фоне — polling не блокируется."""
     try:
         await callback.answer("⏳ Отправляю…", show_alert=False)
@@ -73,7 +188,10 @@ async def _bg_incoming_smtp(callback: CallbackQuery, user_id: int, coro_fn) -> b
         except Exception as e:
             ok, err = False, f"{type(e).__name__}: {e}"
         if ok:
-            await bot.send_message(chat_id, "✅ Отправлено.", parse_mode="HTML")
+            if notify:
+                await _notify_reply_sent(bot, chat_id, notify)
+            else:
+                await bot.send_message(chat_id, "✅ Отправлено.", parse_mode="HTML")
         else:
             err_s = _e(err or "unknown")
             await bot.send_message(chat_id, f"❌ Ошибка SMTP:\n<code>{err_s}</code>", parse_mode="HTML")
@@ -87,7 +205,13 @@ async def _bg_incoming_smtp(callback: CallbackQuery, user_id: int, coro_fn) -> b
     return True
 
 
-async def _bg_message_smtp(message: Message, user_id: int, coro_fn) -> bool:
+async def _bg_message_smtp(
+    message: Message,
+    user_id: int,
+    coro_fn,
+    *,
+    notify: ReplyNotifyCtx | None = None,
+) -> bool:
     """SMTP из текстового ответа — в фоне."""
     if bg_is_running(user_id, "smtp"):
         await message.answer("⏳ Отправка уже идёт…")
@@ -104,7 +228,10 @@ async def _bg_message_smtp(message: Message, user_id: int, coro_fn) -> bool:
         except Exception as e:
             ok, err = False, f"{type(e).__name__}: {e}"
         if ok:
-            await bot.send_message(chat_id, "✅ Отправлено.", parse_mode="HTML")
+            if notify:
+                await _notify_reply_sent(bot, chat_id, notify)
+            else:
+                await bot.send_message(chat_id, "✅ Отправлено.", parse_mode="HTML")
         else:
             err_s = _e(err or "unknown")
             await bot.send_message(chat_id, f"❌ Ошибка SMTP:\n<code>{err_s}</code>", parse_mode="HTML")
@@ -1311,20 +1438,28 @@ async def cb_mail_reply(callback: CallbackQuery, state: FSMContext):
     if not to_email or "@" not in to_email:
         return await callback.answer("Не вижу email отправителя", show_alert=True)
 
-    await state.set_state(_MailReplyState.waiting_choice)
-    await state.update_data(acc_id=acc_id, uid=uid, to_email=to_email, subject=subject, account_email=account_email)
+    inbox_label = ""
+    try:
+        async with Session() as session:
+            user = await get_or_create_user(session, int(callback.from_user.id))
+            inbox_label = (getattr(user, "sender_name", None) or "").strip()
+    except Exception:
+        pass
 
-    await callback.message.answer(
-        "✉️ <b>Ответ</b>\n\n"
-        f"<b>Кому:</b> <code>{_e(to_email)}</code>\n"
-        f"<b>Тема:</b> <code>{_e(subject) or '—'}</code>\n\n"
-        "Выбери способ ответа:\n"
-        "• <b>Пресет</b> — отправит готовый текст\n"
-        "• <b>HTML</b> — отправит HTML-шаблон\n\n"
-        "Или просто напиши сообщение — отправлю как обычный ответ.\n"
-        "Чтобы отменить — нажми <b>Отмена</b> или отправь <code>-</code>.",
-        parse_mode="HTML",
+    await state.set_state(_MailReplyState.waiting_choice)
+    ui = await callback.message.answer(
+        REPLY_CHOICE_TEXT,
         reply_markup=_kb_reply_choice(acc_id, uid),
+    )
+    await state.update_data(
+        acc_id=acc_id,
+        uid=uid,
+        to_email=to_email,
+        subject=subject,
+        account_email=account_email,
+        anchor_message_id=int(callback.message.message_id),
+        ui_message_id=int(ui.message_id),
+        inbox_label=inbox_label,
     )
     await callback.answer()
 
@@ -1338,25 +1473,32 @@ async def cb_mail_reply_mode(callback: CallbackQuery, state: FSMContext):
     except Exception:
         return await callback.answer("Неверные данные", show_alert=True)
 
+    data = await state.get_data()
+
     if mode in {"cancel"}:
+        await _delete_message_safe(
+            callback.bot,
+            callback.message.chat.id,
+            data.get("ui_message_id") or callback.message.message_id,
+        )
         await state.clear()
-        await callback.answer("Ок")
-        return await callback.message.answer("❌ Отменено.")
+        return await callback.answer("Отменено")
 
     if mode in {"back"}:
-        # show choice menu again
-        data = await state.get_data()
-        to_email = str(data.get("to_email") or "")
-        subject = str(data.get("subject") or "")
         await state.set_state(_MailReplyState.waiting_choice)
-        await callback.message.answer(
-            "✉️ <b>Ответ</b>\n\n"
-            f"<b>Кому:</b> <code>{_e(to_email)}</code>\n"
-            f"<b>Тема:</b> <code>{_e(subject) or '—'}</code>\n\n"
-            "Выбери способ ответа или напиши сообщение вручную.",
-            parse_mode="HTML",
-            reply_markup=_kb_reply_choice(acc_id, uid),
-        )
+        try:
+            await callback.message.edit_text(
+                REPLY_CHOICE_TEXT,
+                reply_markup=_kb_reply_choice(acc_id, uid),
+            )
+        except Exception:
+            ui = await callback.message.answer(
+                REPLY_CHOICE_TEXT,
+                reply_markup=_kb_reply_choice(acc_id, uid),
+            )
+            await state.update_data(ui_message_id=int(ui.message_id))
+        else:
+            await state.update_data(ui_message_id=int(callback.message.message_id))
         return await callback.answer()
 
     # preset picker
@@ -1365,20 +1507,40 @@ async def cb_mail_reply_mode(callback: CallbackQuery, state: FSMContext):
         if not items:
             return await callback.answer("Нет шаблонов. Добавь их в ⚡ Шаблоны", show_alert=True)
 
-        await callback.message.answer(
-            "🧾 <b>Ваши шаблоны:</b>\n\nНажмите на пресет для отправки",
-            parse_mode="HTML",
-            reply_markup=_kb_preset_pick(items, acc_id, uid),
-        )
+        try:
+            await callback.message.edit_text(
+                "🧾 <b>Ваши шаблоны:</b>\n\nНажмите на пресет для отправки",
+                parse_mode="HTML",
+                reply_markup=_kb_preset_pick(items, acc_id, uid),
+            )
+        except Exception:
+            ui = await callback.message.answer(
+                "🧾 <b>Ваши шаблоны:</b>\n\nНажмите на пресет для отправки",
+                parse_mode="HTML",
+                reply_markup=_kb_preset_pick(items, acc_id, uid),
+            )
+            await state.update_data(ui_message_id=int(ui.message_id))
+        else:
+            await state.update_data(ui_message_id=int(callback.message.message_id))
         return await callback.answer()
 
     # html picker
     if mode == "html":
-        await callback.message.answer(
-            "🧩 <b>HTML</b>\n\nВыбери HTML-шаблон:",
-            parse_mode="HTML",
-            reply_markup=_kb_html_pick(acc_id, uid),
-        )
+        try:
+            await callback.message.edit_text(
+                "🧩 <b>HTML</b>\n\nВыберите шаблон:",
+                parse_mode="HTML",
+                reply_markup=_kb_html_pick(acc_id, uid),
+            )
+        except Exception:
+            ui = await callback.message.answer(
+                "🧩 <b>HTML</b>\n\nВыберите шаблон:",
+                parse_mode="HTML",
+                reply_markup=_kb_html_pick(acc_id, uid),
+            )
+            await state.update_data(ui_message_id=int(ui.message_id))
+        else:
+            await state.update_data(ui_message_id=int(callback.message.message_id))
         return await callback.answer()
 
     return await callback.answer("Ок")
@@ -1400,6 +1562,19 @@ async def cb_mail_reply_preset_send(callback: CallbackQuery, state: FSMContext):
         return await callback.answer("Не вижу email отправителя", show_alert=True)
 
     uid = int(callback.from_user.id)
+    preset_body = ""
+
+    async with Session() as session:
+        user = await get_or_create_user(session, uid)
+        tmpl_pre = (
+            await session.execute(
+                sa_select(QuickTemplate)
+                .where(QuickTemplate.user_id == int(user.id))
+                .where(QuickTemplate.id == int(tid))
+            )
+        ).scalar_one_or_none()
+        if tmpl_pre:
+            preset_body = (tmpl_pre.body or "").strip()
 
     async def _send() -> tuple[bool, str | None]:
         async with Session() as session:
@@ -1428,8 +1603,14 @@ async def cb_mail_reply_preset_send(callback: CallbackQuery, state: FSMContext):
                 tmpl.body or "",
             )
 
+    notify = _reply_notify_from_state(
+        data,
+        body_text=preset_body,
+        is_preset=True,
+        extra_cleanup=[callback.message.message_id],
+    )
     await state.clear()
-    if not await _bg_incoming_smtp(callback, uid, _send):
+    if not await _bg_incoming_smtp(callback, uid, _send, notify=notify):
         return
 
 
@@ -1520,6 +1701,7 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
 
     mail_uid = uid
     tg_id = int(callback.from_user.id)
+    html_kind_label = kind.upper()
 
     async with Session() as session:
         user_pre = await get_or_create_user(session, tg_id)
@@ -1617,8 +1799,14 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
                 sender_name=sender_name,
             )
 
+    notify = _reply_notify_from_state(
+        data,
+        body_text=f"HTML ({html_kind_label})",
+        is_html=True,
+        extra_cleanup=[callback.message.message_id],
+    )
     await state.clear()
-    if not await _bg_incoming_smtp(callback, tg_id, _send):
+    if not await _bg_incoming_smtp(callback, tg_id, _send, notify=notify):
         return
 
 
@@ -1638,6 +1826,7 @@ async def mail_reply_text(message: Message, state: FSMContext):
 
     out_subject = _reply_subject(subject)
     tg_id = int(message.from_user.id)
+    body_for_notify = text
 
     async def _send() -> tuple[bool, str | None]:
         async with Session() as session:
@@ -1659,9 +1848,9 @@ async def mail_reply_text(message: Message, state: FSMContext):
                 text,
             )
 
+    notify = _reply_notify_from_state(data, body_text=body_for_notify)
     await state.clear()
-    await message.answer("⏳ Отправляю…")
-    if await _bg_message_smtp(message, tg_id, _send):
+    if await _bg_message_smtp(message, tg_id, _send, notify=notify):
         try:
             FULL_META[(acc_id, uid)] = {
                 **(FULL_META.get((acc_id, uid)) or {}),
@@ -1687,6 +1876,7 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
     account_email = str(data.get("account_email") or "").strip().lower()
     tg_id = int(message.from_user.id)
     html_text = text
+    body_for_notify = _preview_reply_body(html_text, is_html=True)
 
     async def _send() -> tuple[bool, str | None]:
         async with Session() as session:
@@ -1762,9 +1952,9 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
                 sender_name=sender_name,
             )
 
+    notify = _reply_notify_from_state(data, body_text=body_for_notify, is_html=True)
     await state.clear()
-    await message.answer("⏳ Отправляю…")
-    await _bg_message_smtp(message, tg_id, _send)
+    await _bg_message_smtp(message, tg_id, _send, notify=notify)
 
 
 @router.callback_query(F.data.startswith("mail_info:"))

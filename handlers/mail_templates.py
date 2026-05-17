@@ -6,6 +6,7 @@ from typing import List
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
 
 from sqlalchemy import select
 
@@ -15,7 +16,7 @@ from models import EmailAccount, User
 from services.incoming_mail_worker import FULL_META
 from services.smtp_proxy_send import send_email_via_account_with_proxy
 from handlers.templates import load_templates, TemplateItem
-from handlers.incoming_mail import _bg_incoming_smtp
+from handlers.incoming_mail import _bg_incoming_smtp, _reply_notify_from_state
 from models import IncomingMail
 
 router = Router()
@@ -132,7 +133,7 @@ async def mail_tmpl_close(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("mail_tmpl_send:"))
-async def mail_tmpl_send(callback: CallbackQuery):
+async def mail_tmpl_send(callback: CallbackQuery, state: FSMContext):
     try:
         _, idx, acc_id, uid = (callback.data or "").split(":", 3)
         idx = int(idx)
@@ -218,6 +219,14 @@ async def mail_tmpl_send(callback: CallbackQuery):
                 sender_name=getattr(user, "sender_name", None),
             )
 
-    if not await _bg_incoming_smtp(callback, tg_id, _send):
+    data = await state.get_data()
+    notify = _reply_notify_from_state(
+        data,
+        body_text=body,
+        is_preset=True,
+        extra_cleanup=[callback.message.message_id],
+    )
+    await state.clear()
+    if not await _bg_incoming_smtp(callback, tg_id, _send, notify=notify):
         return
     logger.info("MAIL_TEMPLATE queued to=%s acc_id=%s uid=%s idx=%s", to_email, acc_id, uid, idx)
