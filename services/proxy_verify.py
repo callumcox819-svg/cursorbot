@@ -85,10 +85,10 @@ def _proxy_row_from_dict(d: dict[str, Any]) -> Proxy:
 
 
 async def test_smtp_tunnel(proxy: Proxy | dict[str, Any], *, timeout: int = 12) -> Tuple[bool, str]:
-    from proxy_manager import test_smtp_tunnel_sync
+    from proxy_manager import test_smtp_tunnel_async
 
     row = _proxy_row_from_dict(proxy_to_dict(proxy))
-    return await asyncio.to_thread(test_smtp_tunnel_sync, row, timeout=timeout)
+    return await test_smtp_tunnel_async(row, timeout=timeout)
 
 
 async def test_proxy(proxy: Proxy | dict[str, Any], *, timeout: int = 10) -> Tuple[bool, str]:
@@ -105,7 +105,7 @@ async def test_proxy(proxy: Proxy | dict[str, Any], *, timeout: int = 10) -> Tup
 
     proxy_url = build_proxy_url(d)
     socks_ok, socks_info = await _test_socks5_handshake(proxy_url, timeout=timeout)
-    smtp_ok, smtp_info = await test_smtp_tunnel(proxy, timeout=max(timeout, 14))
+    smtp_ok, smtp_info = await test_smtp_tunnel(proxy, timeout=timeout)
 
     if socks_ok and smtp_ok:
         return True, f"{socks_info} · {smtp_info}"
@@ -153,9 +153,19 @@ async def refresh_proxies_status(
     sem = asyncio.Semaphore(max(1, concurrency))
     results: list[tuple[Proxy, bool, str]] = []
 
+    per_proxy_timeout = max(8, int(timeout))
+
     async def _one(p: Proxy) -> None:
         async with sem:
-            ok, info = await test_proxy(p, timeout=timeout)
+            try:
+                ok, info = await asyncio.wait_for(
+                    test_proxy(p, timeout=per_proxy_timeout),
+                    timeout=per_proxy_timeout * 2 + 8,
+                )
+            except asyncio.TimeoutError:
+                ok, info = False, "Timeout: проверка прокси заняла слишком долго"
+            except Exception as e:
+                ok, info = False, f"{type(e).__name__}: {e}"
         results.append((p, ok, info))
 
     await asyncio.gather(*[_one(p) for p in proxies])

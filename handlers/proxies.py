@@ -26,6 +26,9 @@ from services.proxy_verify import test_proxy, refresh_proxies_status
 router = Router()
 logger = logging.getLogger(__name__)
 
+# Один фоновый прогон «Проверить все» на пользователя (повторные клики не вешают бота)
+_proxy_bulk_check_tasks: dict[int, asyncio.Task] = {}
+
 
 # ======================
 #  FSM состояния
@@ -662,20 +665,31 @@ async def proxy_delete(callback: CallbackQuery):
 
 @router.callback_query(F.data == "proxies_check_all")
 async def proxies_check_all(callback: CallbackQuery) -> None:
+    telegram_id = callback.from_user.id
+
+    existing = _proxy_bulk_check_tasks.get(telegram_id)
+    if existing and not existing.done():
+        try:
+            await callback.answer("⏳ Проверка уже идёт, подождите…", show_alert=True)
+        except TelegramBadRequest:
+            pass
+        return
+
     try:
-        await callback.answer("⏳ Проверяю все прокси…", show_alert=False)
+        await callback.answer("⏳ Запускаю проверку…", show_alert=False)
     except TelegramBadRequest:
         pass
-
-    telegram_id = callback.from_user.id
-    concurrency = max(1, min(10, int(os.getenv("PROXY_CHECK_CONCURRENCY", "5"))))
 
     async with Session() as session:
         user = (
             await session.execute(select(User).where(User.telegram_id == telegram_id))
         ).scalar_one_or_none()
         if not user:
-            return await callback.message.edit_text("❌ Пользователь не найден.")
+            try:
+                await callback.message.edit_text("❌ Пользователь не найден.")
+            except TelegramBadRequest:
+                pass
+            return
 
         proxies = list(
             (
@@ -684,40 +698,73 @@ async def proxies_check_all(callback: CallbackQuery) -> None:
         )
 
     if not proxies:
-        return await render_proxy_menu(callback, telegram_id)
-
-    total = len(proxies)
-    async with Session() as session:
-        user = (
-            await session.execute(select(User).where(User.telegram_id == telegram_id))
-        ).scalar_one_or_none()
-        if not user:
-            return await callback.message.edit_text("❌ Пользователь не найден.")
-        ok_n, fail_n, _ = await refresh_proxies_status(
-            session, int(user.id), concurrency=concurrency, timeout=10
-        )
+        await render_proxy_menu(callback, telegram_id)
+        return
 
     try:
         await callback.message.edit_text(
-            "✅ <b>Проверка завершена</b>\n\n"
-            f"🟢 рабочих: <b>{ok_n}</b> · 🔴 неактивных: <b>{fail_n}</b>\n"
-            "<i>Прокси не удаляются — только статус в списке.</i>",
+            f"⏳ <b>Проверяю {len(proxies)} прокси…</b>\n\n"
+            "<i>SOCKS5 (httpbin) + SMTP smtp.gmail.com:587\n"
+            "Не нажимайте кнопку повторно — займёт до ~30 сек.</i>",
             parse_mode="HTML",
         )
     except TelegramBadRequest:
         pass
 
-    await render_proxy_menu(callback, telegram_id)
+    async def _run_bulk_check() -> None:
+        concurrency = max(1, min(3, int(os.getenv("PROXY_CHECK_CONCURRENCY", "2"))))
+        check_timeout = max(6, min(12, int(os.getenv("PROXY_CHECK_TIMEOUT", "8"))))
+        ok_n = fail_n = 0
+        try:
+            async with Session() as session:
+                user = (
+                    await session.execute(select(User).where(User.telegram_id == telegram_id))
+                ).scalar_one_or_none()
+                if not user:
+                    return
+                ok_n, fail_n, _ = await refresh_proxies_status(
+                    session,
+                    int(user.id),
+                    concurrency=concurrency,
+                    timeout=check_timeout,
+                )
+
+            try:
+                await callback.message.edit_text(
+                    "✅ <b>Проверка завершена</b>\n\n"
+                    f"🟢 рабочих: <b>{ok_n}</b> · 🔴 неактивных: <b>{fail_n}</b>\n"
+                    "<i>Статус обновлён в списке ниже.</i>",
+                    parse_mode="HTML",
+                )
+            except TelegramBadRequest:
+                pass
+
+            await render_proxy_menu(callback, telegram_id)
+        except Exception:
+            logger.exception("bulk proxy check failed for user %s", telegram_id)
+            try:
+                await callback.message.edit_text(
+                    "❌ Ошибка при проверке прокси. Попробуйте позже или проверьте один прокси кнопкой 🔄.",
+                    parse_mode="HTML",
+                )
+            except TelegramBadRequest:
+                pass
+        finally:
+            _proxy_bulk_check_tasks.pop(telegram_id, None)
+
+    task = asyncio.create_task(_run_bulk_check())
+    _proxy_bulk_check_tasks[telegram_id] = task
 
 
 @router.callback_query(F.data.startswith("proxy_test:"))
 async def proxy_test(callback: CallbackQuery):
     try:
-        await callback.answer("⏳ Тестирую прокси...", show_alert=False)
+        await callback.answer("⏳ Тестирую прокси…", show_alert=False)
     except TelegramBadRequest:
         pass
 
     proxy_id = int(callback.data.split(":")[1])
+    telegram_id = callback.from_user.id
 
     async with Session() as session:
         proxy = await session.get(Proxy, proxy_id)
@@ -725,8 +772,18 @@ async def proxy_test(callback: CallbackQuery):
     if not proxy:
         return
 
-    async def run():
-        ok, info = await test_proxy(proxy)
+    check_timeout = max(6, min(12, int(os.getenv("PROXY_CHECK_TIMEOUT", "8"))))
+
+    async def run() -> None:
+        try:
+            ok, info = await asyncio.wait_for(
+                test_proxy(proxy, timeout=check_timeout),
+                timeout=check_timeout * 2 + 10,
+            )
+        except asyncio.TimeoutError:
+            ok, info = False, "Timeout: проверка заняла слишком долго"
+        except Exception as e:
+            ok, info = False, f"{type(e).__name__}: {e}"
 
         async with Session() as session2:
             proxy_db = await session2.get(Proxy, proxy_id)
@@ -735,14 +792,22 @@ async def proxy_test(callback: CallbackQuery):
                 proxy_db.last_error = None if ok else info
                 await session2.commit()
 
-        status_text = "✅ Прокси работает" if ok else f"❌ Прокси не работает\n{info}"
+        status_text = (
+            f"✅ Прокси работает\n<code>{info}</code>"
+            if ok
+            else f"❌ Прокси не работает\n<code>{info}</code>"
+        )
         try:
-            await callback.bot.send_message(callback.message.chat.id, status_text)
+            await callback.bot.send_message(
+                callback.message.chat.id,
+                status_text,
+                parse_mode="HTML",
+            )
         except Exception:
             pass
 
         try:
-            await render_proxy_menu(callback, callback.from_user.id)
+            await render_proxy_menu(callback, telegram_id)
         except Exception:
             logger.exception("render_proxy_menu failed")
 
