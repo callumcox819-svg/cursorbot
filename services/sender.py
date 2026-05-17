@@ -219,11 +219,49 @@ _HARD_PATTERNS = [
 
 def _is_proxy_error(e: Exception, text: str) -> bool:
     t = (text or "").lower()
+    if type(e).__name__ in ("GeneralProxyError", "ProxyError", "SOCKS5Error", "NewConnectionError"):
+        return True
     if isinstance(e, OSError) and "ipv6" in t and "pysocks" in t:
         return True
     if isinstance(e, (TimeoutError, smtplib.SMTPServerDisconnected)):
         return True
     return any(re.search(p, t) for p in _PROXY_PATTERNS)
+
+
+_KNOWN_ERROR_KINDS = frozenset(
+    {
+        "PROXY_ERROR",
+        "ACCOUNT_INVALID_CREDENTIALS",
+        "ACCOUNT_WEB_LOGIN_REQUIRED",
+        "ACCOUNT_RATE_LIMIT",
+        "ACCOUNT_BLOCKED",
+        "RECIPIENT_DEAD",
+        "RECIPIENT_REFUSED",
+        "TG_ERROR",
+        "NO_ACCOUNTS",
+    }
+)
+
+
+def normalize_send_error(err: str | None) -> str:
+    """Приводит сырой GeneralProxyError и пр. к формату PROXY_ERROR|… для /stat."""
+    s = (err or "").strip()
+    if not s:
+        return "UNKNOWN"
+    kind = s.split("|", 1)[0].split(":", 1)[0].strip().upper()
+    if kind in _KNOWN_ERROR_KINDS:
+        return s
+    t = s.lower()
+    if any(re.search(p, t) for p in _PROXY_PATTERNS):
+        return _marker("PROXY_ERROR", "socks", s)
+    if _is_hard_bounce(None, t):
+        return _marker("RECIPIENT_DEAD", None, s)
+    return s
+
+
+def is_proxy_error_marker(err: str | None) -> bool:
+    s = normalize_send_error(err)
+    return s.split("|", 1)[0].split(":", 1)[0].strip().upper() == "PROXY_ERROR"
 
 
 def _is_invalid_creds(code: Optional[str], text: str) -> bool:

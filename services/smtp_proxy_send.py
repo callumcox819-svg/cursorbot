@@ -7,7 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import EmailAccount, Proxy
 from proxy_manager import ProxySMTPContext, choose_proxy_for_user
-from services.sender import send_batch_via_account, send_email_via_account
+from services.sender import (
+    is_proxy_error_marker,
+    normalize_send_error,
+    send_batch_via_account,
+    send_email_via_account,
+)
+from services.proxy_manager import ProxyManager
 
 NO_ACTIVE_PROXY = "PROXY_ERROR|no_active_proxy|No active proxy configured"
 
@@ -54,4 +60,17 @@ async def send_batch_via_account_with_proxy(
     if err:
         return [(False, err) for _ in items]
     async with ProxySMTPContext(proxy):
-        return await send_batch_via_account(account, items, sender_name=sender_name)
+        results = await send_batch_via_account(account, items, sender_name=sender_name)
+    out: list[tuple[bool, str | None]] = []
+    proxy_failed = False
+    for ok, err in results:
+        err_n = normalize_send_error(err)
+        if not ok and is_proxy_error_marker(err_n):
+            proxy_failed = True
+        out.append((bool(ok), err_n))
+    if proxy_failed:
+        try:
+            await ProxyManager.set_proxy_error(session, int(proxy.id), "PROXY_ERROR batch")
+        except Exception:
+            pass
+    return out

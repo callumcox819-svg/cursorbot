@@ -27,6 +27,7 @@ from services.user_settings import get_user_setting
 from services.placeholders import apply_placeholders
 
 from handlers.status import render_status_text, tg_answer_safe
+from services.sender import normalize_send_error, is_proxy_error_marker
 from keyboards.main_menu import main_menu_kb
 
 from services.sending_state import SendingState
@@ -73,6 +74,7 @@ SMTP_CONCURRENCY_NO_PROXY = 1
 
 SEND_ONE_TIMEOUT = 25
 SEND_BATCH_TIMEOUT = 60
+MAX_PROXY_FAILS_PER_TARGET = 5
 
 # user settings keys (уже используются в проекте)
 GAG_PROFILE_NAME_KEY = "gag_profile_name"
@@ -287,9 +289,91 @@ async def start_sending(message: Message):
     )
 
 
+async def _notify_sending_finished(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
+    """Отдельное сообщение по завершении рассылки (успех / стоп / сбой)."""
+    state = get_sending_state(tg_user_id)
+    if not state:
+        return
+
+    pending = 0
+    try:
+        async with async_session() as session:
+            user = await get_or_create_user(session, tg_user_id)
+            pending = int(await _get_targets_count(session, int(user.id)))
+    except Exception:
+        pass
+
+    sent = int(state.sent_count)
+    failed = int(state.failed_count)
+    status = (state.last_status or "").upper()
+
+    if state.is_stopping:
+        title = "⏹ <b>Рассылка остановлена</b>"
+    elif status == "DONE":
+        title = "✅ <b>Рассылка завершена</b>"
+    else:
+        title = "⚠️ <b>Рассылка прервана</b>"
+
+    text = (
+        f"{title}\n\n"
+        f"Отправлено: <b>{sent}</b>\n"
+        f"Ошибок отправки: <b>{failed}</b>\n"
+        f"Email в очереди: <b>{pending}</b>"
+    )
+    if failed > 0 and (state.last_error or "").strip() not in ("", "-"):
+        who = f"\nПоследний адрес: <code>{state.last_failed_to}</code>" if state.last_failed_to else ""
+        from handlers.status import _humanize_send_error
+
+        text += f"\n\n{_humanize_send_error(normalize_send_error(state.last_error))}{who}"
+
+    try:
+        await bot.send_message(
+            chat_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=main_menu_kb(tg_user_id),
+        )
+    except Exception:
+        logger.exception("failed to send mailing finished notification user=%s", tg_user_id)
+
+
+async def _handle_send_failure(
+    *,
+    session: AsyncSession,
+    db_user_id: int,
+    state: SendingState,
+    tgt: OfferEmail,
+    err: str,
+    fail_streak: dict[int, int],
+) -> None:
+    err = normalize_send_error(err)
+    state.failed_count += 1
+    state.last_error = err or "UNKNOWN"
+    state.last_failed_to = (tgt.email or "").strip()
+
+    purge = False
+    if "RECIPIENT_DEAD" in err or "5.1.1" in err:
+        purge = True
+    elif is_proxy_error_marker(err):
+        tid = int(tgt.id)
+        fail_streak[tid] = fail_streak.get(tid, 0) + 1
+        if fail_streak[tid] >= MAX_PROXY_FAILS_PER_TARGET:
+            purge = True
+            logger.warning(
+                "purge target after %s proxy fails: %s",
+                fail_streak[tid],
+                state.last_failed_to,
+            )
+    if purge:
+        await _purge_target(session, db_user_id, int(tgt.id))
+        fail_streak.pop(int(tgt.id), None)
+
+
 async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
     state = get_sending_state(tg_user_id) or SendingState(user_id=tg_user_id)
     smtp_sem = asyncio.Semaphore(SMTP_CONCURRENCY_WITH_PROXY)
+    entered_main_loop = False
+    fail_streak: dict[int, int] = {}
 
     async with async_session() as session:
         user = await get_or_create_user(session, tg_user_id)
@@ -350,9 +434,9 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     return bool(ok), (err or "")
 
                 except asyncio.TimeoutError:
-                    return False, "PROXY_ERROR|timeout|SMTP timeout (send_one)"
+                    return False, normalize_send_error("PROXY_ERROR|timeout|SMTP timeout (send_one)")
                 except Exception as e:
-                    return False, str(e)
+                    return False, normalize_send_error(str(e))
 
             async def _send_batch_with_timeout(acc: EmailAccount, batch: List[OfferEmail]) -> List[Tuple[bool, str]]:
                 try:
@@ -379,13 +463,16 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     return out
 
                 except asyncio.TimeoutError:
-                    return [(False, "PROXY_ERROR|timeout|SMTP timeout (send_batch)") for _ in batch]
+                    err = normalize_send_error("PROXY_ERROR|timeout|SMTP timeout (send_batch)")
+                    return [(False, err) for _ in batch]
                 except Exception as e:
-                    return [(False, str(e)) for _ in batch]
+                    err = normalize_send_error(str(e))
+                    return [(False, err) for _ in batch]
 
             acc_idx = 0
 
             while True:
+                entered_main_loop = True
                 state = get_sending_state(tg_user_id) or state
                 if state.is_stopping:
                     state.is_running = False
@@ -414,13 +501,17 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     ok, err = await _send_one_with_timeout(acc, tgt)
                     if ok:
                         state.sent_count += 1
+                        fail_streak.pop(int(tgt.id), None)
                         await _purge_target(session, db_user_id, tgt.id)
                     else:
-                        state.failed_count += 1
-                        state.last_error = err or "UNKNOWN"
-                        state.last_failed_to = (tgt.email or "").strip()
-                        if "RECIPIENT_DEAD" in err or "5.1.1" in err:
-                            await _purge_target(session, db_user_id, tgt.id)
+                        await _handle_send_failure(
+                            session=session,
+                            db_user_id=db_user_id,
+                            state=state,
+                            tgt=tgt,
+                            err=err or "UNKNOWN",
+                            fail_streak=fail_streak,
+                        )
 
                 else:
                     batch = targets[:batch_size]
@@ -428,13 +519,17 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     for t, (ok, err) in zip(batch, results):
                         if ok:
                             state.sent_count += 1
+                            fail_streak.pop(int(t.id), None)
                             await _purge_target(session, db_user_id, t.id)
                         else:
-                            state.failed_count += 1
-                            state.last_error = err or "UNKNOWN"
-                            state.last_failed_to = (t.email or "").strip()
-                            if "RECIPIENT_DEAD" in err or "5.1.1" in err:
-                                await _purge_target(session, db_user_id, t.id)
+                            await _handle_send_failure(
+                                session=session,
+                                db_user_id=db_user_id,
+                                state=state,
+                                tgt=t,
+                                err=err or "UNKNOWN",
+                                fail_streak=fail_streak,
+                            )
 
                 set_sending_state(tg_user_id, state=state)
                 await asyncio.sleep(random.uniform(min_delay, max_delay))
@@ -445,6 +540,13 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
             set_sending_state(tg_user_id, state=state)
         except Exception as e:
             state.is_running = False
-            state.last_error = f"ERROR|exception|{e}"
+            state.last_error = normalize_send_error(str(e))
             set_sending_state(tg_user_id, state=state)
             logger.exception("sending loop failed for user %s", tg_user_id)
+        finally:
+            state = get_sending_state(tg_user_id) or state
+            if state.is_running:
+                state.is_running = False
+                set_sending_state(tg_user_id, state=state)
+            if entered_main_loop:
+                await _notify_sending_finished(bot=bot, chat_id=chat_id, tg_user_id=tg_user_id)
