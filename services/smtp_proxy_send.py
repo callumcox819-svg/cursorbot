@@ -39,7 +39,7 @@ async def send_email_via_account_with_proxy(
     if err:
         return False, err
     async with ProxySMTPContext(proxy):
-        return await send_email_via_account(
+        ok, err = await send_email_via_account(
             account,
             to_email,
             subject,
@@ -47,6 +47,13 @@ async def send_email_via_account_with_proxy(
             sender_name=sender_name,
             is_html=is_html,
         )
+    err = normalize_send_error(err)
+    if not ok and is_proxy_error_marker(err):
+        try:
+            await ProxyManager.set_proxy_error(session, int(proxy.id), (err or "")[:500])
+        except Exception:
+            pass
+    return ok, err
 
 
 async def send_batch_via_account_with_proxy(

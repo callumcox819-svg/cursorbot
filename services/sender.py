@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import re
 import smtplib
@@ -43,7 +44,7 @@ MAILERS = [
     "Mutt",
 ]
 
-SMTP_TIMEOUT_SEC = 12
+SMTP_TIMEOUT_SEC = max(12, min(30, int(os.getenv("SMTP_TIMEOUT_SEC", "25"))))
 
 logger = logging.getLogger(__name__)
 

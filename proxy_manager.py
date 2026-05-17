@@ -12,6 +12,8 @@ from models import Proxy, UserSetting
 logger = logging.getLogger(__name__)
 
 _PROXY_LOCK = asyncio.Lock()
+# round-robin по активным прокси (на user_id из БД)
+_RR_INDEX: dict[int, int] = {}
 
 import socket as _stdlib_socket
 import smtplib as _smtplib
@@ -54,14 +56,32 @@ async def choose_proxy_for_user(session, user_id: int) -> Optional[Proxy]:
                 .where(Proxy.type.in_(list(SOCKS5_TYPES)))
             )
 
-        if not rot_on:
-            q = _base_q().order_by(Proxy.id.asc()).limit(1)
-            return (await session.execute(q)).scalars().first()
-
-        items = (await session.execute(_base_q())).scalars().all()
+        items = list(
+            (await session.execute(_base_q().order_by(Proxy.id.asc()))).scalars().all()
+        )
         if not items:
             return None
-        return random.choice(items)
+        if len(items) == 1:
+            return items[0]
+
+        uid = int(user_id)
+        if rot_on:
+            chosen = random.choice(items)
+        else:
+            # Раньше без ротации всегда брался только первый id — новые прокси не использовались.
+            idx = _RR_INDEX.get(uid, 0) % len(items)
+            _RR_INDEX[uid] = idx + 1
+            chosen = items[idx]
+
+        logger.info(
+            "SMTP proxy selected user_id=%s proxy_id=%s %s:%s rot=%s",
+            uid,
+            chosen.id,
+            chosen.host,
+            chosen.port,
+            "random" if rot_on else "rr",
+        )
+        return chosen
     except Exception:
         logger.exception("choose_proxy_for_user failed")
         return None

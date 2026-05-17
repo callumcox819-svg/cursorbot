@@ -69,7 +69,8 @@ def set_sending_state(user_id: int, state: Optional[SendingState] = None, **kwar
 # Константы
 # ==========================
 
-SMTP_CONCURRENCY_WITH_PROXY = 2
+# SOCKS5 через PySocks — один глобальный lock в ProxySMTPContext; >1 только ждут в очереди.
+SMTP_CONCURRENCY_WITH_PROXY = 1
 SMTP_CONCURRENCY_NO_PROXY = 1
 
 SEND_ONE_TIMEOUT = 25

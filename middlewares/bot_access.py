@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, TelegramObject, ReplyKeyboardRemove
 
 from database import Session
-from services.bot_roles import config_admin_ids, user_is_admin
+from services.bot_roles import config_admin_ids
 from services.users import get_or_create_user
 
 logger = logging.getLogger(__name__)
+
+# Кэш доступа — без запроса в БД на каждую кнопку (главная причина «подлагиваний»).
+_ACCESS_CACHE: dict[int, tuple[bool, bool, float]] = {}
+_ACCESS_CACHE_TTL_SEC = float(__import__("os").getenv("BOT_ACCESS_CACHE_TTL_SEC", "25"))
 
 ACCESS_DENIED_TEXT = (
     "⛔ У тебя нет доступа к использованию этого бота. Обратись к администратору."
@@ -49,15 +54,40 @@ def _is_service_message(event: Message) -> bool:
     return False
 
 
-async def user_has_bot_access(telegram_id: int) -> bool:
+async def _resolve_access(telegram_id: int) -> tuple[bool, bool]:
+    """(is_admin, has_bot_access) — один запрос в БД, с кэшем."""
     tg_id = int(telegram_id)
-    if await user_is_admin(tg_id):
-        return True
+    if tg_id in config_admin_ids():
+        return True, True
+
+    now = time.monotonic()
+    cached = _ACCESS_CACHE.get(tg_id)
+    if cached and (now - cached[2]) < _ACCESS_CACHE_TTL_SEC:
+        return cached[0], cached[1]
+
+    is_admin = False
+    has_access = False
     async with Session() as session:
         user = await get_or_create_user(session, tg_id)
-    if getattr(user, "is_banned", False):
-        return False
-    return bool(getattr(user, "access_granted", False))
+        if getattr(user, "is_banned", False):
+            is_admin, has_access = False, False
+        else:
+            is_admin = bool(getattr(user, "is_admin", False))
+            if is_admin and not bool(getattr(user, "access_granted", False)):
+                user.access_granted = True
+                await session.commit()
+            has_access = is_admin or bool(getattr(user, "access_granted", False))
+
+    _ACCESS_CACHE[tg_id] = (is_admin, has_access, now)
+    return is_admin, has_access
+
+
+async def user_has_bot_access(telegram_id: int) -> bool:
+    return (await _resolve_access(int(telegram_id)))[1]
+
+
+async def user_is_admin(telegram_id: int) -> bool:
+    return (await _resolve_access(int(telegram_id)))[0]
 
 
 async def deny_access_message(message: Message) -> None:
@@ -83,13 +113,15 @@ class BotAccessMiddleware(BaseMiddleware):
             if getattr(user, "is_bot", False):
                 return await handler(event, data)
 
-        if await user_is_admin(user.id):
+        is_admin, has_access = await _resolve_access(int(user.id))
+
+        if is_admin:
             return await handler(event, data)
 
         if _is_start_message(event):
             return await handler(event, data)
 
-        if await user_has_bot_access(user.id):
+        if has_access:
             return await handler(event, data)
 
         if isinstance(event, Message):

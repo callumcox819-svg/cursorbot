@@ -177,7 +177,7 @@ async def _settings_menu_kb_for_user(tg_user_id: int) -> InlineKeyboardMarkup:
             "smart_mode": await _b("smart_mode", False),
             "spoofing": await _b("spoofing", False),
             "block_control": await _b("block_control", False),
-            "proxy_rotation": await _b("proxy_rotation", False),
+            "proxy_rotation": await _b("proxy_rotation", True),
         }
 
     return settings_menu_kb(flags)

@@ -193,15 +193,19 @@ async def cmd_statussend(message: Message) -> None:
     tg_user_id = message.from_user.id
     st = get_sending_state(tg_user_id)
 
+    # Быстрый отклик, пока считаем БД (рассылка не блокирует, но /stat тяжёлый на SQLite).
+    wait_msg = await message.answer("⏳ Считаю статистику…")
+
     offers_total, pending_now, acc_total, acc_active = await _collect_db_stats(tg_user_id)
 
-    await message.answer(
-        render_status_text(
-            st,
-            offers_total=offers_total,
-            pending_now=pending_now,
-            accounts_total=acc_total,
-            accounts_active=acc_active,
-        ),
-        parse_mode="HTML",
+    text = render_status_text(
+        st,
+        offers_total=offers_total,
+        pending_now=pending_now,
+        accounts_total=acc_total,
+        accounts_active=acc_active,
     )
+    try:
+        await wait_msg.edit_text(text, parse_mode="HTML")
+    except Exception:
+        await message.answer(text, parse_mode="HTML")
