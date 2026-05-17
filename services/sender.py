@@ -225,14 +225,49 @@ _HARD_PATTERNS = [
 
 
 def _is_proxy_error(e: Exception, text: str) -> bool:
+    """Только явный сбой SOCKS/туннеля — не любой SMTP timeout/disconnect."""
     t = (text or "").lower()
-    if type(e).__name__ in ("GeneralProxyError", "ProxyError", "SOCKS5Error", "NewConnectionError"):
+    en = type(e).__name__
+    if en in (
+        "GeneralProxyError",
+        "ProxyError",
+        "SOCKS5Error",
+        "SOCKS4Error",
+        "ProxyConnectionError",
+    ):
         return True
     if isinstance(e, OSError) and "ipv6" in t and "pysocks" in t:
         return True
-    if isinstance(e, (TimeoutError, smtplib.SMTPServerDisconnected)):
+    mod = type(e).__module__ or ""
+    if "socks" in mod.lower():
         return True
-    return any(re.search(p, t) for p in _PROXY_PATTERNS)
+    if any(re.search(p, t) for p in _PROXY_PATTERNS):
+        return True
+    # Gmail/лаг: disconnect/timeout без текста про SOCKS — не вина прокси
+    return False
+
+
+def is_definite_proxy_failure(err: str | None) -> bool:
+    """Можно помечать прокси неактивным только при явной ошибке туннеля."""
+    s = normalize_send_error(err)
+    if not is_proxy_error_marker(s):
+        return False
+    t = s.lower()
+    if "no_active_proxy" in t or "no_proxy_context" in t:
+        return False
+    definite = (
+        "generalproxyerror",
+        "socks",
+        "proxy connection",
+        "can't connect to proxy",
+        "cannot connect to proxy",
+        "authentication failed",  # socks auth
+        "0x05",  # socks5 reply
+        "network is unreachable",
+        "getaddrinfo failed",
+        "pysocks",
+    )
+    return any(x in t for x in definite)
 
 
 _KNOWN_ERROR_KINDS = frozenset(

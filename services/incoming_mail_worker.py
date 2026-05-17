@@ -266,6 +266,20 @@ async def _load_convlink(
 
 
 def _imap_connect(provider: str, email_addr: str) -> tuple[str, int]:
+    """Хост IMAP по домену (как при добавлении аккаунта в handlers/accounts.py)."""
+    try:
+        from handlers.accounts import detect_imap_server
+
+        host, _prov = detect_imap_server((email_addr or "").strip())
+        if host:
+            return host, 993
+    except Exception:
+        pass
+    p = (provider or "").strip().lower()
+    if p == "gmx":
+        return "imap.gmx.net", 993
+    if p == "icloud":
+        return "imap.mail.me.com", 993
     return "imap.gmail.com", 993
 
 
@@ -1427,6 +1441,21 @@ async def _idle_manager_loop(bot: Bot, *, poll_seconds: int) -> None:
             logger.exception("Incoming mail manager loop error")
 
         await asyncio.sleep(max(5, int(poll_seconds)))
+
+
+def incoming_mail_diag_snapshot() -> dict[str, Any]:
+    """Снимок для /imap_diag (без секретов)."""
+    now = _now()
+    backoff: dict[int, int] = {}
+    for aid, until in list(_BACKOFF_UNTIL.items()):
+        if float(until) > now:
+            backoff[int(aid)] = max(0, int(float(until) - now))
+    return {
+        "poll_fallback_sec": int(POLL_FALLBACK_SEC),
+        "idle_threads": len(_IDLE_TASKS),
+        "backoff_sec_by_account": backoff,
+        "error_streak_by_account": {int(k): int(v) for k, v in _ERROR_STREAK.items()},
+    }
 
 
 def start_incoming_mail_worker(bot: Bot, poll_seconds: int = 20) -> None:

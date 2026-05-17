@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models import EmailAccount, Proxy
 from proxy_manager import ProxySMTPContext, choose_proxy_for_user
 from services.sender import (
+    is_definite_proxy_failure,
     is_proxy_error_marker,
     normalize_send_error,
     send_batch_via_account,
@@ -48,9 +49,18 @@ async def send_email_via_account_with_proxy(
             is_html=is_html,
         )
     err = normalize_send_error(err)
-    if not ok and is_proxy_error_marker(err):
+    if not ok and is_definite_proxy_failure(err):
         try:
-            await ProxyManager.set_proxy_error(session, int(proxy.id), (err or "")[:500])
+            await ProxyManager.note_proxy_failure(
+                session, int(proxy.id), (err or "")[:500], deactivate=True
+            )
+        except Exception:
+            pass
+    elif not ok and is_proxy_error_marker(err):
+        try:
+            await ProxyManager.note_proxy_failure(
+                session, int(proxy.id), (err or "")[:500], deactivate=False
+            )
         except Exception:
             pass
     return ok, err
@@ -77,7 +87,12 @@ async def send_batch_via_account_with_proxy(
         out.append((bool(ok), err_n))
     if proxy_failed:
         try:
-            await ProxyManager.set_proxy_error(session, int(proxy.id), "PROXY_ERROR batch")
+            await ProxyManager.note_proxy_failure(
+                session,
+                int(proxy.id),
+                "PROXY_ERROR batch",
+                deactivate=any(is_definite_proxy_failure(e) for _, e in out if e),
+            )
         except Exception:
             pass
     return out

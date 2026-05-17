@@ -159,7 +159,7 @@ class Proxy(Base):
     username = Column(String, nullable=True)
     password = Column(String, nullable=True)
 
-    type = Column(String, default="http")
+    type = Column(String, default="socks5")
 
     is_active = Column(Boolean, default=True)
     last_error = Column(Text, nullable=True)

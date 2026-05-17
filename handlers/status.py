@@ -9,7 +9,7 @@ from aiogram.types import Message, CallbackQuery
 from sqlalchemy import select, func
 
 from database import async_session
-from models import OfferEmail, Offer, EmailAccount
+from models import OfferEmail, Offer, EmailAccount, IncomingMail
 from services.users import get_or_create_user
 from services.sending_state import get_sending_state, SendingState
 
@@ -185,6 +185,56 @@ async def _collect_db_stats(tg_user_id: int) -> tuple[int, int, int, int]:
             int(accounts_total),
             int(accounts_active),
         )
+
+
+@router.message(Command("imap_diag"))
+async def cmd_imap_diag(message: Message) -> None:
+    """Проверка: жив ли IMAP-воркер и есть ли входящие в БД."""
+    tg_user_id = message.from_user.id
+    from services.incoming_mail_worker import incoming_mail_diag_snapshot
+
+    snap = incoming_mail_diag_snapshot()
+    async with async_session() as session:
+        user = await get_or_create_user(session, tg_user_id)
+        accs = (
+            await session.execute(
+                select(EmailAccount).where(EmailAccount.user_id == int(user.id))
+            )
+        ).scalars().all()
+        incoming_total = (
+            await session.execute(
+                select(func.count(IncomingMail.id)).where(IncomingMail.user_id == int(user.id))
+            )
+        ).scalar() or 0
+
+    lines = [
+        "<b>IMAP</b>",
+        f"Опрос INBOX: каждые ~{snap['poll_fallback_sec']} с (потоков: {snap['idle_threads']})",
+        f"Входящих в БД (всего): <b>{incoming_total}</b>",
+    ]
+    if snap.get("backoff_sec_by_account"):
+        lines.append(
+            f"⚠️ Пауза после ошибок IMAP (acc_id→сек): <code>{snap['backoff_sec_by_account']}</code>"
+        )
+    if not accs:
+        lines.append("\n❌ Нет почтовых аккаунтов — IMAP не к чему подключаться.")
+    else:
+        lines.append("\n<b>Аккаунты:</b>")
+        for a in accs[:15]:
+            st = (a.status or "—").strip()
+            uid = getattr(a, "last_seen_uid", None)
+            bo = snap["backoff_sec_by_account"].get(int(a.id))
+            extra = f", пауза IMAP {bo}с" if bo else ""
+            lines.append(
+                f"• <code>{a.email}</code> — {st}, last_uid={uid if uid is not None else 'новый'}{extra}"
+            )
+        if len(accs) > 15:
+            lines.append(f"… и ещё {len(accs) - 15}")
+    lines.append(
+        "\n<i>Тест: ответьте на письмо рассылки с телефона → через ~30 с должна прийти карточка в Telegram. "
+        "Если в БД 0 входящих — смотрите INBOX/пароль приложения; ответы в Spam (Gmail) сейчас не читаются.</i>"
+    )
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @router.message(Command("stat", "status", "statussend"))

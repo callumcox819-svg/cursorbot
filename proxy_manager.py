@@ -48,18 +48,34 @@ async def choose_proxy_for_user(session, user_id: int) -> Optional[Proxy]:
 
         active_cond = or_(Proxy.is_active.is_(True), Proxy.is_active.is_(None))
 
-        def _base_q():
-            return (
-                select(Proxy)
-                .where(Proxy.user_id == int(user_id))
-                .where(active_cond)
-                .where(Proxy.type.in_(list(SOCKS5_TYPES)))
-            )
+        def _smtp_eligible(p: Proxy) -> bool:
+            if not is_socks5_proxy(p):
+                t = (getattr(p, "type", None) or "").strip().lower()
+                # В БД default=http, хотя прокси SOCKS5 — не отбрасываем пустой/мусорный type
+                if t in ("http", "https"):
+                    return False
+                if t and not t.startswith("socks"):
+                    return False
+            return True
 
-        items = list(
-            (await session.execute(_base_q().order_by(Proxy.id.asc()))).scalars().all()
+        all_rows = list(
+            (
+                await session.execute(
+                    select(Proxy)
+                    .where(Proxy.user_id == int(user_id))
+                    .order_by(Proxy.id.asc())
+                )
+            ).scalars().all()
         )
+        items = [p for p in all_rows if _smtp_eligible(p) and (p.is_active is True or p.is_active is None)]
         if not items:
+            logger.warning(
+                "no SMTP proxy for user_id=%s total=%s eligible=%s active_eligible=%s",
+                user_id,
+                len(all_rows),
+                sum(1 for p in all_rows if _smtp_eligible(p)),
+                0,
+            )
             return None
         if len(items) == 1:
             return items[0]

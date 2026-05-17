@@ -28,7 +28,7 @@ class ProxyManager:
         host = parts[0]
         port = int(parts[1])
         username = parts[2] if len(parts) >= 3 else None
-        password = parts[3] if len(parts) >= 4 else None
+        password = ":".join(parts[3:]) if len(parts) >= 4 else None
 
         return host, port, username, password
 
@@ -88,10 +88,24 @@ class ProxyManager:
     async def set_proxy_error(
         session: AsyncSession, proxy_id: int, error: str
     ) -> None:
+        await ProxyManager.note_proxy_failure(
+            session, proxy_id, error, deactivate=True
+        )
+
+    @staticmethod
+    async def note_proxy_failure(
+        session: AsyncSession,
+        proxy_id: int,
+        error: str,
+        *,
+        deactivate: bool = False,
+    ) -> None:
+        """Записать ошибку; отключать прокси только при явном сбое SOCKS (не SMTP timeout)."""
+        values: dict = {"last_error": (error or "")[:500]}
+        if deactivate:
+            values["is_active"] = False
         await session.execute(
-            update(Proxy)
-            .where(Proxy.id == proxy_id)
-            .values(is_active=False, last_error=error)
+            update(Proxy).where(Proxy.id == proxy_id).values(**values)
         )
         await session.commit()
 

@@ -262,21 +262,28 @@ def parse_proxy_string(raw: str) -> Optional[dict]:
             "type": "socks5",
         }
 
-    # ip:port:user:pass:type
-    if len(parts) == 5:
-        host, port, user, pwd, proto = parts
+    # ip:port:user:pass[:type] — пароль может содержать ':'
+    if len(parts) >= 4:
+        host, port, user = parts[0], parts[1], parts[2]
         if not _is_probable_host(host):
             return None
         try:
             port_i = int(port)
         except ValueError:
             return None
+        tail = parts[3:]
+        proto = None
+        if len(tail) >= 2 and _normalize_proxy_type(tail[-1]) in ("socks5", "socks5h", "http", "https"):
+            proto = tail[-1]
+            pwd = ":".join(tail[:-1])
+        else:
+            pwd = ":".join(tail)
         return {
             "host": host,
             "port": port_i,
             "username": user or None,
             "password": pwd or None,
-            "type": _normalize_proxy_type(proto),
+            "type": _normalize_proxy_type(proto or "socks5"),
         }
 
     return None
