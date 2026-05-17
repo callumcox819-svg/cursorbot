@@ -37,3 +37,92 @@ async def get_html_sender_name(session, user: User) -> str | None:
 async def prepare_html_body(html: str, session, user: User) -> str:
     nick = await get_spoof_display_name(session, user)
     return apply_nick_to_html(html, nick)
+
+
+def _canon_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def _format_chf_price(price: str) -> str:
+    p = (price or "").strip()
+    if not p:
+        return ""
+    if p.upper().startswith("CHF"):
+        return p
+    return f"CHF {p}"
+
+
+async def build_offer_html_ctx(
+    session,
+    user_id: int,
+    seller_email: str,
+    *,
+    link: str = "",
+) -> dict[str, str]:
+    """Контекст для Post.ch HTML: оффер из БД + email продавца + GAG-ссылка."""
+    from sqlalchemy import select
+
+    from models import Offer, OfferEmail
+
+    title = ""
+    price = ""
+    photo = ""
+    try:
+        canon = _canon_email(seller_email)
+        off = (
+            await session.execute(
+                select(Offer)
+                .join(OfferEmail, OfferEmail.offer_id == Offer.id)
+                .where(Offer.user_id == int(user_id))
+                .where(OfferEmail.email == canon)
+                .order_by(Offer.id.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if off:
+            title = (off.title or "").strip()
+            price = _format_chf_price((off.price or "").strip())
+            photo = (off.photo or "").strip()
+    except Exception:
+        pass
+
+    return {
+        "ITEM_TITLE": title,
+        "PRICE": price,
+        "IMAGE_URL": photo,
+        "SELLER_EMAIL": _canon_email(seller_email),
+        "LINK": (link or "").strip(),
+    }
+
+
+async def resolve_gag_link_for_reply(
+    session,
+    user_id: int,
+    *,
+    account_email: str,
+    seller_email: str,
+    mail_generated_link: str | None = None,
+) -> str:
+    """GAG-ссылка из ConversationLink или из письма после «Создать ссылку»."""
+    from sqlalchemy import select
+
+    from models import ConversationLink
+
+    link = (mail_generated_link or "").strip()
+    if link:
+        return link
+
+    inbox = _canon_email(account_email)
+    seller = _canon_email(seller_email)
+    if inbox and seller:
+        conv = (
+            await session.execute(
+                select(ConversationLink)
+                .where(ConversationLink.user_id == int(user_id))
+                .where(ConversationLink.account_email == inbox)
+                .where(ConversationLink.from_email == seller)
+            )
+        ).scalar_one_or_none()
+        if conv and conv.generated_link:
+            return str(conv.generated_link).strip()
+    return ""

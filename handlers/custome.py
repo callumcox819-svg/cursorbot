@@ -188,7 +188,14 @@ async def cust_send_imap(callback: CallbackQuery):
             if not account:
                 return False, "Аккаунт не найден"
             user = await get_or_create_user(session, tg_id)
-            from services.html_reply import get_html_reply_subject, get_html_sender_name, prepare_html_body
+            from services.html_reply import (
+                build_offer_html_ctx,
+                get_html_reply_subject,
+                get_html_sender_name,
+                prepare_html_body,
+                resolve_gag_link_for_reply,
+            )
+            from services.placeholders import apply_placeholders
 
             subject = await get_html_reply_subject(
                 session,
@@ -210,9 +217,38 @@ async def cust_send_imap(callback: CallbackQuery):
             if not file_path.exists():
                 return False, "HTML шаблон не найден"
             raw_html = file_path.read_text(encoding="utf-8", errors="ignore")
+            account_email = (meta.get("account_email") or account.email or "").strip().lower()
+            mail_gen_link = None
+            try:
+                uid_s = (mail_uid or "").strip()
+                if uid_s.startswith("S:"):
+                    uid_s = uid_s.split(":", 1)[1]
+                uid_num = int(uid_s)
+                mail_row = (
+                    await session.execute(
+                        select(IncomingMail)
+                        .where(IncomingMail.account_id == int(acc_id))
+                        .where(IncomingMail.imap_uid == int(uid_num))
+                        .order_by(IncomingMail.id.desc())
+                        .limit(1)
+                    )
+                ).scalars().first()
+                if mail_row and mail_row.generated_link:
+                    mail_gen_link = str(mail_row.generated_link)
+            except Exception:
+                pass
+            link = await resolve_gag_link_for_reply(
+                session,
+                int(user.id),
+                account_email=account_email,
+                seller_email=to_email,
+                mail_generated_link=mail_gen_link,
+            )
+            ctx = await build_offer_html_ctx(session, int(user.id), to_email, link=link)
             html_body = prepare_html_body(raw_html, session, user)
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
+            html_body = apply_placeholders(html_body, link=link, ctx=ctx)
             return await send_email_via_account_with_proxy(
                 session,
                 int(user.id),
@@ -268,7 +304,14 @@ async def cust_send_html(callback: CallbackQuery):
             if not account:
                 return False, "Аккаунт не найден"
             from models import User
-            from services.html_reply import get_html_reply_subject, get_html_sender_name, prepare_html_body
+            from services.html_reply import (
+                build_offer_html_ctx,
+                get_html_reply_subject,
+                get_html_sender_name,
+                prepare_html_body,
+                resolve_gag_link_for_reply,
+            )
+            from services.placeholders import apply_placeholders
 
             user = (
                 await session.execute(select(User).where(User.id == int(offer_email.user_id)))
@@ -296,9 +339,19 @@ async def cust_send_html(callback: CallbackQuery):
             if not file_path.exists():
                 return False, "HTML шаблон не найден"
             raw_html = file_path.read_text(encoding="utf-8", errors="ignore")
+            to_email = (offer_email.email or "").strip().lower()
+            link = await resolve_gag_link_for_reply(
+                session,
+                int(user.id),
+                account_email=(account.email or "").strip().lower(),
+                seller_email=to_email,
+                mail_generated_link=(meta.get("generated_link") if isinstance(meta, dict) else None),
+            )
+            ctx = await build_offer_html_ctx(session, int(user.id), to_email, link=link)
             html_body = prepare_html_body(raw_html, session, user)
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", html_signature)
+            html_body = apply_placeholders(html_body, link=link, ctx=ctx)
             return await send_email_via_account_with_proxy(
                 session,
                 int(user.id),

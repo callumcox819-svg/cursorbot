@@ -1531,11 +1531,12 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
     if not filename:
         return await callback.answer("Неизвестный шаблон", show_alert=True)
 
-    uid = int(callback.from_user.id)
+    mail_uid = uid
+    tg_id = int(callback.from_user.id)
 
     async def _send() -> tuple[bool, str | None]:
         async with Session() as session:
-            user = await get_or_create_user(session, uid)
+            user = await get_or_create_user(session, tg_id)
             acc = (
                 await session.execute(sa_select(EmailAccount).where(EmailAccount.id == int(acc_id)))
             ).scalar_one_or_none()
@@ -1543,9 +1544,11 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
                 return False, "SMTP аккаунт не найден"
 
             from services.html_reply import (
+                build_offer_html_ctx,
                 get_html_reply_subject,
                 get_html_sender_name,
                 prepare_html_body,
+                resolve_gag_link_for_reply,
             )
 
             subject = await get_html_reply_subject(session, user, fallback=_reply_subject(subject_raw))
@@ -1563,56 +1566,40 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
             if not raw_html:
                 return False, "HTML шаблон не найден"
 
-            link = ""
-            if account_email:
-                conv = (
-                    await session.execute(
-                        sa_select(ConversationLink)
-                        .where(ConversationLink.user_id == int(user.id))
-                        .where(ConversationLink.account_email == account_email)
-                        .where(ConversationLink.from_email == to_email)
-                    )
-                ).scalar_one_or_none()
-                if conv and conv.generated_link:
-                    link = str(conv.generated_link)
+            from services.placeholders import apply_placeholders
 
+            mail_gen_link = None
+            try:
+                uid_s = (mail_uid or "").strip()
+                if uid_s.startswith("S:"):
+                    uid_s = uid_s.split(":", 1)[1]
+                uid_num = int(uid_s)
+                mail_row = (
+                    await session.execute(
+                        sa_select(IncomingMail)
+                        .where(IncomingMail.account_id == int(acc_id))
+                        .where(IncomingMail.imap_uid == int(uid_num))
+                        .order_by(IncomingMail.id.desc())
+                        .limit(1)
+                    )
+                ).scalars().first()
+                if mail_row and mail_row.generated_link:
+                    mail_gen_link = str(mail_row.generated_link)
+            except Exception:
+                pass
+
+            link = await resolve_gag_link_for_reply(
+                session,
+                int(user.id),
+                account_email=account_email,
+                seller_email=to_email,
+                mail_generated_link=mail_gen_link,
+            )
+            ctx = await build_offer_html_ctx(session, int(user.id), to_email, link=link)
             html_body = prepare_html_body(_apply_link(raw_html, link), session, user)
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
-
-            try:
-                from services.placeholders import apply_placeholders
-
-                offer_title = await _offer_title_for_email(session, int(user.id), to_email)
-                offer_price = ""
-                offer_photo = ""
-                if offer_title:
-                    try:
-                        canon = _canon_email(to_email)
-                        off = (
-                            await session.execute(
-                                sa_select(Offer)
-                                .join(OfferEmail, OfferEmail.offer_id == Offer.id)
-                                .where(Offer.user_id == int(user.id))
-                                .where(OfferEmail.email == canon)
-                                .order_by(Offer.id.desc())
-                                .limit(1)
-                            )
-                        ).scalars().first()
-                        if off:
-                            offer_price = (off.price or "").strip()
-                            offer_photo = (off.photo or "").strip()
-                    except Exception:
-                        pass
-
-                ctx = {
-                    "ITEM_TITLE": offer_title,
-                    "PRICE": offer_price,
-                    "IMAGE_URL": offer_photo,
-                }
-                html_body = apply_placeholders(html_body, link=link, ctx=ctx)
-            except Exception:
-                pass
+            html_body = apply_placeholders(html_body, link=link, ctx=ctx)
 
             return await send_email_via_account_with_proxy(
                 session,
@@ -1626,7 +1613,7 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
             )
 
     await state.clear()
-    if not await _bg_incoming_smtp(callback, uid, _send):
+    if not await _bg_incoming_smtp(callback, tg_id, _send):
         return
 
 
@@ -1689,6 +1676,7 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
         return await message.answer("❌ Отменено.")
 
     acc_id = int(data.get("acc_id") or 0)
+    mail_uid = str(data.get("uid") or "")
     to_email = str(data.get("to_email") or "").strip().lower()
     subject_raw = str(data.get("subject") or "").strip()
     account_email = str(data.get("account_email") or "").strip().lower()
@@ -1705,9 +1693,11 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
                 return False, "SMTP аккаунт не найден в БД."
 
             from services.html_reply import (
+                build_offer_html_ctx,
                 get_html_reply_subject,
                 get_html_sender_name,
                 prepare_html_body,
+                resolve_gag_link_for_reply,
             )
 
             subject = await get_html_reply_subject(session, user, fallback=_reply_subject(subject_raw))
@@ -1721,56 +1711,40 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
                 )
             ).scalar_one_or_none()
 
-            link = ""
-            if account_email:
-                conv = (
-                    await session.execute(
-                        sa_select(ConversationLink)
-                        .where(ConversationLink.user_id == int(user.id))
-                        .where(ConversationLink.account_email == account_email)
-                        .where(ConversationLink.from_email == to_email)
-                    )
-                ).scalar_one_or_none()
-                if conv and conv.generated_link:
-                    link = str(conv.generated_link)
+            from services.placeholders import apply_placeholders
 
+            mail_gen_link = None
+            try:
+                uid_s = (mail_uid or "").strip()
+                if uid_s.startswith("S:"):
+                    uid_s = uid_s.split(":", 1)[1]
+                uid_num = int(uid_s)
+                mail_row = (
+                    await session.execute(
+                        sa_select(IncomingMail)
+                        .where(IncomingMail.account_id == int(acc_id))
+                        .where(IncomingMail.imap_uid == int(uid_num))
+                        .order_by(IncomingMail.id.desc())
+                        .limit(1)
+                    )
+                ).scalars().first()
+                if mail_row and mail_row.generated_link:
+                    mail_gen_link = str(mail_row.generated_link)
+            except Exception:
+                pass
+
+            link = await resolve_gag_link_for_reply(
+                session,
+                int(user.id),
+                account_email=account_email,
+                seller_email=to_email,
+                mail_generated_link=mail_gen_link,
+            )
+            ctx = await build_offer_html_ctx(session, int(user.id), to_email, link=link)
             html_body = prepare_html_body(_apply_link(html_text, link), session, user)
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
-
-            try:
-                from services.placeholders import apply_placeholders
-
-                offer_title = await _offer_title_for_email(session, int(user.id), to_email)
-                offer_price = ""
-                offer_photo = ""
-                if offer_title:
-                    try:
-                        canon = _canon_email(to_email)
-                        off = (
-                            await session.execute(
-                                sa_select(Offer)
-                                .join(OfferEmail, OfferEmail.offer_id == Offer.id)
-                                .where(Offer.user_id == int(user.id))
-                                .where(OfferEmail.email == canon)
-                                .order_by(Offer.id.desc())
-                                .limit(1)
-                            )
-                        ).scalars().first()
-                        if off:
-                            offer_price = (off.price or "").strip()
-                            offer_photo = (off.photo or "").strip()
-                    except Exception:
-                        pass
-
-                ctx = {
-                    "ITEM_TITLE": offer_title,
-                    "PRICE": offer_price,
-                    "IMAGE_URL": offer_photo,
-                }
-                html_body = apply_placeholders(html_body, link=link, ctx=ctx)
-            except Exception:
-                pass
+            html_body = apply_placeholders(html_body, link=link, ctx=ctx)
 
             return await send_email_via_account_with_proxy(
                 session,

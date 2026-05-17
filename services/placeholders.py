@@ -4,7 +4,7 @@ import re
 from typing import Any, Optional
 
 # Supported placeholders (case-insensitive, with optional spaces):
-# {{LINK}}, {{ITEM_TITLE}}, {{PRICE}}, {{BUYER_NAME}}, {{ADDRESS}}, {{IMAGE_URL}}, {{IMAGE}}
+# {{LINK}}, {{ITEM_TITLE}}, {{PRICE}}, {{SELLER_EMAIL}}, {{BUYER_NAME}}, {{ADDRESS}}, {{IMAGE_URL}}, {{IMAGE}}
 LINK_PLACEHOLDER_RE = re.compile(r"\{\{\s*LINK\s*\}\}", re.I)
 GEN_PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Z0-9_]+)\s*\}\}", re.I)
 
