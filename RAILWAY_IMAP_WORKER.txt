@@ -1,0 +1,140 @@
+Пошагово: стабильный IMAP для 100+ ящиков (50+ на пользователя)
+================================================================
+
+Схема на Railway (один проект, два сервиса):
+
+   [ PostgreSQL ]  ←── одна база для всех
+        ↑    ↑
+        │    │
+   [ cursorbot ]     [ imap-worker ]
+   python bot.py     python imap_worker.py
+   Telegram polling  только IMAP + уведомления в чат
+   replicas = 1      replicas = 1
+
+ВАЖНО: два сервиса с python bot.py = конфликт Telegram (бот «умирает»).
+Второй сервис — ТОЛЬКО imap_worker.py.
+
+
+ЧАСТЬ A — сервис бота (cursorbot), как сейчас
+----------------------------------------------
+
+1. Открой проект Railway → сервис **cursorbot** (основной бот).
+
+2. **Settings** → **Deploy** → **Replicas** = **1** (не 2).
+
+3. **Settings** → если есть **Custom Start Command** — оставь пустым или:
+      python bot.py
+
+4. **Variables** — проверь / добавь:
+
+   BOT_TOKEN              = (токен @BotFather, тот же что сейчас)
+   DATABASE_URL           = Reference на Postgres (НЕ пустая строка!)
+
+   IMAP_DEDICATED_WORKER  = 1
+
+   ENABLE_INCOMING_MAIL   = удалить или НЕ ставить 1 на боте
+                          (IMAP будет только на imap-worker)
+
+   DB_POOL_SIZE           = 20
+   DB_MAX_OVERFLOW        = 30
+
+5. **Redeploy** cursorbot.
+
+
+ЧАСТЬ B — новый сервис imap-worker
+-----------------------------------
+
+6. На canvas проекта: **+ New** → **GitHub Repo** (тот же репозиторий cursorbot/happy88).
+
+7. Назови сервис, например: **imap-worker**.
+
+8. **Settings** → **Deploy** → **Custom Start Command**:
+      python imap_worker.py
+
+9. **Settings** → **Replicas** = **1**.
+
+10. **Variables** → **+ New Variable** (скопируй с cursorbot):
+
+    BOT_TOKEN                    = (тот же токен, что у бота)
+    DATABASE_URL                 = Reference на тот же Postgres
+
+    ENABLE_INCOMING_MAIL         = 1
+    MAX_IMAP_CONCURRENT          = 16
+    INCOMING_MAIL_POLL_SECONDS   = 20
+    INCOMING_MAIL_START_DELAY_SEC = 15
+    IMAP_MAILING_PAUSE           = per_user
+    IMAP_ACCOUNTS_CACHE_SEC      = 45
+
+    DB_POOL_SIZE                 = 15
+    DB_MAX_OVERFLOW                = 25
+
+    (BOT_TOKEN нужен только чтобы слать «новое письмо» в Telegram;
+     polling imap_worker НЕ запускает.)
+
+11. **Deploy** / **Redeploy** imap-worker.
+
+
+ЧАСТЬ C — проверка логов
+-------------------------
+
+Сервис **cursorbot** после старта:
+   IMAP в bot.py отключён (IMAP_DEDICATED_WORKER=1)
+   БД: PostgreSQL
+   Polling…
+
+Сервис **imap-worker** после старта:
+   IMAP worker: БД postgresql
+   IMAP scheduler: round-robin pause=per_user max_concurrent=16
+   💓 IMAP worker alive
+
+Если на imap-worker ошибка ENABLE_INCOMING_MAIL — добавь переменную = 1.
+
+
+Масштаб: сколько ящиков выдержит
+---------------------------------
+
+Формула грубо:
+   время полного круга ≈ (число_ящиков / MAX_IMAP_CONCURRENT) × 3 сек + POLL_SECONDS
+
+Примеры при MAX=16, POLL=20:
+
+   100 ящиков  → ~19 + 20 ≈ 40 с между опросами одного ящика
+   250 ящиков  → ~47 + 20 ≈ 1 мин
+   500 ящиков  → ~94 + 20 ≈ 2 мин
+
+10 пользователей × 50 ящиков = 500 — укладывается в imap-worker;
+если круг > 2–3 мин и нужно быстрее:
+   MAX_IMAP_CONCURRENT = 20  (только на imap-worker, не на боте)
+   INCOMING_MAIL_POLL_SECONDS = 15
+
+Не поднимай replicas imap-worker на 2 без шардинга — два воркера
+опросят одни ящики дважды и придут дубли в Telegram.
+
+
+Поведение при рассылке /send
+----------------------------
+
+IMAP_MAILING_PAUSE=per_user:
+   у кого идёт рассылка — его ящики на паузу;
+   остальные пользователи получают входящие как обычно.
+
+
+Локально (не мешать Railway)
+----------------------------
+
+Не запускай bot.py с тем же BOT_TOKEN, пока Railway работает.
+
+Если тестируешь imap_worker локально:
+   set ENABLE_INCOMING_MAIL=1
+   python imap_worker.py
+
+
+Чеклист «всё ок»
+----------------
+
+[ ] Postgres подключён (в логах PostgreSQL, не sqlite)
+[ ] cursorbot: IMAP_DEDICATED_WORKER=1, replicas=1
+[ ] imap-worker: python imap_worker.py, ENABLE_INCOMING_MAIL=1, replicas=1
+[ ] Один BOT_TOKEN, два сервиса — в логах бота нет TELEGRAM CONFLICT
+[ ] В Telegram при новом письме приходит уведомление
+[ ] Во время /send у другого пользователя /start отвечает

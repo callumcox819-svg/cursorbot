@@ -80,6 +80,10 @@ async def main() -> None:
     me = await bot.get_me()
     logger.info("IMAP worker: Bot @%s (id=%s) — только исходящие уведомления", me.username, me.id)
 
+    # На dedicated-воркере по умолчанию выше параллелизм, чем в bot.py (там 6).
+    os.environ.setdefault("MAX_IMAP_CONCURRENT", "16")
+    os.environ.setdefault("IMAP_MAILING_PAUSE", "per_user")
+
     poll_seconds = int(os.getenv("INCOMING_MAIL_POLL_SECONDS", "20"))
     delay = int(os.getenv("INCOMING_MAIL_START_DELAY_SEC", "15"))
     if delay > 0:

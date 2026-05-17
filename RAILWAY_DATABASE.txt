@@ -58,3 +58,7 @@ cursorbot → Deployments → **Redeploy** (или Apply 1 Change).
    Replicas = 1
 
 Не ставь BOT_OPEN_ACCESS (бот закрытый).
+
+IMAP на 100+ ящиков (отдельный сервис)
+--------------------------------------
+См. пошаговую инструкцию: RAILWAY_IMAP_WORKER.txt
