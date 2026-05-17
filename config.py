@@ -1,5 +1,12 @@
 import os
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 
 class Config:
     # 🔐 Бот токен
@@ -37,5 +44,12 @@ class Config:
     GAG_GENERATE_URL = os.getenv("GAG_GENERATE_URL", "https://imgbeoxo.com/generate").strip()
     GAG_SEND_EMAIL_URL = os.getenv("GAG_SEND_EMAIL_URL", "https://imgbeoxo.com/send-email").strip()
     GAG_DEFAULT_VERSION = os.getenv("GAG_DEFAULT_VERSION", "lk").strip() or "lk"
+
+    # 🌍 Перевод входящих (кнопка «Перевести») — DeepSeek Chat API
+    # TRANSLATE_PROVIDER: auto | deepseek | free
+    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    DEEPSEEK_API_BASE = (os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com") or "").strip().rstrip("/")
+    DEEPSEEK_MODEL = (os.getenv("DEEPSEEK_MODEL", "deepseek-chat") or "deepseek-chat").strip()
+    TRANSLATE_PROVIDER = (os.getenv("TRANSLATE_PROVIDER", "auto") or "auto").strip().lower()
 
 config = Config()
