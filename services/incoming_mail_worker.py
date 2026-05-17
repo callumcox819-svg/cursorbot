@@ -1290,8 +1290,18 @@ _IDLE_TASKS: Dict[int, asyncio.Task] = {}
 _IDLE_STOPS: Dict[int, threading.Event] = {}
 _EVENT_QUEUES: Dict[int, asyncio.Queue] = {}
 
+_ACCOUNTS_MAP_CACHE: tuple[list[tuple[EmailAccount, int]], float] | None = None
+_ACCOUNTS_MAP_CACHE_TTL_SEC = float(__import__("os").getenv("IMAP_ACCOUNTS_CACHE_SEC", "45"))
+
 
 async def _refresh_accounts_map() -> list[tuple[EmailAccount, int]]:
+    global _ACCOUNTS_MAP_CACHE
+    now = _now()
+    if _ACCOUNTS_MAP_CACHE is not None:
+        cached, ts = _ACCOUNTS_MAP_CACHE
+        if (now - ts) < _ACCOUNTS_MAP_CACHE_TTL_SEC:
+            return cached
+
     async with _imap_db_session() as session:
         accounts = (await session.execute(
             sa_select(EmailAccount).where(
@@ -1310,6 +1320,7 @@ async def _refresh_accounts_map() -> list[tuple[EmailAccount, int]]:
         tg_id = users_by_id.get(a.user_id)
         if tg_id:
             out.append((a, int(tg_id)))
+    _ACCOUNTS_MAP_CACHE = (out, now)
     return out
 
 

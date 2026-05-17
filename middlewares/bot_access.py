@@ -115,6 +115,9 @@ class BotAccessMiddleware(BaseMiddleware):
                 return await handler(event, data)
             if getattr(user, "is_bot", False):
                 return await handler(event, data)
+            # /start не ждёт БД в middleware — проверка доступа внутри cmd_start (один запрос).
+            if _is_start_message(event):
+                return await handler(event, data)
 
         try:
             is_admin, has_access = await asyncio.wait_for(
@@ -135,9 +138,6 @@ class BotAccessMiddleware(BaseMiddleware):
             return None
 
         if is_admin:
-            return await handler(event, data)
-
-        if _is_start_message(event):
             return await handler(event, data)
 
         if has_access:

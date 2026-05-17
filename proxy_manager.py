@@ -239,13 +239,27 @@ async def database_socket_guard():
     Перед PostgreSQL/asyncpg: сбросить глобальный PySocks-патч.
     Отдельный lock от SMTP — иначе IMAP/БД блокируют рассылку и кнопки меню.
     """
-    await _DB_SOCKET_LOCK.acquire()
+    import asyncio
+
+    lock_wait = float(os.getenv("DB_SOCKET_LOCK_TIMEOUT_SEC", "10"))
+    acquired = False
+    try:
+        await asyncio.wait_for(_DB_SOCKET_LOCK.acquire(), timeout=lock_wait)
+        acquired = True
+    except asyncio.TimeoutError:
+        import logging
+
+        logging.getLogger(__name__).error(
+            "DB socket lock timeout (%.0fs) — продолжаем без lock", lock_wait
+        )
+
     reset_smtplib_proxy()
     try:
         yield
     finally:
         reset_smtplib_proxy()
-        _DB_SOCKET_LOCK.release()
+        if acquired:
+            _DB_SOCKET_LOCK.release()
 
 
 def reset_smtplib_proxy() -> None:
