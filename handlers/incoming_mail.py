@@ -11,7 +11,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
-from sqlalchemy import select as sa_select, func, select
+from sqlalchemy import select as sa_select, func, select, update as sa_update
 
 from database import Session
 from models import (
@@ -622,9 +622,10 @@ def _service_label_for_card(service_code: str) -> str:
     return service_code or "—"
 
 
-async def _send_generated_link_card(
+async def _send_generated_link_card_to_chat(
+    bot,
+    chat_id: int,
     *,
-    callback: CallbackQuery,
     offer_title: str | None,
     offer_price: str | None,
     photo_url: str | None,
@@ -639,8 +640,6 @@ async def _send_generated_link_card(
 ):
     """Карточка GAG-ссылки — reply к исходному письму (как пресет/HTML)."""
     service_label = _service_label_for_card(service_code)
-    chat_id = int(callback.message.chat.id)
-    bot = callback.bot
     reply_to = int(anchor_message_id) if anchor_message_id else None
 
     from_acc = _e((account_email or "").strip() or "—")
@@ -707,6 +706,38 @@ async def _send_generated_link_card(
             await _try_pin(bot, chat_id, reply_to)
         except Exception:
             pass
+
+
+async def _send_generated_link_card(
+    *,
+    callback: CallbackQuery,
+    offer_title: str | None,
+    offer_price: str | None,
+    photo_url: str | None,
+    profile_display: str | None,
+    service_code: str,
+    link: str,
+    offer_id: int | None = None,
+    anchor_message_id: int | None = None,
+    account_email: str | None = None,
+    contact_email: str | None = None,
+    inbox_label: str | None = None,
+):
+    await _send_generated_link_card_to_chat(
+        callback.bot,
+        int(callback.message.chat.id),
+        offer_title=offer_title,
+        offer_price=offer_price,
+        photo_url=photo_url,
+        profile_display=profile_display,
+        service_code=service_code,
+        link=link,
+        offer_id=offer_id,
+        anchor_message_id=anchor_message_id,
+        account_email=account_email,
+        contact_email=contact_email,
+        inbox_label=inbox_label,
+    )
 
 
 def _norm_subject_for_match(subject: str) -> str:
@@ -2433,6 +2464,195 @@ async def cb_mail_info(callback: CallbackQuery):
 # =========================
 # Offer price edit (кнопка "Цена" на pinned карточке)
 # =========================
+# Offer price → пересоздать GAG-ссылку (в API GAG нет смены цены)
+# =========================
+
+
+def _format_gag_price_from_input(text: str, *, previous: str | None = None) -> str | None:
+    """Парсинг цены для GAG: по умолчанию CHF (как в офферах Швейцарии)."""
+    raw = (text or "").strip().replace(",", ".")
+    if not raw:
+        return None
+    m = re.search(r"([\d.]+)", raw)
+    if not m:
+        return None
+    try:
+        num = float(m.group(1))
+    except ValueError:
+        return None
+    if num < 0:
+        return None
+
+    prev = (previous or "").upper()
+    suffix_m = re.search(r"([A-Za-z]{2,4}|€)\s*$", raw.strip())
+    if suffix_m:
+        suf = suffix_m.group(1).upper()
+        if suf in {"€", "EUR"}:
+            return f"{num:.2f} EUR"
+        if suf == "CHF":
+            return f"{num:.2f} CHF"
+    if "EUR" in prev or "€" in (previous or ""):
+        return f"{num:.2f} EUR"
+    return f"{num:.2f} CHF"
+
+
+async def _resolve_offer_dialog_emails(session, user_id: int, offer_id: int) -> tuple[str, str]:
+    """inbox (наш ящик) и contact (продавец) по OfferEmail + ConversationLink."""
+    emails = (
+        await session.execute(
+            sa_select(OfferEmail.email).where(OfferEmail.offer_id == int(offer_id)).limit(8)
+        )
+    ).scalars().all()
+    for em in emails:
+        contact = _canon_email(str(em or ""))
+        if not contact:
+            continue
+        conv = (
+            await session.execute(
+                sa_select(ConversationLink)
+                .where(ConversationLink.user_id == int(user_id))
+                .where(func.lower(ConversationLink.from_email) == contact)
+                .order_by(ConversationLink.id.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if conv and (conv.account_email or "").strip():
+            return _canon_email(conv.account_email or ""), contact
+    return "", ""
+
+
+async def _gag_generate_link_for_offer(session, user: User, offer: Offer, price: str) -> str:
+    gag_key = await get_user_gag_api_key(session, user)
+    if not gag_key:
+        raise GAGError("GAG API ключ не установлен")
+
+    service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
+    if not is_valid_gag_service(service):
+        raise GAGError("Не выбран сервис GAG")
+
+    prof_name = (await get_user_setting(session, user, GAG_PROFILE_NAME_KEY) or "").strip()
+    prof_addr = (await get_user_setting(session, user, GAG_PROFILE_ADDRESS_KEY) or "").strip()
+    if not (prof_name and prof_addr):
+        raise GAGError("Профиль GAG не заполнен")
+
+    title = (offer.title or "").strip()
+    if not title:
+        raise GAGError("Нет названия объявления (title)")
+
+    p = (price or "").strip()
+    if not p:
+        raise GAGError("Нет цены")
+
+    offer_image = (offer.photo or "").strip() or None
+    api_service = gag_service_for_api(service)
+
+    dom_raw = (await get_user_setting(session, user, "gag_domain_slot") or "").strip()
+    dom_slot = None
+    try:
+        if dom_raw and dom_raw.lower() not in {"team", "default", "0"}:
+            dom_slot = int(dom_raw)
+    except Exception:
+        dom_slot = None
+    api_domain = (dom_slot + 4) if dom_slot in (1, 2, 3, 4) else None
+
+    return await generate_gag_url(
+        endpoint=gag_generate_endpoint(),
+        apikey=gag_key,
+        title=title,
+        price=p,
+        service=api_service,
+        name=prof_name,
+        address=prof_addr,
+        image=offer_image,
+        domain=api_domain,
+        version=gag_default_version(),
+    )
+
+
+async def _regenerate_gag_link_after_price(
+    bot,
+    chat_id: int,
+    tg_user_id: int,
+    *,
+    offer_id: int,
+    new_price: str,
+    anchor_message_id: int | None,
+    inbox_email: str,
+    contact_email: str,
+) -> tuple[bool, str]:
+    card: dict = {}
+    async with Session() as session:
+        user = await get_or_create_user(session, int(tg_user_id))
+        offer = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.id == int(offer_id))
+                .where(Offer.user_id == int(user.id))
+                .limit(1)
+            )
+        ).scalars().first()
+        if not offer:
+            return False, "Оффер не найден"
+
+        offer.price = new_price
+        await session.flush()
+
+        try:
+            gag_url = await _gag_generate_link_for_offer(session, user, offer, new_price)
+        except GAGError as e:
+            await session.rollback()
+            return False, str(e)
+
+        ad_url = (offer.link or "").strip()
+        if inbox_email and contact_email:
+            await _upsert_convlink(
+                session,
+                user_id=int(user.id),
+                inbox_email=inbox_email,
+                contact_email=contact_email,
+                ad_url=ad_url or None,
+                generated_link=gag_url,
+            )
+
+        await session.execute(
+            sa_update(IncomingMail)
+            .where(IncomingMail.user_id == int(user.id))
+            .where(IncomingMail.resolved_offer_id == int(offer.id))
+            .values(generated_link=gag_url)
+        )
+        await session.commit()
+
+        card = {
+            "offer_title": (offer.title or "").strip() or None,
+            "offer_price": new_price,
+            "photo_url": (offer.photo or "").strip() or None,
+            "profile_display": (
+                await get_user_setting(session, user, GAG_PROFILE_TITLE_KEY) or ""
+            ).strip()
+            or None,
+            "service_code": (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip(),
+            "link": gag_url,
+            "offer_id": int(offer.id),
+            "inbox_label": (getattr(user, "sender_name", None) or "").strip() or None,
+        }
+
+    await _send_generated_link_card_to_chat(
+        bot,
+        int(chat_id),
+        offer_title=card["offer_title"],
+        offer_price=card["offer_price"],
+        photo_url=card["photo_url"],
+        profile_display=card["profile_display"],
+        service_code=card["service_code"],
+        link=card["link"],
+        offer_id=card["offer_id"],
+        anchor_message_id=anchor_message_id,
+        account_email=inbox_email or None,
+        contact_email=contact_email or None,
+        inbox_label=card["inbox_label"],
+    )
+    return True, new_price
+
 
 class _OfferPriceState(StatesGroup):
     waiting_price = State()
@@ -2445,29 +2665,52 @@ async def cb_offer_price(callback: CallbackQuery, state: FSMContext):
     except Exception:
         return await callback.answer("Неверный ID", show_alert=True)
 
+    anchor: int | None = None
+    rt = callback.message.reply_to_message if callback.message else None
+    if rt and getattr(rt, "message_id", None):
+        anchor = int(rt.message_id)
+
+    inbox_email = contact_email = ""
     async with Session() as session:
-        offer = (await session.execute(sa_select(Offer).where(Offer.id == offer_id).limit(1))).scalars().first()
+        user = await get_or_create_user(session, int(callback.from_user.id))
+        offer = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.id == int(offer_id))
+                .where(Offer.user_id == int(user.id))
+                .limit(1)
+            )
+        ).scalars().first()
         if not offer:
             return await callback.answer("Оффер не найден", show_alert=True)
         current = (offer.price or "—").strip() or "—"
+        inbox_email, contact_email = await _resolve_offer_dialog_emails(session, int(user.id), int(offer_id))
+        if not anchor and inbox_email and contact_email:
+            conv = await _load_convlink_for_reply(
+                session,
+                user_id=int(user.id),
+                inbox_email=inbox_email,
+                contact_email=contact_email,
+            )
+            if conv and getattr(conv, "tg_message_id", None):
+                anchor = int(conv.tg_message_id)
 
     await state.clear()
     await state.set_state(_OfferPriceState.waiting_price)
     await state.update_data(
         offer_id=offer_id,
         chat_id=int(callback.message.chat.id),
-        msg_id=int(callback.message.message_id),
-        has_photo=bool(getattr(callback.message, "photo", None)),
+        anchor_message_id=anchor,
+        inbox_email=inbox_email,
+        contact_email=contact_email,
     )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open")]])
 
     await callback.message.answer(
         "💶 <b>Цена</b>\n\n"
         f"Текущая цена: <code>{_e(current)}</code>\n\n"
-        "Отправь новую цену (например: <code>30</code> или <code>30.0</code>).\n"
-        "Чтобы отменить — отправь <code>-</code>."
-        ,
+        "Отправь новую цену (например: <code>500</code> или <code>500.00 CHF</code>).\n"
+        "Бот пересоздаст GAG-ссылку и отправит её к письму.\n\n"
+        "Чтобы отменить — отправь <code>-</code>.",
         parse_mode="HTML",
     )
     await callback.answer()
@@ -2486,35 +2729,61 @@ async def offer_price_set(message: Message, state: FSMContext):
         await state.clear()
         return await message.answer("❌ Нет offer_id.")
 
-    # normalize number
-    num = None
-    try:
-        num = float(text.replace(",", "."))
-    except Exception:
-        num = None
-
-    if num is None:
-        return await message.answer("❌ Введи число (пример: 30 или 30.0) или '-' для отмены.")
-
-    new_price = f"€ {num}"
-
+    prev_price = ""
     async with Session() as session:
-        offer = (await session.execute(sa_select(Offer).where(Offer.id == offer_id).limit(1))).scalars().first()
-        if not offer:
-            await state.clear()
-            return await message.answer("❌ Оффер не найден.")
-        offer.price = new_price
-        await session.commit()
+        offer = (
+            await session.execute(sa_select(Offer).where(Offer.id == offer_id).limit(1))
+        ).scalars().first()
+        if offer:
+            prev_price = (offer.price or "").strip()
 
-    # Try to update the pinned card if possible (best-effort)
-    try:
-        chat_id = int(data.get("chat_id") or 0)
-        msg_id = int(data.get("msg_id") or 0)
-        if chat_id and msg_id:
-            # we don't have full card_text here; just notify in chat like reference
-            pass
-    except Exception:
-        pass
+    new_price = _format_gag_price_from_input(text, previous=prev_price)
+    if not new_price:
+        return await message.answer(
+            "❌ Введи число (пример: <code>500</code> или <code>500.00 CHF</code>) или <code>-</code> для отмены.",
+            parse_mode="HTML",
+        )
+
+    chat_id = int(data.get("chat_id") or message.chat.id)
+    anchor = data.get("anchor_message_id")
+    anchor_id = int(anchor) if anchor else None
+    inbox_email = _canon_email(str(data.get("inbox_email") or ""))
+    contact_email = _canon_email(str(data.get("contact_email") or ""))
+    tg_id = int(message.from_user.id)
 
     await state.clear()
-    await message.answer(f"✅ Цена товара с ID {offer_id} была изменена на {new_price}")
+
+    if bg_is_running(tg_id, "gag_link"):
+        return await message.answer("⏳ Ссылка уже создаётся… подождите.")
+
+    await message.answer("⏳ Пересоздаю ссылку с новой ценой…")
+
+    bot = message.bot
+
+    async def _job() -> None:
+        ok, info = await _regenerate_gag_link_after_price(
+            bot,
+            chat_id,
+            tg_id,
+            offer_id=offer_id,
+            new_price=new_price,
+            anchor_message_id=anchor_id,
+            inbox_email=inbox_email,
+            contact_email=contact_email,
+        )
+        if ok:
+            await bot.send_message(
+                chat_id,
+                f"✅ Цена обновлена: <code>{_e(info)}</code>\nНовая ссылка прикреплена к письму.",
+                parse_mode="HTML",
+                reply_to_message_id=anchor_id,
+            )
+        else:
+            await bot.send_message(
+                chat_id,
+                f"❌ Не удалось пересоздать ссылку:\n<code>{_e(info)}</code>",
+                parse_mode="HTML",
+            )
+
+    if not bg_start(tg_id, "gag_link", _job()):
+        await message.answer("⏳ Ссылка уже создаётся…")
