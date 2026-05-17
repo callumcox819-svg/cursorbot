@@ -17,27 +17,27 @@ class ProxyManager:
 
     @staticmethod
     def parse_proxy_string(proxy_str: str):
-        """
-        Ожидаемый формат:
-        proxy.loma.host:38174:login:password
-        """
-        parts = proxy_str.strip().split(":")
-        if len(parts) < 2:
-            raise ValueError("Неверный формат прокси. Нужно host:port[:login:password]")
+        """host:port:user:pass, user:pass@host:port, socks5://… — см. handlers.proxies."""
+        from handlers.proxies import parse_proxy_string as parse_line
 
-        host = parts[0]
-        port = int(parts[1])
-        username = parts[2] if len(parts) >= 3 else None
-        password = ":".join(parts[3:]) if len(parts) >= 4 else None
-
-        return host, port, username, password
+        parsed = parse_line((proxy_str or "").strip())
+        if not parsed:
+            raise ValueError(
+                "Неверный формат. Примеры: user:pass@ip:port или ip:port:user:pass"
+            )
+        return (
+            parsed["host"],
+            int(parsed["port"]),
+            parsed.get("username"),
+            parsed.get("password"),
+        )
 
     @staticmethod
     async def add_proxy(
         session: AsyncSession,
         user_id: int,
         proxy_str: str,
-        proxy_type: str = "http",
+        proxy_type: str = "socks5",
     ) -> Proxy:
         host, port, username, password = ProxyManager.parse_proxy_string(proxy_str)
 

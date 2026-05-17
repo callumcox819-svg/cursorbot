@@ -154,13 +154,13 @@ def apply_proxy_to_smtplib(proxy: Proxy) -> None:
     logger.info("SMTP SOCKS5 applied: %s:%s rdns=True", host, port)
 
 
-async def test_smtp_tunnel_async(proxy: Proxy, *, timeout: int = 12) -> tuple[bool, str]:
+async def test_smtp_tunnel_async(proxy: Proxy, *, timeout: int = 20) -> tuple[bool, str]:
     """SMTP-проверка под lock — без гонок при параллельных тестах."""
     async with _PROXY_LOCK:
         return await asyncio.to_thread(test_smtp_tunnel_sync, proxy, timeout=timeout)
 
 
-def test_smtp_tunnel_sync(proxy: Proxy, *, timeout: int = 12) -> tuple[bool, str]:
+def test_smtp_tunnel_sync(proxy: Proxy, *, timeout: int = 20) -> tuple[bool, str]:
     """Проверка как при рассылке: SOCKS5 → SMTP :587."""
     if not is_socks5_proxy(proxy):
         return False, "Только SOCKS5 прокси"

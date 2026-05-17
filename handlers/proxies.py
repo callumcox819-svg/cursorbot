@@ -584,7 +584,7 @@ async def _proxy_add_work(
                 continue
 
             try:
-                ok, info = await asyncio.wait_for(test_proxy(parsed, timeout=10), timeout=25)
+                ok, info = await asyncio.wait_for(test_proxy(parsed, timeout=22), timeout=55)
             except asyncio.TimeoutError:
                 ok, info = False, "Timeout: проверка прокси заняла слишком долго"
             except Exception as e:
@@ -752,7 +752,7 @@ async def proxies_check_all(callback: CallbackQuery) -> None:
 
     async def _run_bulk_check() -> None:
         concurrency = max(1, min(3, int(os.getenv("PROXY_CHECK_CONCURRENCY", "2"))))
-        check_timeout = max(6, min(12, int(os.getenv("PROXY_CHECK_TIMEOUT", "8"))))
+        check_timeout = max(12, min(25, int(os.getenv("PROXY_CHECK_TIMEOUT", "22"))))
         ok_n = fail_n = 0
         try:
             async with Session() as session:
@@ -819,13 +819,13 @@ async def proxy_test(callback: CallbackQuery):
     if not proxy:
         return
 
-    check_timeout = max(6, min(12, int(os.getenv("PROXY_CHECK_TIMEOUT", "8"))))
+    check_timeout = max(12, min(25, int(os.getenv("PROXY_CHECK_TIMEOUT", "22"))))
 
     async def run() -> None:
         try:
             ok, info = await asyncio.wait_for(
                 test_proxy(proxy, timeout=check_timeout),
-                timeout=check_timeout * 2 + 10,
+                timeout=check_timeout * 2 + 12,
             )
         except asyncio.TimeoutError:
             ok, info = False, "Timeout: проверка заняла слишком долго"

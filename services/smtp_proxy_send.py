@@ -36,34 +36,50 @@ async def send_email_via_account_with_proxy(
     sender_name: Optional[str] = None,
     is_html: Optional[bool] = None,
 ) -> Tuple[bool, Optional[str]]:
-    proxy, err = await choose_required_proxy(session, user_id)
-    if err:
+    last_err: str | None = None
+    tried_ids: set[int] = set()
+
+    for _attempt in range(3):
+        proxy, err = await choose_required_proxy(session, user_id)
+        if err:
+            return False, err
+        pid = int(proxy.id)
+        if pid in tried_ids:
+            break
+        tried_ids.add(pid)
+
+        async with ProxySMTPContext(proxy):
+            ok, err = await send_email_via_account(
+                account,
+                to_email,
+                subject,
+                body,
+                sender_name=sender_name,
+                is_html=is_html,
+            )
+        err = normalize_send_error(err)
+        if ok:
+            return True, err
+
+        last_err = err
+        if is_definite_proxy_failure(err):
+            try:
+                await ProxyManager.note_proxy_failure(
+                    session, pid, (err or "")[:500], deactivate=True
+                )
+            except Exception:
+                pass
+        elif is_proxy_error_marker(err):
+            try:
+                await ProxyManager.note_proxy_failure(
+                    session, pid, (err or "")[:500], deactivate=False
+                )
+            except Exception:
+                pass
+            continue
         return False, err
-    async with ProxySMTPContext(proxy):
-        ok, err = await send_email_via_account(
-            account,
-            to_email,
-            subject,
-            body,
-            sender_name=sender_name,
-            is_html=is_html,
-        )
-    err = normalize_send_error(err)
-    if not ok and is_definite_proxy_failure(err):
-        try:
-            await ProxyManager.note_proxy_failure(
-                session, int(proxy.id), (err or "")[:500], deactivate=True
-            )
-        except Exception:
-            pass
-    elif not ok and is_proxy_error_marker(err):
-        try:
-            await ProxyManager.note_proxy_failure(
-                session, int(proxy.id), (err or "")[:500], deactivate=False
-            )
-        except Exception:
-            pass
-    return ok, err
+
+    return False, last_err
 
 
 async def send_batch_via_account_with_proxy(

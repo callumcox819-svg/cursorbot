@@ -7,9 +7,6 @@ import logging
 from typing import Any, Tuple
 from urllib.parse import urlsplit
 
-import aiohttp
-from aiohttp_socks import ProxyConnector  # type: ignore
-
 from models import Proxy
 
 logger = logging.getLogger(__name__)
@@ -60,18 +57,49 @@ def is_socks5_type(proxy_type: str) -> bool:
     return normalize_proxy_type(proxy_type) in _SOCKS5_SCHEMES
 
 
-async def _test_socks5_handshake(proxy_url: str, *, timeout: int = 10) -> Tuple[bool, str]:
-    """Быстрая проверка SOCKS5 (httpbin через туннель)."""
-    timeout_cfg = aiohttp.ClientTimeout(total=timeout)
-    connector = ProxyConnector.from_url(proxy_url)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout_cfg, connector=connector) as session:
-            async with session.get("http://httpbin.org/ip") as resp:
-                if resp.status < 400:
-                    return True, f"SOCKS5 OK ({resp.status})"
-                return False, f"SOCKS5 HTTP status {resp.status}"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+def _test_socks5_connect_sync(d: dict[str, Any], *, timeout: int = 12) -> Tuple[bool, str]:
+    """Быстрая проверка SOCKS5 через PySocks (тот же стек, что и рассылка)."""
+    import socks
+
+    host = (d.get("host") or "").strip()
+    port = int(d.get("port") or 0)
+    if not host or not port:
+        return False, "host/port пустые"
+
+    username = (d.get("username") or "").strip() or None
+    password = (d.get("password") or "").strip() or None
+
+    targets = (("smtp.gmail.com", 587), ("httpbin.org", 80))
+    last_err = ""
+
+    for thost, tport in targets:
+        s = socks.socksocket()
+        try:
+            s.set_proxy(
+                socks.SOCKS5,
+                host,
+                port,
+                username=username,
+                password=password,
+                rdns=True,
+            )
+            s.settimeout(float(timeout))
+            s.connect((thost, int(tport)))
+            return True, f"SOCKS5 OK -> {thost}:{tport}"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    return False, last_err or "SOCKS5 connect failed"
+
+
+async def _test_socks5_handshake(proxy: Proxy | dict[str, Any], *, timeout: int = 12) -> Tuple[bool, str]:
+    d = proxy_to_dict(proxy)
+    return await asyncio.to_thread(_test_socks5_connect_sync, d, timeout=timeout)
 
 
 def _proxy_row_from_dict(d: dict[str, Any]) -> Proxy:
@@ -84,18 +112,17 @@ def _proxy_row_from_dict(d: dict[str, Any]) -> Proxy:
     )
 
 
-async def test_smtp_tunnel(proxy: Proxy | dict[str, Any], *, timeout: int = 12) -> Tuple[bool, str]:
+async def test_smtp_tunnel(proxy: Proxy | dict[str, Any], *, timeout: int = 20) -> Tuple[bool, str]:
     from proxy_manager import test_smtp_tunnel_async
 
     row = _proxy_row_from_dict(proxy_to_dict(proxy))
     return await test_smtp_tunnel_async(row, timeout=timeout)
 
 
-async def test_proxy(proxy: Proxy | dict[str, Any], *, timeout: int = 10) -> Tuple[bool, str]:
+async def test_proxy(proxy: Proxy | dict[str, Any], *, timeout: int = 20) -> Tuple[bool, str]:
     """
-    Только SOCKS5:
-    1) SOCKS5 туннель (httpbin)
-    2) SMTP :587 через PySocks (как /send)
+    Только SOCKS5. Для рассылки решающий тест — SMTP :587 (как /send).
+    SOCKS5-handshake — дополнительная диагностика (PySocks, не aiohttp).
     """
     d = proxy_to_dict(proxy)
     ptype = normalize_proxy_type(d.get("type"))
@@ -103,20 +130,24 @@ async def test_proxy(proxy: Proxy | dict[str, Any], *, timeout: int = 10) -> Tup
     if not is_socks5_type(ptype):
         return False, "Только SOCKS5. HTTP/HTTPS не поддерживаются для рассылки."
 
-    proxy_url = build_proxy_url(d)
-    socks_ok, socks_info = await _test_socks5_handshake(proxy_url, timeout=timeout)
-    smtp_ok, smtp_info = await test_smtp_tunnel(proxy, timeout=timeout)
+    smtp_timeout = max(12, int(timeout))
+    socks_timeout = max(8, min(smtp_timeout, 15))
 
-    if socks_ok and smtp_ok:
-        return True, f"{socks_info} · {smtp_info}"
-    if socks_ok and not smtp_ok:
-        return False, f"SOCKS5 OK, SMTP нет: {smtp_info}"
-    if not socks_ok and smtp_ok:
-        return False, f"SMTP OK, SOCKS5 нет: {socks_info}"
-    return False, f"SOCKS5: {socks_info} · SMTP: {smtp_info}"
+    smtp_ok, smtp_info = await test_smtp_tunnel(proxy, timeout=smtp_timeout)
+    socks_ok, socks_info = await _test_socks5_handshake(proxy, timeout=socks_timeout)
+
+    # Рассылка идёт через PySocks→SMTP — если SMTP OK, прокси рабочий.
+    if smtp_ok:
+        if socks_ok:
+            return True, f"{smtp_info} · {socks_info}"
+        return True, smtp_info
+
+    if socks_ok:
+        return False, f"SOCKS подключается, SMTP нет: {smtp_info}"
+    return False, f"SOCKS: {socks_info} · SMTP: {smtp_info}"
 
 
-async def test_proxy_url(proxy_url: str, *, timeout: int = 10) -> Tuple[bool, str]:
+async def test_proxy_url(proxy_url: str, *, timeout: int = 20) -> Tuple[bool, str]:
     p = (proxy_url or "").strip()
     scheme = normalize_proxy_type(urlsplit(p).scheme or "socks5")
     if not is_socks5_type(scheme):
@@ -138,7 +169,7 @@ async def refresh_proxies_status(
     user_id: int,
     *,
     concurrency: int = 10,
-    timeout: int = 10,
+    timeout: int = 20,
 ) -> tuple[int, int, int]:
     from sqlalchemy import select as sa_select
 
@@ -153,14 +184,14 @@ async def refresh_proxies_status(
     sem = asyncio.Semaphore(max(1, concurrency))
     results: list[tuple[Proxy, bool, str]] = []
 
-    per_proxy_timeout = max(8, int(timeout))
+    per_proxy_timeout = max(12, int(timeout))
 
     async def _one(p: Proxy) -> None:
         async with sem:
             try:
                 ok, info = await asyncio.wait_for(
                     test_proxy(p, timeout=per_proxy_timeout),
-                    timeout=per_proxy_timeout * 2 + 8,
+                    timeout=per_proxy_timeout * 2 + 10,
                 )
             except asyncio.TimeoutError:
                 ok, info = False, "Timeout: проверка прокси заняла слишком долго"
