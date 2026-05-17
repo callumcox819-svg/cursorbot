@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
@@ -69,6 +69,10 @@ class ReplyNotifyCtx:
     body_text: str
     is_preset: bool = False
     is_html: bool = False
+    is_link: bool = False
+    inbox_label: str | None = None
+    html_attachment: str | None = None
+    html_filename: str | None = None
     cleanup_message_ids: list[int] = field(default_factory=list)
 
 
@@ -91,40 +95,98 @@ async def _delete_message_safe(bot, chat_id: int, message_id: int | None) -> Non
         pass
 
 
+def _resolve_mail_anchor(
+    acc_id: int,
+    uid: str,
+    meta: dict | None,
+    callback_message: Message | None,
+) -> int | None:
+    """ID карточки входящего в Telegram (для reply_to)."""
+    if callback_message and getattr(callback_message, "message_id", None):
+        return int(callback_message.message_id)
+    m = meta or {}
+    anchor = m.get("tg_card_message_id")
+    if anchor:
+        return int(anchor)
+    fm = FULL_META.get((int(acc_id), str(uid))) or {}
+    anchor = fm.get("tg_card_message_id")
+    if anchor:
+        return int(anchor)
+    return None
+
+
 async def _notify_reply_sent(bot, chat_id: int, ctx: ReplyNotifyCtx) -> None:
     for mid in ctx.cleanup_message_ids:
         await _delete_message_safe(bot, chat_id, mid)
 
-    preview = _preview_reply_body(ctx.body_text, is_html=ctx.is_html)
     from_acc = _e(ctx.account_email or "—")
     to_addr = _e(ctx.to_email or "—")
     incoming = _e(ctx.incoming_from or ctx.to_email or "—")
+    anchor = int(ctx.anchor_message_id)
+    label = (ctx.inbox_label or "").strip()
+    head_inbox = ""
+    if label:
+        head_inbox = f'⚡️ Получено сообщение на "<b>{_e(label)}</b>" <code>{from_acc}</code>\n'
 
-    main = (
-        f"⚡️ <code>{from_acc}</code> — <b>{_e(preview)}</b> — <code>{to_addr}</code>\n\n"
-        f"успешно отправлен на <code>{to_addr}</code> с аккаунта <code>{from_acc}</code> ⚡️\n"
-        f"От кого было входящее: <code>{incoming}</code>"
-    )
+    if ctx.is_html:
+        main = (
+            f"{head_inbox}"
+            f"⚡️ Ответ: <b>[HTML]</b> успешно отправлен на <code>{to_addr}</code> "
+            f"с аккаунта <code>{from_acc}</code> ⚡️\n"
+            f"От кого было входящее: <code>{incoming}</code>"
+        )
+    else:
+        preview = _preview_reply_body(ctx.body_text, is_html=False)
+        main = (
+            f"{head_inbox}"
+            f"⚡️ <code>{from_acc}</code> — <b>{_e(preview)}</b> — <code>{to_addr}</code>\n\n"
+            f"успешно отправлен на <code>{to_addr}</code> с аккаунта <code>{from_acc}</code> ⚡️\n"
+            f"От кого было входящее: <code>{incoming}</code>"
+        )
 
     try:
         await bot.send_message(
             int(chat_id),
             main,
             parse_mode="HTML",
-            reply_to_message_id=int(ctx.anchor_message_id),
+            reply_to_message_id=anchor,
         )
     except Exception:
         await bot.send_message(int(chat_id), main, parse_mode="HTML")
 
+    if ctx.is_html and ctx.html_attachment:
+        fname = (ctx.html_filename or "reply.html").strip() or "reply.html"
+        try:
+            doc = BufferedInputFile(
+                ctx.html_attachment.encode("utf-8"),
+                filename=fname,
+            )
+            await bot.send_document(
+                int(chat_id),
+                doc,
+                caption="📄 HTML, который был отправлен",
+                reply_to_message_id=anchor,
+            )
+        except Exception:
+            pass
+
+    footer: str | None = None
     if ctx.is_preset:
+        footer = "✅ Пресет отправлен"
+    elif ctx.is_html:
+        footer = "✅ HTML отправлен"
+    elif ctx.is_link:
+        footer = "✅ Ссылка создана"
+
+    if footer:
         try:
             await bot.send_message(
                 int(chat_id),
-                "✅ Пресет отправлен",
-                reply_to_message_id=int(ctx.anchor_message_id),
+                footer,
+                reply_to_message_id=anchor,
             )
         except Exception:
-            await bot.send_message(int(chat_id), "✅ Пресет отправлен")
+            await bot.send_message(int(chat_id), footer)
 
 
 def _reply_notify_from_state(
@@ -198,6 +260,7 @@ def _reply_notify_build(
         body_text=body_text,
         is_preset=is_preset,
         is_html=is_html,
+        inbox_label=(state_data.get("inbox_label") or "").strip() or None,
         cleanup_message_ids=cleanup,
     )
 
@@ -270,6 +333,7 @@ async def _bg_incoming_smtp(
     coro_fn,
     *,
     notify: ReplyNotifyCtx | None = None,
+    notify_builder=None,
 ) -> bool:
     """SMTP в фоне — polling не блокируется."""
     try:
@@ -294,8 +358,14 @@ async def _bg_incoming_smtp(
         except Exception as e:
             ok, err = False, f"{type(e).__name__}: {e}"
         if ok:
-            if notify:
-                await _notify_reply_sent(bot, chat_id, notify)
+            ctx = notify
+            if notify_builder:
+                try:
+                    ctx = await notify_builder()
+                except Exception:
+                    pass
+            if ctx:
+                await _notify_reply_sent(bot, chat_id, ctx)
             else:
                 await bot.send_message(chat_id, "✅ Отправлено.", parse_mode="HTML")
         else:
@@ -317,6 +387,7 @@ async def _bg_message_smtp(
     coro_fn,
     *,
     notify: ReplyNotifyCtx | None = None,
+    notify_builder=None,
 ) -> bool:
     """SMTP из текстового ответа — в фоне."""
     if bg_is_running(user_id, "smtp"):
@@ -334,8 +405,14 @@ async def _bg_message_smtp(
         except Exception as e:
             ok, err = False, f"{type(e).__name__}: {e}"
         if ok:
-            if notify:
-                await _notify_reply_sent(bot, chat_id, notify)
+            ctx = notify
+            if notify_builder:
+                try:
+                    ctx = await notify_builder()
+                except Exception:
+                    pass
+            if ctx:
+                await _notify_reply_sent(bot, chat_id, ctx)
             else:
                 await bot.send_message(chat_id, "✅ Отправлено.", parse_mode="HTML")
         else:
@@ -555,12 +632,32 @@ async def _send_generated_link_card(
     service_code: str,
     link: str,
     offer_id: int | None = None,
+    anchor_message_id: int | None = None,
+    account_email: str | None = None,
+    contact_email: str | None = None,
+    inbox_label: str | None = None,
 ):
-    """Send the link generation card exactly like reference style (photo + fields + optional price button)."""
+    """Карточка GAG-ссылки — reply к исходному письму (как пресет/HTML)."""
     service_label = _service_label_for_card(service_code)
+    chat_id = int(callback.message.chat.id)
+    bot = callback.bot
+    reply_to = int(anchor_message_id) if anchor_message_id else None
+
+    from_acc = _e((account_email or "").strip() or "—")
+    to_addr = _e((contact_email or "").strip() or "—")
+    label = (inbox_label or "").strip()
+    head = ""
+    if label and reply_to:
+        head = f'⚡️ Получено сообщение на "<b>{_e(label)}</b>" <code>{from_acc}</code>\n'
+    if reply_to:
+        head += (
+            f"⚡️ <code>{from_acc}</code> — <b>ссылка создана</b> — <code>{to_addr}</code>\n"
+            f"От кого было входящее: <code>{to_addr}</code>\n\n"
+        )
 
     card_text = (
-        f"📣 <b>Объявления » { _e(service_label) }</b>\n\n"
+        f"{head}"
+        f"📣 <b>Объявления » {_e(service_label)}</b>\n\n"
         f"📌 <b>Название:</b> {_e((offer_title or '').strip()) or '—'}\n"
         f"💰 <b>Цена:</b> {_e((offer_price or '').strip()) or '—'}\n"
         f"👤 <b>Профиль:</b> <code>{_e((profile_display or '').strip()) or '—'}</code>\n\n"
@@ -575,24 +672,41 @@ async def _send_generated_link_card(
             inline_keyboard=[[InlineKeyboardButton(text="💶 Цена", callback_data=f"offer_price:{offer_id}")]]
         )
 
-    # Per requirement: photo must be shown (do not silently downgrade).
     p = (photo_url or "").strip()
     if not p:
-        await callback.message.answer("❌ Нет фото объявления (photo).")
+        await bot.send_message(chat_id, "❌ Нет фото объявления (photo).", reply_to_message_id=reply_to)
         return
 
     try:
-        sent = await callback.message.answer_photo(
+        await bot.send_photo(
+            chat_id=chat_id,
             photo=p,
             caption=card_text,
             parse_mode="HTML",
             reply_markup=price_kb,
+            reply_to_message_id=reply_to,
         )
     except Exception:
-        await callback.message.answer("❌ Не удалось отправить фото объявления.")
+        await bot.send_message(
+            chat_id,
+            "❌ Не удалось отправить фото объявления.",
+            reply_to_message_id=reply_to,
+        )
         return
 
-    await _try_pin(callback.bot, callback.message.chat.id, sent.message_id)
+    if reply_to:
+        try:
+            await bot.send_message(
+                chat_id,
+                "✅ Ссылка создана",
+                reply_to_message_id=reply_to,
+            )
+        except Exception:
+            await bot.send_message(chat_id, "✅ Ссылка создана")
+        try:
+            await _try_pin(bot, chat_id, reply_to)
+        except Exception:
+            pass
 
 
 def _norm_subject_for_match(subject: str) -> str:
@@ -1273,6 +1387,11 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
             pass
         await session.commit()
 
+        mail_uid = str(getattr(mail, "imap_uid", "") or "")
+        meta_fm = FULL_META.get((acc_id, mail_uid)) or {}
+        anchor = _resolve_mail_anchor(acc_id, mail_uid, meta_fm, callback.message)
+        inbox_label = (getattr(tg_user, "sender_name", None) or "").strip()
+
         await _send_generated_link_card(
             callback=callback,
             offer_title=offer_title or title,
@@ -1282,6 +1401,10 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
             service_code=service,
             link=gag_url,
             offer_id=offer_id,
+            anchor_message_id=anchor,
+            account_email=inbox_email,
+            contact_email=contact_email,
+            inbox_label=inbox_label or None,
         )
         await callback.answer()
 
@@ -1515,6 +1638,9 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
                 pass
         await session.commit()
 
+        inbox_label = (getattr(user, "sender_name", None) or "").strip()
+        anchor = _resolve_mail_anchor(acc_id, uid, meta, callback.message)
+
         await _send_generated_link_card(
             callback=callback,
             offer_title=offer_title or title,
@@ -1524,6 +1650,10 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
             service_code=service,
             link=gag_url,
             offer_id=offer_id,
+            anchor_message_id=anchor,
+            account_email=inbox_email,
+            contact_email=contact_email,
+            inbox_label=inbox_label or None,
         )
         await callback.answer("Готово ✅")
 
@@ -1743,6 +1873,11 @@ def _reply_subject(subject: str) -> str:
     return f"Re: {subj_norm}" if subj_norm else "Re:"
 
 
+def _html_attachment_filename(subject: str) -> str:
+    base = re.sub(r"[^\w\-]+", "_", (subject or "reply")[:60]).strip("_") or "reply"
+    return f"{base}.html"
+
+
 def _html_nick_key_for_service(service: str) -> str:
     service = (service or "").strip()
     return f"html_nick_{service}" if service else HTML_NICK_KEY
@@ -1826,6 +1961,7 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
     mail_uid = uid
     tg_id = int(callback.from_user.id)
     html_kind_label = kind.upper()
+    sent_pkg: dict = {}
 
     async with Session() as session:
         user_pre = await get_or_create_user(session, tg_id)
@@ -1911,6 +2047,8 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
             html_body = apply_placeholders(html_body, link=link, ctx=ctx)
+            sent_pkg["html"] = html_body
+            sent_pkg["subject"] = subject
 
             return await send_email_via_account_with_proxy(
                 session,
@@ -1931,18 +2069,26 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
             db_user_id = int(u.id)
     except Exception:
         pass
-    notify = await _reply_notify_build_async(
-        acc_id=acc_id,
-        uid=uid,
-        meta=meta_fm,
-        state_data=data,
-        body_text=f"HTML ({html_kind_label})",
-        is_html=True,
-        extra_cleanup=[callback.message.message_id],
-        user_id=db_user_id,
-    )
+
+    async def _notify_builder() -> ReplyNotifyCtx | None:
+        n = await _reply_notify_build_async(
+            acc_id=acc_id,
+            uid=uid,
+            meta=meta_fm,
+            state_data=data,
+            body_text=f"HTML ({html_kind_label})",
+            is_html=True,
+            extra_cleanup=[callback.message.message_id],
+            user_id=db_user_id,
+        )
+        if not n:
+            return None
+        n.html_attachment = sent_pkg.get("html")
+        n.html_filename = _html_attachment_filename(sent_pkg.get("subject") or subject_raw)
+        return n
+
     await state.clear()
-    if not await _bg_incoming_smtp(callback, tg_id, _send, notify=notify):
+    if not await _bg_incoming_smtp(callback, tg_id, _send, notify_builder=_notify_builder):
         return
 
 
@@ -2025,6 +2171,7 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
     tg_id = int(message.from_user.id)
     html_text = text
     body_for_notify = _preview_reply_body(html_text, is_html=True)
+    sent_pkg: dict = {}
 
     async def _send() -> tuple[bool, str | None]:
         async with Session() as session:
@@ -2088,6 +2235,8 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
             html_body = apply_placeholders(html_body, link=link, ctx=ctx)
+            sent_pkg["html"] = html_body
+            sent_pkg["subject"] = subject
 
             return await send_email_via_account_with_proxy(
                 session,
@@ -2100,22 +2249,30 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
                 sender_name=sender_name,
             )
 
-    meta_fm = FULL_META.get((acc_id, uid)) or {}
+    meta_fm = FULL_META.get((acc_id, mail_uid)) or {}
     db_user_id: int | None = None
     async with Session() as session:
         user = await get_or_create_user(session, tg_id)
         db_user_id = int(user.id)
-    notify = await _reply_notify_build_async(
-        acc_id=acc_id,
-        uid=uid,
-        meta=meta_fm,
-        state_data=data,
-        body_text=body_for_notify,
-        is_html=True,
-        user_id=db_user_id,
-    )
+
+    async def _notify_builder() -> ReplyNotifyCtx | None:
+        n = await _reply_notify_build_async(
+            acc_id=acc_id,
+            uid=mail_uid,
+            meta=meta_fm,
+            state_data=data,
+            body_text=body_for_notify,
+            is_html=True,
+            user_id=db_user_id,
+        )
+        if not n:
+            return None
+        n.html_attachment = sent_pkg.get("html")
+        n.html_filename = _html_attachment_filename(sent_pkg.get("subject") or subject_raw)
+        return n
+
     await state.clear()
-    await _bg_message_smtp(message, tg_id, _send, notify=notify)
+    await _bg_message_smtp(message, tg_id, _send, notify_builder=_notify_builder)
 
 
 @router.callback_query(F.data.startswith("mail_info:"))
