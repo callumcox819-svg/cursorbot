@@ -225,7 +225,7 @@ async def start_sending(message: Message):
     await tg_answer_safe(message, "⏳ Проверяю очередь, аккаунты и прокси…")
 
     async with db_session() as session:
-        db_user = await get_or_create_user(session, tg_user_id)
+        db_user = await get_or_create_user(session, int(tg_user_id))
         timing = await load_timing(session, tg_user_id)
 
         db_user_id = db_user.id
@@ -410,11 +410,11 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
     smtp_sem = asyncio.Semaphore(SMTP_CONCURRENCY_WITH_PROXY)
     entered_main_loop = False
     fail_streak: dict[int, int] = {}
+    acc_idx = 0
 
-    async with async_session() as session:
+    async with db_session() as session:
         user = await get_or_create_user(session, tg_user_id)
         db_user_id = user.id
-        sender_name = getattr(user, "sender_name", None)
 
         accounts = await _get_active_accounts(session, db_user_id)
         if not accounts:
@@ -447,75 +447,25 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
         max_delay = float(timing.get("max_delay", 3.0))
         batch_size = int(timing.get("batch_size", 1))
 
-        try:
+    try:
+        while True:
+            await asyncio.sleep(0)
+            entered_main_loop = True
+            state = get_sending_state(tg_user_id) or state
+            if state.is_stopping:
+                state.is_running = False
+                set_sending_state(tg_user_id, state=state)
+                break
 
-            async def _send_one_with_timeout(acc: EmailAccount, tgt: OfferEmail) -> Tuple[bool, str]:
-                try:
-                    subject, body = await _build_message_for_target(session, tg_user_id, tgt)
-                    to_addr = (tgt.email or "").strip()
+            async with db_session() as session:
+                user = await get_or_create_user(session, tg_user_id)
+                db_user_id = int(user.id)
+                sender_name = getattr(user, "sender_name", None)
 
-                    async with smtp_sem:
-                        ok, err, _msgid = await asyncio.wait_for(
-                            send_email_via_account_with_proxy(
-                                session,
-                                db_user_id,
-                                acc,
-                                to_addr,
-                                subject,
-                                body,
-                                sender_name=sender_name,
-                            ),
-                            timeout=SEND_ONE_TIMEOUT,
-                        )
-                    return bool(ok), (err or "")
-
-                except asyncio.TimeoutError:
-                    return False, normalize_send_error(
-                        f"SMTP_TIMEOUT|timeout|SMTP send exceeded {SEND_ONE_TIMEOUT}s (send_one)"
-                    )
-                except Exception as e:
-                    return False, normalize_send_error(str(e))
-
-            async def _send_batch_with_timeout(acc: EmailAccount, batch: List[OfferEmail]) -> List[Tuple[bool, str]]:
-                try:
-                    items: list[tuple[str, str, str]] = []
-                    for t in batch:
-                        subj, body = await _build_message_for_target(session, tg_user_id, t)
-                        items.append(((t.email or "").strip(), subj, body))
-
-                    async with smtp_sem:
-                        res = await asyncio.wait_for(
-                            send_batch_via_account_with_proxy(
-                                session,
-                                db_user_id,
-                                acc,
-                                items,
-                                sender_name=sender_name,
-                            ),
-                            timeout=SEND_BATCH_TIMEOUT,
-                        )
-
-                    out: List[Tuple[bool, str]] = []
-                    for ok, err in res:
-                        out.append((bool(ok), (err or "")))
-                    return out
-
-                except asyncio.TimeoutError:
-                    err = normalize_send_error(
-                        f"SMTP_TIMEOUT|timeout|SMTP batch exceeded {SEND_BATCH_TIMEOUT}s (send_batch)"
-                    )
-                    return [(False, err) for _ in batch]
-                except Exception as e:
-                    err = normalize_send_error(str(e))
-                    return [(False, err) for _ in batch]
-
-            acc_idx = 0
-
-            while True:
-                entered_main_loop = True
-                state = get_sending_state(tg_user_id) or state
-                if state.is_stopping:
+                accounts = await _get_active_accounts(session, db_user_id)
+                if not accounts:
                     state.is_running = False
+                    state.last_status = "STOPPED"
                     set_sending_state(tg_user_id, state=state)
                     break
 
@@ -538,40 +488,80 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
 
                 if batch_size <= 1:
                     tgt = targets[0]
-                    ok, err = await _send_one_with_timeout(acc, tgt)
+                    try:
+                        subject, body = await _build_message_for_target(session, tg_user_id, tgt)
+                        to_addr = (tgt.email or "").strip()
+                        async with smtp_sem:
+                            ok, err, _msgid = await asyncio.wait_for(
+                                send_email_via_account_with_proxy(
+                                    session,
+                                    db_user_id,
+                                    acc,
+                                    to_addr,
+                                    subject,
+                                    body,
+                                    sender_name=sender_name,
+                                ),
+                                timeout=SEND_ONE_TIMEOUT,
+                            )
+                    except asyncio.TimeoutError:
+                        ok, err = False, normalize_send_error(
+                            f"SMTP_TIMEOUT|timeout|SMTP send exceeded {SEND_ONE_TIMEOUT}s"
+                        )
+                    except Exception as e:
+                        ok, err = False, normalize_send_error(str(e))
+
                     if ok:
                         state.sent_count += 1
                         fail_streak.pop(int(tgt.id), None)
                         await _purge_target(session, db_user_id, tgt.id)
-                    else:
-                        if await _handle_send_failure(
-                            session=session,
-                            db_user_id=db_user_id,
-                            state=state,
-                            tgt=tgt,
-                            err=err or "UNKNOWN",
-                            fail_streak=fail_streak,
-                            acc=acc,
-                            bot=bot,
-                            chat_id=chat_id,
-                        ):
-                            accounts[:] = [a for a in accounts if int(a.id) != int(acc.id)]
-                            if not accounts:
-                                state.is_running = False
-                                state.last_status = "STOPPED"
-                                set_sending_state(tg_user_id, state=state)
-                                break
+                    elif await _handle_send_failure(
+                        session=session,
+                        db_user_id=db_user_id,
+                        state=state,
+                        tgt=tgt,
+                        err=err or "UNKNOWN",
+                        fail_streak=fail_streak,
+                        acc=acc,
+                        bot=bot,
+                        chat_id=chat_id,
+                    ):
+                        pass
 
                 else:
                     batch = targets[:batch_size]
-                    results = await _send_batch_with_timeout(acc, batch)
+                    try:
+                        items: list[tuple[str, str, str]] = []
+                        for t in batch:
+                            subj, body = await _build_message_for_target(session, tg_user_id, t)
+                            items.append(((t.email or "").strip(), subj, body))
+                        async with smtp_sem:
+                            results = await asyncio.wait_for(
+                                send_batch_via_account_with_proxy(
+                                    session,
+                                    db_user_id,
+                                    acc,
+                                    items,
+                                    sender_name=sender_name,
+                                ),
+                                timeout=SEND_BATCH_TIMEOUT,
+                            )
+                    except asyncio.TimeoutError:
+                        err = normalize_send_error(
+                            f"SMTP_TIMEOUT|timeout|SMTP batch exceeded {SEND_BATCH_TIMEOUT}s"
+                        )
+                        results = [(False, err) for _ in batch]
+                    except Exception as e:
+                        err = normalize_send_error(str(e))
+                        results = [(False, err) for _ in batch]
+
                     for t, (ok, err) in zip(batch, results):
                         if ok:
                             state.sent_count += 1
                             fail_streak.pop(int(t.id), None)
                             await _purge_target(session, db_user_id, t.id)
                         else:
-                            if await _handle_send_failure(
+                            await _handle_send_failure(
                                 session=session,
                                 db_user_id=db_user_id,
                                 state=state,
@@ -581,30 +571,27 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                                 acc=acc,
                                 bot=bot,
                                 chat_id=chat_id,
-                            ):
-                                accounts[:] = [a for a in accounts if int(a.id) != int(acc.id)]
-                                if not accounts:
-                                    state.is_running = False
-                                    state.last_status = "STOPPED"
-                                    set_sending_state(tg_user_id, state=state)
-                                    break
+                            )
 
-                set_sending_state(tg_user_id, state=state)
-                await asyncio.sleep(random.uniform(min_delay, max_delay))
+            if not state.is_running:
+                break
 
-        except TelegramNetworkError:
-            state.is_running = False
-            state.last_error = "TG_ERROR|network|Telegram network error"
             set_sending_state(tg_user_id, state=state)
-        except Exception as e:
+            await asyncio.sleep(random.uniform(min_delay, max_delay))
+
+    except TelegramNetworkError:
+        state.is_running = False
+        state.last_error = "TG_ERROR|network|Telegram network error"
+        set_sending_state(tg_user_id, state=state)
+    except Exception as e:
+        state.is_running = False
+        state.last_error = normalize_send_error(str(e))
+        set_sending_state(tg_user_id, state=state)
+        logger.exception("sending loop failed for user %s", tg_user_id)
+    finally:
+        state = get_sending_state(tg_user_id) or state
+        if state.is_running:
             state.is_running = False
-            state.last_error = normalize_send_error(str(e))
             set_sending_state(tg_user_id, state=state)
-            logger.exception("sending loop failed for user %s", tg_user_id)
-        finally:
-            state = get_sending_state(tg_user_id) or state
-            if state.is_running:
-                state.is_running = False
-                set_sending_state(tg_user_id, state=state)
-            if entered_main_loop:
-                await _notify_sending_finished(bot=bot, chat_id=chat_id, tg_user_id=tg_user_id)
+        if entered_main_loop:
+            await _notify_sending_finished(bot=bot, chat_id=chat_id, tg_user_id=tg_user_id)

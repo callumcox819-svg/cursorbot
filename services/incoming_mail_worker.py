@@ -1292,6 +1292,15 @@ _EVENT_QUEUES: Dict[int, asyncio.Queue] = {}
 
 _ACCOUNTS_MAP_CACHE: tuple[list[tuple[EmailAccount, int]], float] | None = None
 _ACCOUNTS_MAP_CACHE_TTL_SEC = float(__import__("os").getenv("IMAP_ACCOUNTS_CACHE_SEC", "45"))
+_MAX_IMAP_CONCURRENT = max(1, int(__import__("os").getenv("MAX_IMAP_CONCURRENT", "4")))
+_IMAP_SLOT_SEM: asyncio.Semaphore | None = None
+
+
+def _imap_slot_sem() -> asyncio.Semaphore:
+    global _IMAP_SLOT_SEM
+    if _IMAP_SLOT_SEM is None:
+        _IMAP_SLOT_SEM = asyncio.Semaphore(_MAX_IMAP_CONCURRENT)
+    return _IMAP_SLOT_SEM
 
 
 async def _refresh_accounts_map() -> list[tuple[EmailAccount, int]]:
@@ -1419,11 +1428,14 @@ async def _start_idle_for_account(bot: Bot, acc: EmailAccount, tg_id: int) -> No
             pass
 
     async def _runner():
-        thread_task = asyncio.create_task(
-            asyncio.to_thread(_idle_thread_loop, snap, start_last, stop_evt, push_event)
-        )
-
+        sem = _imap_slot_sem()
+        await sem.acquire()
+        thread_task: asyncio.Task | None = None
         try:
+            thread_task = asyncio.create_task(
+                asyncio.to_thread(_idle_thread_loop, snap, start_last, stop_evt, push_event)
+            )
+
             while not stop_evt.is_set():
                 item = await q.get()
                 typ = item.get("type")
@@ -1479,10 +1491,12 @@ async def _start_idle_for_account(bot: Bot, acc: EmailAccount, tg_id: int) -> No
 
         finally:
             stop_evt.set()
-            try:
-                thread_task.cancel()
-            except Exception:
-                pass
+            if thread_task is not None:
+                try:
+                    thread_task.cancel()
+                except Exception:
+                    pass
+            sem.release()
 
     _IDLE_TASKS[acc_id] = asyncio.create_task(_runner())
 
@@ -1490,6 +1504,13 @@ async def _start_idle_for_account(bot: Bot, acc: EmailAccount, tg_id: int) -> No
 async def _idle_manager_loop(bot: Bot, *, poll_seconds: int) -> None:
     while True:
         try:
+            from services.sending_state import any_mailing_active
+
+            if any_mailing_active():
+                logger.info("IMAP: пауза — идёт рассылка (кнопки Telegram в приоритете)")
+                await asyncio.sleep(max(5, int(poll_seconds)))
+                continue
+
             now = _now()
             accounts = await _refresh_accounts_map()
 
@@ -1530,4 +1551,9 @@ def start_incoming_mail_worker(bot: Bot, poll_seconds: int = 20) -> None:
         await _idle_manager_loop(bot, poll_seconds=poll_seconds)
 
     _worker_task = asyncio.create_task(_loop())
-    logger.info("Incoming mail worker started: poll=%ss idle=%s", poll_seconds, USE_IMAP_IDLE)
+    logger.info(
+        "Incoming mail worker started: poll=%ss idle=%s max_concurrent=%s",
+        poll_seconds,
+        USE_IMAP_IDLE,
+        _MAX_IMAP_CONCURRENT,
+    )

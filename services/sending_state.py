@@ -65,3 +65,8 @@ def set_state(telegram_id: int, **kwargs) -> SendingState:
     st.sync_aliases()
     _STATE[telegram_id] = st
     return st
+
+
+def any_mailing_active() -> bool:
+    """Идёт рассылка — IMAP и тяжёлые задачи приостанавливаем, чтобы /start и кнопки не зависали."""
+    return any(st.is_running and not st.is_stopping for st in _STATE.values())
