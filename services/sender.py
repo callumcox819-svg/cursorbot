@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import random
 import re
 import smtplib
 from email.mime.text import MIMEText
@@ -34,15 +33,6 @@ SMTP_BY_PROVIDER = {
     "rambler": ("smtp.rambler.ru", 587),
     "zoho": ("smtp.zoho.com", 587),
 }
-
-MAILERS = [
-    "Apple Mail",
-    "Thunderbird",
-    "Outlook",
-    "Gmail",
-    "Mail",
-    "Mutt",
-]
 
 SMTP_TIMEOUT_SEC = max(15, min(90, int(os.getenv("SMTP_TIMEOUT_SEC", "45"))))
 
@@ -131,7 +121,6 @@ def _build_message(
     msg["Subject"] = subj
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=(from_email.split("@")[-1] if "@" in from_email else None))
-    msg["X-Mailer"] = random.choice(MAILERS)
     return msg
 
 

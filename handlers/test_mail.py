@@ -135,45 +135,33 @@ async def test_mail_send(message: Message, state: FSMContext):
                     body,
                 )
             if ok:
-                await asyncio.sleep(4)
-                verified, verify_msg = await verify_message_in_sent(
-                    account.email,
-                    account.password or "",
-                    subject=subject,
-                    to_email=to_email,
-                    message_id=msgid,
+                imap_extra = (
+                    "\n\n<i>Gmail через SMTP часто не сразу кладёт копию в «Отправленные» — "
+                    "это не значит, что прокси не сработал. Смотрите у получателя: "
+                    "Входящие, Спам, «Вся почта».</i>"
                 )
-                if verified:
-                    await status.edit_text(
-                        "✅ <b>Письмо реально ушло</b> — найдено в «Отправленных» у отправителя\n\n"
-                        f"Кому: <code>{to_email}</code>\n"
-                        f"От: <code>{acc_email}</code>\n"
-                        f"Тема: {subject}\n\n"
-                        f"<i>{verify_msg}</i>\n\n"
-                        "Если у получателя во «Входящих» нет — смотрите спам/«Вся почта» или репутацию ящика.",
-                        parse_mode="HTML",
+                try:
+                    await asyncio.sleep(3)
+                    verified, verify_msg = await verify_message_in_sent(
+                        account.email,
+                        account.password or "",
+                        subject=subject,
+                        to_email=to_email,
+                        message_id=msgid,
                     )
-                else:
-                    vm = (verify_msg or "").lower()
-                    if vm.startswith("imap:") or "could not parse" in vm:
-                        hint = (
-                            "SMTP принял письмо, но проверка «Отправленных» по IMAP не удалась.\n"
-                            "Проверьте у отправителя папку «Отправленные» вручную."
-                        )
-                    else:
-                        hint = (
-                            "SMTP не вернул ошибку, но в «Отправленных» у отправителя письма нет.\n"
-                            "Проверьте SOCKS5-прокси или попробуйте другой."
-                        )
-                    await status.edit_text(
-                        "⚠️ <b>Отправка не подтверждена в «Отправленных»</b>\n\n"
-                        f"Кому: <code>{to_email}</code>\n"
-                        f"От: <code>{acc_email}</code>\n\n"
-                        f"{hint}\n\n"
-                        f"<i>{verify_msg}</i>",
-                        parse_mode="HTML",
-                    )
-                    return
+                    if verified:
+                        imap_extra = f"\n\n<i>Копия в «Отправленных» отправителя: {verify_msg}</i>"
+                except Exception:
+                    pass
+
+                await status.edit_text(
+                    "✅ <b>Отправка через прокси прошла</b> (SMTP принял письмо)\n\n"
+                    f"Кому: <code>{to_email}</code>\n"
+                    f"От: <code>{acc_email}</code>\n"
+                    f"Тема: {subject}"
+                    f"{imap_extra}",
+                    parse_mode="HTML",
+                )
                 async with async_session() as session2:
                     raw_link = await pick_random_raw_link(session2)
                     if raw_link:
