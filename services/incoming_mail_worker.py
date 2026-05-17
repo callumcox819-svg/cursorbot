@@ -725,11 +725,10 @@ def render_mail_text_chunks(
     shown = _ensure_multiline_for_expandable(_clean_mail_body_for_card((body or "").strip()))
 
     extra = ""
+    # ID только из сгенерированной GAG-ссылки (не внутренний offer_id в БД).
     lid = (link_id or "").strip()
     if lid:
         extra += f"<b>ID:</b> <code>{_e(lid)}</code>\n"
-    elif offer_id is not None:
-        extra += f"<b>ID:</b> <code>{int(offer_id)}</code>\n"
     if service_label:
         extra += f"<b>Сервис:</b> {_service_html(service_label)}\n"
     if product_title:
