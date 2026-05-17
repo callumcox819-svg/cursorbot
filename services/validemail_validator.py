@@ -24,9 +24,6 @@ from services.seller_name import (
     seller_name_from_item,
 )
 
-# Всегда первый домен при подстановке имени (далее — домены пользователя из настроек).
-_GMAIL_PROBE_DOMAIN = "gmail.com"
-
 logger = logging.getLogger(__name__)
 
 # Только пользовательский blacklist из настроек (не режем имена из JSON автоматически).
@@ -204,26 +201,18 @@ async def _get_validemail_key_for_user(session: Session, telegram_id: int) -> st
 ProgressCb = Callable[[int, int, int, int], None]
 
 
-def merge_validation_domains(
-    user_domains: list[str], items: list[dict[str, Any]] | None = None,
-) -> list[str]:
+def merge_validation_domains(user_domains: list[str]) -> list[str]:
     """
-    Порядок подстановки: сначала gmail.com, затем домены из настроек (получатели).
-    Email из JSON не участвует — только имя + домен + ValidEmail API.
+    Домены в порядке «Приоритет отправки» (настройки) + остальные из БД, без дублей.
+    Никакого принудительного gmail — только ваш список.
     """
-    _ = items
     seen: set[str] = set()
     out: list[str] = []
-
-    def _push(d: str) -> None:
+    for d in user_domains or []:
         dd = str(d or "").strip().lower()
         if dd and dd not in seen:
             seen.add(dd)
             out.append(dd)
-
-    _push(_GMAIL_PROBE_DOMAIN)
-    for d in user_domains or []:
-        _push(d)
     return out
 
 

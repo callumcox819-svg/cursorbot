@@ -250,8 +250,8 @@ async def validation_handler(message: Message):
             f"Всего объявлений: <b>{total_offers}</b>\n"
             f"К подстановке email по имени: <b>{offers_with_name}</b>\n"
             f"С полем имени: <b>{offers_name_any}</b>\n\n"
-            "<i>Готовые email из JSON не используем — только имя → "
-            "логин → @gmail.com → ваши домены → ValidEmail.</i>",
+            "<i>Готовые email из JSON не используем — имя → логин → "
+            "домены по приоритету из настроек → ValidEmail.</i>",
             parse_mode="HTML",
         )
     except Exception:
@@ -300,7 +300,7 @@ async def validation_handler(message: Message):
             priority_list = []
 
         pr = [str(x or "").strip().lower() for x in priority_list if str(x or "").strip()]
-        domains = merge_validation_domains(pr + db_domains, items)
+        domains = merge_validation_domains(pr + db_domains)
 
         if not domains:
             return await status_msg.edit_text("❌ У тебя нет доменов.")
@@ -319,12 +319,13 @@ async def validation_handler(message: Message):
     dom_preview = ", ".join(domains[:10])
     if len(domains) > 10:
         dom_preview += f" … (+{len(domains) - 10})"
+    dom0 = domains[0] if domains else "…"
     progress_msg = await message.answer(
         f"🔎 Запуск валидации…\n"
-        f"<b>Sam Day</b> → <code>sam.day@gmail.com</code> → ValidEmail → "
-        f"если нет — следующий домен из списка\n"
-        f"Ники (Semiuel2421) → <code>semiuel2421@gmail.com</code>\n"
-        f"Домены ({len(domains)}): <code>{dom_preview}</code>\n"
+        f"Имя → логин → <code>@{dom0}</code> (1-й в приоритете) → ValidEmail → "
+        f"далее следующие домены из списка\n"
+        f"Ники: <code>semiuel2421@{dom0}</code> и т.д.\n"
+        f"Приоритет ({len(domains)}): <code>{dom_preview}</code>\n"
         f"Ключей API: <b>{n_keys}</b> | потоков: <b>{cfg.concurrency}</b>",
         parse_mode="HTML",
     )
@@ -495,6 +496,6 @@ async def validation_handler(message: Message):
             f"✅ Продавцов с email: {offers_with_email}\n"
             f"⏳ Без email (имя есть): {max(0, eligible - offers_with_email)}\n"
             f"📧 Email записей в БД: {saved_email_count}\n"
-            f"🌐 Порядок: gmail.com → ваши домены"
+            f"🌐 Домены: {dom_preview}"
         ),
     )
