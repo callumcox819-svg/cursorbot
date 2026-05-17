@@ -215,15 +215,41 @@ def _release_single_instance_lock() -> None:
 
 async def _on_startup(bot: Bot) -> None:
     wh = await bot.get_webhook_info()
+    logger.info(
+        "Telegram webhook: url=%r pending_updates=%s",
+        wh.url or "",
+        getattr(wh, "pending_update_count", "?"),
+    )
     if wh.url:
         logger.warning("Активен webhook %s — удаляю, нужен polling", wh.url)
-        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.delete_webhook(drop_pending_updates=False)
 
+    if os.getenv("DISABLE_INCOMING_MAIL", "").strip() in {"1", "true", "yes"}:
+        logger.warning("IMAP worker ВЫКЛЮЧЕН (DISABLE_INCOMING_MAIL=1)")
+        return
+
+    delay = int(os.getenv("INCOMING_MAIL_START_DELAY_SEC", "60"))
     poll_seconds = int(os.getenv("INCOMING_MAIL_POLL_SECONDS", "20"))
-    from services.incoming_mail_worker import start_incoming_mail_worker
 
-    start_incoming_mail_worker(bot, poll_seconds=poll_seconds)
-    logger.info("✅ Incoming mail worker стартовал (poll=%ss)", poll_seconds)
+    async def _start_imap_delayed() -> None:
+        if delay > 0:
+            logger.info("IMAP worker стартует через %ss (сначала отвечаем в Telegram)", delay)
+            await asyncio.sleep(delay)
+        from services.incoming_mail_worker import start_incoming_mail_worker
+
+        start_incoming_mail_worker(bot, poll_seconds=poll_seconds)
+        logger.info("✅ Incoming mail worker стартовал (poll=%ss)", poll_seconds)
+
+    asyncio.create_task(_start_imap_delayed())
+
+
+async def _polling_heartbeat() -> None:
+    """Пульс в логах: polling жив, даже если нет сообщений пользователя."""
+    n = 0
+    while True:
+        await asyncio.sleep(120)
+        n += 1
+        logger.info("💓 polling alive (%d)", n)
 
 
 async def _on_error(event: ErrorEvent) -> None:
@@ -291,9 +317,15 @@ async def main() -> None:
     )
     logger.info("allowed_updates=%s", allowed)
 
+    asyncio.create_task(_polling_heartbeat())
+
+    drop_pending = os.getenv("DROP_PENDING_UPDATES", "").strip() in {"1", "true", "yes"}
+    if drop_pending:
+        logger.warning("DROP_PENDING_UPDATES=1 — старые сообщения в очереди Telegram будут сброшены")
+
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot, allowed_updates=allowed)
+        await bot.delete_webhook(drop_pending_updates=drop_pending)
+        await dp.start_polling(bot, allowed_updates=allowed, drop_pending_updates=drop_pending)
     finally:
         _release_single_instance_lock()
         await bot.session.close()

@@ -233,33 +233,39 @@ def test_smtp_tunnel_sync(proxy: Proxy, *, timeout: int = 20) -> tuple[bool, str
         reset_smtplib_proxy()
 
 
-@asynccontextmanager
-async def database_socket_guard():
-    """
-    Перед PostgreSQL/asyncpg: сбросить глобальный PySocks-патч.
-    Отдельный lock от SMTP — иначе IMAP/БД блокируют рассылку и кнопки меню.
-    """
+async def _reset_socks_under_lock() -> None:
+    """Короткий lock только на сброс PySocks (миллисекунды), не на весь запрос к Postgres."""
     import asyncio
 
     lock_wait = float(os.getenv("DB_SOCKET_LOCK_TIMEOUT_SEC", "10"))
-    acquired = False
     try:
         await asyncio.wait_for(_DB_SOCKET_LOCK.acquire(), timeout=lock_wait)
-        acquired = True
     except asyncio.TimeoutError:
         import logging
 
         logging.getLogger(__name__).error(
-            "DB socket lock timeout (%.0fs) — продолжаем без lock", lock_wait
+            "DB socket lock timeout (%.0fs) — reset без lock", lock_wait
         )
+        reset_smtplib_proxy()
+        return
 
-    reset_smtplib_proxy()
+    try:
+        reset_smtplib_proxy()
+    finally:
+        _DB_SOCKET_LOCK.release()
+
+
+@asynccontextmanager
+async def database_socket_guard():
+    """
+    Перед/после работы с Postgres: сбросить PySocks-патч.
+    Lock НЕ держится на время yield — иначе IMAP блокирует /start и все кнопки.
+    """
+    await _reset_socks_under_lock()
     try:
         yield
     finally:
-        reset_smtplib_proxy()
-        if acquired:
-            _DB_SOCKET_LOCK.release()
+        await _reset_socks_under_lock()
 
 
 def reset_smtplib_proxy() -> None:

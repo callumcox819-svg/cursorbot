@@ -45,7 +45,7 @@ async def _start_load_user(tg_id: int) -> tuple[bool, bool, bool]:
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     tg_id = int(message.from_user.id)
-    logger.info("/start tg=%s", tg_id)
+    logger.info("▶ HANDLER /start tg=%s", tg_id)
 
     if tg_id in config_admin_ids():
         await message.answer(_WELCOME, reply_markup=main_menu_kb(tg_id, show_admin=True))
