@@ -13,6 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.types import ErrorEvent
+from aiogram.exceptions import TelegramConflictError
 
 from config import config
 from database import init_db
@@ -224,16 +225,19 @@ async def _on_startup(bot: Bot) -> None:
         logger.warning("Активен webhook %s — удаляю, нужен polling", wh.url)
         await bot.delete_webhook(drop_pending_updates=False)
 
-    if os.getenv("DISABLE_INCOMING_MAIL", "").strip() in {"1", "true", "yes"}:
-        logger.warning("IMAP worker ВЫКЛЮЧЕН (DISABLE_INCOMING_MAIL=1)")
+    # IMAP по умолчанию ВЫКЛ — пока не задано ENABLE_INCOMING_MAIL=1 (не блокирует кнопки).
+    if os.getenv("ENABLE_INCOMING_MAIL", "").strip() not in {"1", "true", "yes", "on"}:
+        logger.warning(
+            "IMAP worker ВЫКЛЮЧЕН. Чтобы включить входящую почту: Railway → ENABLE_INCOMING_MAIL=1"
+        )
         return
 
-    delay = int(os.getenv("INCOMING_MAIL_START_DELAY_SEC", "60"))
-    poll_seconds = int(os.getenv("INCOMING_MAIL_POLL_SECONDS", "20"))
+    delay = int(os.getenv("INCOMING_MAIL_START_DELAY_SEC", "90"))
+    poll_seconds = int(os.getenv("INCOMING_MAIL_POLL_SECONDS", "30"))
 
     async def _start_imap_delayed() -> None:
         if delay > 0:
-            logger.info("IMAP worker стартует через %ss (сначала отвечаем в Telegram)", delay)
+            logger.info("IMAP worker стартует через %ss", delay)
             await asyncio.sleep(delay)
         from services.incoming_mail_worker import start_incoming_mail_worker
 
@@ -247,13 +251,19 @@ async def _polling_heartbeat() -> None:
     """Пульс в логах: polling жив, даже если нет сообщений пользователя."""
     n = 0
     while True:
-        await asyncio.sleep(120)
+        await asyncio.sleep(30)
         n += 1
-        logger.info("💓 polling alive (%d)", n)
+        logger.info("💓 polling alive #%d (если нет 📩 MSG — апдейты не доходят / другой экземпляр бота)", n)
 
 
 async def _on_error(event: ErrorEvent) -> None:
-    logger.exception("Необработанная ошибка апдейта: %s", event.exception)
+    exc = event.exception
+    if isinstance(exc, TelegramConflictError):
+        logger.critical(
+            "⚠️ TELEGRAM CONFLICT: два процесса polling на одном BOT_TOKEN! "
+            "Останови локальный bot.py и оставь только Railway (1 реплика)."
+        )
+    logger.exception("Необработанная ошибка апдейта: %s", exc)
 
 
 async def main() -> None:
@@ -287,9 +297,11 @@ async def main() -> None:
 
     from middlewares.bot_access import BotAccessMiddleware
     from middlewares.callback_ack import CallbackAckMiddleware
-    from middlewares.update_log import UpdateLogMiddleware
+    from middlewares.update_log import CallbackLogMiddleware, MessageLogMiddleware
 
-    dp.update.outer_middleware(UpdateLogMiddleware())
+    # Лог до access — видно, дошёл ли апдейт от Telegram.
+    dp.message.middleware(MessageLogMiddleware())
+    dp.callback_query.middleware(CallbackLogMiddleware())
     dp.message.middleware(BotAccessMiddleware())
     dp.callback_query.middleware(BotAccessMiddleware())
     dp.callback_query.middleware(CallbackAckMiddleware())
@@ -310,12 +322,16 @@ async def main() -> None:
     )
 
     me = await bot.get_me()
+    token_hint = (config.BOT_TOKEN or "")[:12] + "…" if config.BOT_TOKEN else "ПУСТО"
     logger.info(
-        "✅ Bot @%s (id=%s). Polling… На Railway держите 1 реплику — иначе ответы дублируются.",
+        "✅ Bot @%s (id=%s) token=%s. Polling… Только 1 процесс на токен!",
         me.username,
         me.id,
+        token_hint,
     )
     logger.info("allowed_updates=%s", allowed)
+    if not os.getenv("BOT_TOKEN", "").strip():
+        logger.warning("BOT_TOKEN не задан в env — используется значение из config.py (опасно для prod)")
 
     asyncio.create_task(_polling_heartbeat())
 

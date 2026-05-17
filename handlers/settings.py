@@ -81,6 +81,10 @@ async def open_settings_menu(message: Message, state: FSMContext) -> None:
     tg_id = int(message.from_user.id)
     logger.info("open_settings_menu tg=%s text=%r", tg_id, message.text)
     try:
+        await message.answer("⏳ Открываю настройки…")
+    except Exception:
+        pass
+    try:
         kb = await asyncio.wait_for(
             _settings_menu_kb_for_user(tg_id),
             timeout=float(__import__("os").getenv("SETTINGS_MENU_DB_TIMEOUT_SEC", "12")),

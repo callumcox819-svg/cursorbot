@@ -47,6 +47,13 @@ async def cmd_start(message: Message) -> None:
     tg_id = int(message.from_user.id)
     logger.info("▶ HANDLER /start tg=%s", tg_id)
 
+    # Сразу отвечаем в Telegram — без ожидания Postgres (иначе кажется что бот мёртв).
+    try:
+        await message.answer("⏳ Загружаю меню…")
+    except Exception:
+        logger.exception("/start: не удалось отправить первый ответ tg=%s", tg_id)
+        return
+
     if tg_id in config_admin_ids():
         await message.answer(_WELCOME, reply_markup=main_menu_kb(tg_id, show_admin=True))
         return
@@ -59,13 +66,14 @@ async def cmd_start(message: Message) -> None:
     except asyncio.TimeoutError:
         logger.error("/start DB timeout tg=%s", tg_id)
         await message.answer(
-            "⏳ База данных перегружена (IMAP/рассылка). Подожди 10–15 сек и снова /start.",
+            "⏳ База данных не отвечает. Подожди 15 сек и снова /start.\n"
+            "<i>Если повторяется — на Railway выключи IMAP: ENABLE_INCOMING_MAIL=0</i>",
             parse_mode="HTML",
         )
         return
     except Exception:
         logger.exception("/start failed tg=%s", tg_id)
-        await message.answer("❌ Ошибка при обращении к БД. Попробуй /start через 10 сек.")
+        await message.answer("❌ Ошибка БД. Попробуй /start через 10 сек.")
         return
 
     if is_banned:
