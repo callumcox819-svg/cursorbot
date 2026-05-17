@@ -260,6 +260,10 @@ async def _validate_offers_old(
                 "current_domain": "",
                 "sellers_with_email": 0,
                 "last_valid_email": "",
+                "seller_index": 0,
+                "sellers_total": 0,
+                "current_seller_name": "",
+                "current_probe": "",
             }
         )
 
@@ -331,81 +335,84 @@ async def _validate_offers_old(
             api_keys = [single]
     url = str(cfg.validation_url or DEFAULT_VALIDEMAIL_URL).strip()
 
-    # 2) имя → local-part → @домен → ValidEmail (домены по приоритету)
-    for dom_idx, dom in enumerate(domains_clean):
+    # 2) По каждому продавцу: домены по приоритету; нашли email — следующий продавец
+    n_sellers = len(prepared)
+    for i, row in enumerate(prepared):
         if stats is not None:
-            stats["current_domain"] = dom
-            stats["domain_index"] = dom_idx + 1
-            stats["domains_total"] = len(domains_clean)
-        # индексы офферов, которым ещё нужны email
-        need_idx = [i for i, f in enumerate(found_by_idx) if len(f) < per_seller_limit]
-        if not need_idx:
-            break
+            stats["seller_index"] = i + 1
+            stats["sellers_total"] = n_sellers
+            stats["current_seller_name"] = str(row.get("person_name") or "")[:60]
 
-        # собираем кандидатов только для нужных офферов и только для текущего домена
-        batch_emails: list[str] = []
-        email_to_idx: dict[str, int] = {}
-        for i in need_idx:
-            for local in prepared[i].get("locals") or []:
-                cand = f"{local}@{dom}".lower()
-                if cand not in email_to_idx:  # дедуп внутри батча
-                    email_to_idx[cand] = i
-                    batch_emails.append(cand)
-
-        if not batch_emails:
+        locals_list = list(row.get("locals") or [])
+        if not locals_list:
             continue
 
-        base_done = overall_done
+        for dom in domains_clean:
+            if len(found_by_idx[i]) >= per_seller_limit:
+                break
 
-        def _wrap_progress(done: int, total: int, lim: int, in_use: int) -> None:
-            if not progress_cb:
-                return
-            try:
-                progress_cb(base_done + int(done or 0), overall_total, lim, in_use)
-            except Exception:
-                pass
+            batch_emails: list[str] = []
+            seen_cand: set[str] = set()
+            for local in locals_list:
+                cand = f"{local}@{dom}".lower()
+                if cand in seen_cand:
+                    continue
+                seen_cand.add(cand)
+                batch_emails.append(cand)
 
-        results = await validate_emails_fast(
-            batch_emails,
-            api_keys=api_keys,
-            concurrency=limit,
-            url=url,
-            use_ssl_verify=bool(cfg.use_ssl_verify),
-            progress_cb=_wrap_progress,
-        )
-
-        # считаем, что батч "проверен"
-        overall_done += len(batch_emails)
-
-        sellers_found = sum(1 for f in found_by_idx if f)
-        if stats is not None:
-            stats["emails_checked"] = overall_done
-            stats["sellers_with_email"] = sellers_found
-            stats["offers_validated"] = sellers_found
-            eligible_o = int(stats.get("offers_eligible") or len(prepared))
-            stats["offers_remaining"] = max(0, eligible_o - sellers_found)
-
-        combos_valid = 0
-        for e, ok, _raw in results:
-            if not ok:
+            if not batch_emails:
                 continue
-            combos_valid += 1
-            key = (e or "").strip().lower()
-            idx = email_to_idx.get(key)
-            if idx is None:
-                continue
-            lst = found_by_idx[idx]
-            if len(lst) < per_seller_limit and key not in lst:
-                lst.append(key)
-                if stats is not None:
-                    stats["last_valid_email"] = key
 
-        if stats is not None:
-            stats["combinations_valid"] = int(stats.get("combinations_valid") or 0) + combos_valid
-            stats["sellers_with_email"] = sum(1 for f in found_by_idx if f)
-            stats["offers_validated"] = stats["sellers_with_email"]
-            eligible_o = int(stats.get("offers_eligible") or len(prepared))
-            stats["offers_remaining"] = max(0, eligible_o - int(stats["sellers_with_email"]))
+            if stats is not None:
+                stats["current_domain"] = dom
+                stats["current_probe"] = batch_emails[0]
+
+            base_done = overall_done
+
+            def _wrap_progress(
+                done: int, total: int, lim: int, in_use: int, _bd: int = base_done
+            ) -> None:
+                if not progress_cb:
+                    return
+                try:
+                    progress_cb(_bd + int(done or 0), overall_total, lim, in_use)
+                except Exception:
+                    pass
+
+            results = await validate_emails_fast(
+                batch_emails,
+                api_keys=api_keys,
+                concurrency=limit,
+                url=url,
+                use_ssl_verify=bool(cfg.use_ssl_verify),
+                progress_cb=lambda d, t, l, u, _bd=base_done: _wrap_progress(d, t, l, u, _bd),
+            )
+
+            overall_done += len(batch_emails)
+
+            combos_valid = 0
+            for e, ok, _raw in results:
+                if not ok:
+                    continue
+                combos_valid += 1
+                key = (e or "").strip().lower()
+                lst = found_by_idx[i]
+                if len(lst) < per_seller_limit and key not in lst:
+                    lst.append(key)
+                    if stats is not None:
+                        stats["last_valid_email"] = key
+
+            sellers_found = sum(1 for f in found_by_idx if f)
+            if stats is not None:
+                stats["emails_checked"] = overall_done
+                stats["combinations_valid"] = int(stats.get("combinations_valid") or 0) + combos_valid
+                stats["sellers_with_email"] = sellers_found
+                stats["offers_validated"] = sellers_found
+                eligible_o = int(stats.get("offers_eligible") or n_sellers)
+                stats["offers_remaining"] = max(0, eligible_o - sellers_found)
+
+            if found_by_idx[i]:
+                break
 
     # 3) собираем результат
     out_rows: list[dict[str, Any]] = []

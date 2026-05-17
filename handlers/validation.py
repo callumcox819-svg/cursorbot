@@ -386,8 +386,10 @@ async def validation_handler(message: Message):
             )
             combos_ok = int(vstats.get("combinations_valid") or 0)
             cur_dom = str(vstats.get("current_domain") or "").strip()
-            dom_i = int(vstats.get("domain_index") or 0)
-            dom_n = int(vstats.get("domains_total") or 0)
+            seller_i = int(vstats.get("seller_index") or 0)
+            seller_n = int(vstats.get("sellers_total") or eligible_ or 0)
+            seller_name = str(vstats.get("current_seller_name") or "").strip()
+            cur_probe = str(vstats.get("current_probe") or "").strip()
             last_ok = str(vstats.get("last_valid_email") or "").strip()
 
             bar, pct = ("", 0)
@@ -404,11 +406,15 @@ async def validation_handler(message: Message):
                 f"✅ Продавцов с email: <b>{sellers_found_}</b>\n"
                 f"⏳ Без email (ещё ищем): <b>{remaining_}</b>\n"
             )
-            if cur_dom:
-                dom_line = f"🌐 Сейчас домен: <code>@{cur_dom}</code>"
-                if dom_n > 0 and dom_i > 0:
-                    dom_line += f" ({dom_i}/{dom_n})"
-                text += f"\n{dom_line}\n"
+            if seller_i > 0 and seller_n > 0:
+                text += f"\n👤 Продавец: <b>{seller_i}</b> / <b>{seller_n}</b>"
+                if seller_name:
+                    text += f" — <code>{seller_name[:40]}</code>"
+                text += "\n"
+            if cur_probe:
+                text += f"🔎 Проверяю: <code>{cur_probe[:52]}</code>\n"
+            elif cur_dom:
+                text += f"🌐 Домен: <code>@{cur_dom}</code>\n"
             if total > 0:
                 text += (
                     f"\n{bar} {pct}%\n"
