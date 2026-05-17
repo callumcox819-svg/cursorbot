@@ -1292,7 +1292,10 @@ _EVENT_QUEUES: Dict[int, asyncio.Queue] = {}
 
 _ACCOUNTS_MAP_CACHE: tuple[list[tuple[EmailAccount, int]], float] | None = None
 _ACCOUNTS_MAP_CACHE_TTL_SEC = float(__import__("os").getenv("IMAP_ACCOUNTS_CACHE_SEC", "45"))
-_MAX_IMAP_CONCURRENT = max(1, int(__import__("os").getenv("MAX_IMAP_CONCURRENT", "4")))
+_MAX_IMAP_CONCURRENT = max(1, int(__import__("os").getenv("MAX_IMAP_CONCURRENT", "6")))
+# per_user — пауза IMAP только у того, кто шлёт /send; all — пауза для всех; off — не паузим
+_IMAP_MAILING_PAUSE = (__import__("os").getenv("IMAP_MAILING_PAUSE", "per_user") or "per_user").strip().lower()
+_IMAP_BATCH_YIELD_SEC = max(0.0, float(__import__("os").getenv("IMAP_BATCH_YIELD_SEC", "0.08")))
 _IMAP_SLOT_SEM: asyncio.Semaphore | None = None
 
 
@@ -1501,25 +1504,173 @@ async def _start_idle_for_account(bot: Bot, acc: EmailAccount, tg_id: int) -> No
     _IDLE_TASKS[acc_id] = asyncio.create_task(_runner())
 
 
+async def _cancel_legacy_idle_tasks() -> None:
+    """Старый режим: по потоку на ящик навсегда — отключаем при round-robin scheduler."""
+    for stop_evt in list(_IDLE_STOPS.values()):
+        stop_evt.set()
+    for task in list(_IDLE_TASKS.values()):
+        if not task.done():
+            task.cancel()
+    _IDLE_STOPS.clear()
+    _EVENT_QUEUES.clear()
+    _IDLE_TASKS.clear()
+
+
+def _eligible_accounts_for_poll(
+    accounts: list[tuple[EmailAccount, int]],
+    *,
+    now: float,
+    mailing_tg_ids: frozenset[int],
+) -> list[tuple[EmailAccount, int]]:
+    mode = _IMAP_MAILING_PAUSE
+    if mode == "all" and mailing_tg_ids:
+        return []
+    out: list[tuple[EmailAccount, int]] = []
+    for acc, tg_id in accounts:
+        if mode == "per_user" and int(tg_id) in mailing_tg_ids:
+            continue
+        acc_id = int(acc.id)
+        until = _BACKOFF_UNTIL.get(acc_id)
+        if until and now < float(until):
+            continue
+        out.append((acc, int(tg_id)))
+    return out
+
+
+async def _poll_account_once(bot: Bot, acc: EmailAccount, tg_id: int) -> None:
+    """Один IMAP-опрос ящика: слот семафора только на время сетевого fetch (не навсегда)."""
+    acc_id = int(acc.id)
+    email_addr = str(acc.email or "")
+    password = str(acc.password or "")
+    provider = str(getattr(acc, "provider", "") or "")
+    user_id = int(acc.user_id)
+    host, port = _imap_connect(provider, email_addr)
+
+    last_uid = getattr(acc, "last_seen_uid", None)
+    if last_uid is None:
+        last_uid = LAST_UID.get(acc_id)
+
+    sem = _imap_slot_sem()
+    await sem.acquire()
+    try:
+        mails, new_last = await asyncio.to_thread(
+            _imap_fetch_new_sync_raw,
+            host=host,
+            port=port,
+            email_addr=email_addr,
+            password=password,
+            last_uid=last_uid,
+        )
+    except Exception as e:
+        if _is_invalid_credentials_error(e):
+            logger.warning("IMAP invalid creds acc=%s email=%s", acc_id, email_addr)
+            return
+
+        if _is_transient_ssl_eof(e):
+            delay = 2
+            _ERROR_STREAK[acc_id] = 1
+            _BACKOFF_UNTIL[acc_id] = _now() + delay
+            last_log = _LAST_EOF_LOG.get(acc_id, 0.0)
+            if _now() - last_log >= _EOF_LOG_COOLDOWN_SEC:
+                _LAST_EOF_LOG[acc_id] = _now()
+                logger.info("IMAP reconnect acc=%s email=%s (EOF/TLS reset)", acc_id, email_addr)
+            return
+
+        streak = int(_ERROR_STREAK.get(acc_id, 0)) + 1
+        _ERROR_STREAK[acc_id] = streak
+        delay = _calc_backoff(streak)
+        _BACKOFF_UNTIL[acc_id] = _now() + delay
+        logger.warning(
+            "IMAP error acc=%s email=%s backoff=%ss err=%s",
+            acc_id,
+            email_addr,
+            delay,
+            e,
+        )
+        return
+    finally:
+        sem.release()
+
+    if new_last is not None:
+        LAST_UID[acc_id] = int(new_last)
+
+    if mails:
+        await _process_mails_for_account(
+            bot,
+            acc_id=acc_id,
+            tg_id=tg_id,
+            user_id=user_id,
+            account_email=email_addr,
+            mails=mails,
+            max_per_account=DEFAULT_MAX_PER_ACCOUNT,
+            last_uid=new_last,
+        )
+
+    _ERROR_STREAK.pop(acc_id, None)
+    _BACKOFF_UNTIL.pop(acc_id, None)
+
+
+async def _poll_accounts_batch(bot: Bot, batch: list[tuple[EmailAccount, int]]) -> None:
+    if not batch:
+        return
+    results = await asyncio.gather(
+        *[_poll_account_once(bot, acc, tg_id) for acc, tg_id in batch],
+        return_exceptions=True,
+    )
+    for r in results:
+        if isinstance(r, Exception):
+            logger.exception("IMAP poll task failed: %s", r)
+
+
 async def _idle_manager_loop(bot: Bot, *, poll_seconds: int) -> None:
+    await _cancel_legacy_idle_tasks()
+    logger.info(
+        "IMAP scheduler: round-robin pause=%s max_concurrent=%s poll=%ss",
+        _IMAP_MAILING_PAUSE,
+        _MAX_IMAP_CONCURRENT,
+        poll_seconds,
+    )
+
     while True:
         try:
-            from services.sending_state import any_mailing_active
+            from services.sending_state import active_mailing_telegram_ids
 
-            if any_mailing_active():
-                logger.info("IMAP: пауза — идёт рассылка (кнопки Telegram в приоритете)")
+            mailing = active_mailing_telegram_ids()
+            if _IMAP_MAILING_PAUSE == "all" and mailing:
+                logger.info(
+                    "IMAP: пауза для всех — рассылка у tg=%s (режим all)",
+                    ",".join(str(x) for x in sorted(mailing)[:5]),
+                )
                 await asyncio.sleep(max(5, int(poll_seconds)))
                 continue
 
             now = _now()
             accounts = await _refresh_accounts_map()
+            eligible = _eligible_accounts_for_poll(accounts, now=now, mailing_tg_ids=mailing)
 
-            for acc, tg_id in accounts:
-                acc_id = int(acc.id)
-                until = _BACKOFF_UNTIL.get(acc_id)
-                if until and now < float(until):
-                    continue
-                await _start_idle_for_account(bot, acc, tg_id)
+            if mailing and _IMAP_MAILING_PAUSE == "per_user":
+                skipped = len(accounts) - len(eligible)
+                if skipped:
+                    logger.debug(
+                        "IMAP: пропуск %s ящиков (рассылка у %s пользов.)",
+                        skipped,
+                        len(mailing),
+                    )
+
+            if not eligible:
+                await asyncio.sleep(max(5, int(poll_seconds)))
+                continue
+
+            batch: list[tuple[EmailAccount, int]] = []
+            for item in eligible:
+                batch.append(item)
+                if len(batch) >= _MAX_IMAP_CONCURRENT:
+                    await _poll_accounts_batch(bot, batch)
+                    batch = []
+                    if _IMAP_BATCH_YIELD_SEC > 0:
+                        await asyncio.sleep(_IMAP_BATCH_YIELD_SEC)
+            if batch:
+                await _poll_accounts_batch(bot, batch)
 
         except Exception:
             logger.exception("Incoming mail manager loop error")
@@ -1536,7 +1687,10 @@ def incoming_mail_diag_snapshot() -> dict[str, Any]:
             backoff[int(aid)] = max(0, int(float(until) - now))
     return {
         "poll_fallback_sec": int(POLL_FALLBACK_SEC),
-        "idle_threads": len(_IDLE_TASKS),
+        "scheduler": "round_robin",
+        "max_concurrent": _MAX_IMAP_CONCURRENT,
+        "mailing_pause": _IMAP_MAILING_PAUSE,
+        "legacy_idle_threads": len(_IDLE_TASKS),
         "backoff_sec_by_account": backoff,
         "error_streak_by_account": {int(k): int(v) for k, v in _ERROR_STREAK.items()},
     }
@@ -1552,8 +1706,8 @@ def start_incoming_mail_worker(bot: Bot, poll_seconds: int = 20) -> None:
 
     _worker_task = asyncio.create_task(_loop())
     logger.info(
-        "Incoming mail worker started: poll=%ss idle=%s max_concurrent=%s",
+        "Incoming mail worker started: poll=%ss scheduler=round_robin max_concurrent=%s pause=%s",
         poll_seconds,
-        USE_IMAP_IDLE,
         _MAX_IMAP_CONCURRENT,
+        _IMAP_MAILING_PAUSE,
     )

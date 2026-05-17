@@ -69,4 +69,13 @@ def set_state(telegram_id: int, **kwargs) -> SendingState:
 
 def any_mailing_active() -> bool:
     """Идёт рассылка — IMAP и тяжёлые задачи приостанавливаем, чтобы /start и кнопки не зависали."""
-    return any(st.is_running and not st.is_stopping for st in _STATE.values())
+    return bool(active_mailing_telegram_ids())
+
+
+def active_mailing_telegram_ids() -> frozenset[int]:
+    """Telegram ID пользователей, у которых сейчас идёт /send (не останавливается)."""
+    return frozenset(
+        tid
+        for tid, st in _STATE.items()
+        if st.is_running and not st.is_stopping
+    )

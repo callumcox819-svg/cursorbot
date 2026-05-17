@@ -16,7 +16,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from database import async_session, db_session
+from database import db_session
 from models import EmailAccount, OfferEmail, Offer, User, Proxy
 
 from services.smtp_proxy_send import (
@@ -309,7 +309,7 @@ async def _notify_sending_finished(*, bot: Bot, chat_id: int, tg_user_id: int) -
 
     pending = 0
     try:
-        async with async_session() as session:
+        async with db_session() as session:
             user = await get_or_create_user(session, tg_user_id)
             pending = int(await _get_targets_count(session, int(user.id)))
     except Exception:
