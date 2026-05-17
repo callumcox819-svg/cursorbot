@@ -264,6 +264,11 @@ async def _validate_offers_old(
                 "sellers_total": 0,
                 "current_seller_name": "",
                 "current_probe": "",
+                "short_nicks": 0,
+                "blacklisted": 0,
+                "duplicates": 0,
+                "api_errors": 0,
+                "no_name": 0,
             }
         )
 
@@ -274,10 +279,19 @@ async def _validate_offers_old(
             continue
 
         raw_name = seller_name_from_item(it)
+        if not (raw_name or "").strip():
+            if stats is not None:
+                stats["no_name"] = int(stats.get("no_name") or 0) + 1
+            continue
+
+        if _is_blacklisted(raw_name, user_blacklist):
+            if stats is not None:
+                stats["blacklisted"] = int(stats.get("blacklisted") or 0) + 1
+            continue
 
         if not _name_is_usable(raw_name, require_first_and_last=require_fl):
-            continue
-        if _is_blacklisted(raw_name, user_blacklist):
+            if stats is not None:
+                stats["short_nicks"] = int(stats.get("short_nicks") or 0) + 1
             continue
 
         locals_list: list[str] = []
@@ -334,6 +348,8 @@ async def _validate_offers_old(
         if single:
             api_keys = [single]
     url = str(cfg.validation_url or DEFAULT_VALIDEMAIL_URL).strip()
+
+    seen_valid_emails: set[str] = set()
 
     # 2) По каждому продавцу: домены по приоритету; нашли email — следующий продавец
     n_sellers = len(prepared)
@@ -393,14 +409,22 @@ async def _validate_offers_old(
             combos_valid = 0
             for e, ok, _raw in results:
                 if not ok:
+                    if stats is not None:
+                        stats["api_errors"] = int(stats.get("api_errors") or 0) + 1
                     continue
                 combos_valid += 1
                 key = (e or "").strip().lower()
                 lst = found_by_idx[i]
-                if len(lst) < per_seller_limit and key not in lst:
-                    lst.append(key)
+                if len(lst) >= per_seller_limit or key in lst:
+                    continue
+                if key in seen_valid_emails:
                     if stats is not None:
-                        stats["last_valid_email"] = key
+                        stats["duplicates"] = int(stats.get("duplicates") or 0) + 1
+                    continue
+                seen_valid_emails.add(key)
+                lst.append(key)
+                if stats is not None:
+                    stats["last_valid_email"] = key
 
             sellers_found = sum(1 for f in found_by_idx if f)
             if stats is not None:

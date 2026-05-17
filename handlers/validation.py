@@ -28,7 +28,56 @@ router = Router()
 
 REPLACE_OLD_FOR_USER = True
 REQUIRE_FIRST_AND_LAST = False
-PROGRESS_UPDATE_INTERVAL = 5  # seconds
+PROGRESS_UPDATE_INTERVAL = 3  # seconds
+
+
+def _progress_bar(done: int, total: int, width: int = 20) -> tuple[str, int]:
+    if total <= 0:
+        return "░" * width, 0
+    pct = int((done / total) * 100)
+    filled = max(0, min(width, int((done / total) * width)))
+    return ("█" * filled + "░" * (width - filled)), pct
+
+
+def _validation_user_line(message: Message) -> str:
+    u = message.from_user
+    if not u:
+        return ""
+    un = f"@{u.username}" if u.username else ""
+    return f"👤 <code>{u.id}</code> {un}".strip()
+
+
+def _format_validation_status(
+    *,
+    finished: bool,
+    user_line: str,
+    processed: int,
+    total: int,
+    added: int,
+    duplicates: int,
+    in_blacklist: int,
+    added_blacklist: int,
+    short_nicks: int,
+    no_email: int,
+    errors: int,
+) -> str:
+    title = "✅ Подбор завершён" if finished else "🔎 Подбор email…"
+    bar, pct = _progress_bar(processed, total)
+    lines = [
+        f"<b>{title}</b>",
+        user_line,
+        f"<code>{bar}</code> <b>{pct}%</b>",
+        "",
+        f"📄 Объявлений обработано: <b>{processed}/{total}</b>",
+        f"📧 Добавлено: <b>{added}</b>",
+        f"♻️ Дубликатов: <b>{duplicates}</b>",
+        f"⛔ В ЧС: <b>{in_blacklist}</b>",
+        f"➕ Добавлено в ЧС: <b>{added_blacklist}</b>",
+        f"✂️ Коротких ников: <b>{short_nicks}</b>",
+        f"📬 Без email: <b>{no_email}</b>",
+        f"⚠️ Ошибок: <b>{errors}</b>",
+    ]
+    return "\n".join(l for l in lines if l is not None)
 
 
 def _norm_email(e: str) -> str:
@@ -237,26 +286,8 @@ async def validation_handler(message: Message):
     if not items:
         return await status_msg.edit_text("❌ В файле не найдено записей.")
 
-    # --- UI статистика (не влияет на логику валидации) ---
     total_offers = len(items)
-    offers_with_name = sum(
-        1 for it in items if seller_name_eligible_for_validation(seller_name_from_item(it))
-    )
-    offers_name_any = sum(1 for it in items if seller_name_from_item(it))
-
-    try:
-        await status_msg.edit_text(
-            "📥 Файл принят. Сохраню все объявления в БД.\n"
-            f"Всего объявлений: <b>{total_offers}</b>\n"
-            f"К подстановке email по имени: <b>{offers_with_name}</b>\n"
-            f"С полем имени: <b>{offers_name_any}</b>\n\n"
-            "<i>Готовые email из JSON не используем — имя → логин → "
-            "домены по приоритету из настроек → ValidEmail.</i>",
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
-
+    user_line = _validation_user_line(message)
     tg_id = message.from_user.id
 
     async with Session() as session:
@@ -315,127 +346,65 @@ async def validation_handler(message: Message):
         min_len=MIN_NAME_TOKEN_LEN,
     )
 
-    n_keys = len(api_keys)
-    dom_preview = ", ".join(domains[:10])
-    if len(domains) > 10:
-        dom_preview += f" … (+{len(domains) - 10})"
-    dom0 = domains[0] if domains else "…"
-    progress_msg = await message.answer(
-        f"🔎 Запуск валидации…\n"
-        f"Имя → логин → <code>@{dom0}</code> (1-й в приоритете) → ValidEmail → "
-        f"далее следующие домены из списка\n"
-        f"Ники: <code>semiuel2421@{dom0}</code> и т.д.\n"
-        f"Приоритет ({len(domains)}): <code>{dom_preview}</code>\n"
-        f"Ключей API: <b>{n_keys}</b> | потоков: <b>{cfg.concurrency}</b>",
-        parse_mode="HTML",
-    )
-
-    live_stats: dict = {}
-    state = {
-        "done": 0,
-        "total": 0,
-        "limit": 0,
-        "in_use": 0,
-        "t0": time.time(),
-        "offers_total": total_offers,
-        "offers_with_name": offers_with_name,
-        "last_text": "",
-    }
+    live_stats: dict = {"offers_total": total_offers}
+    ui_state = {"last_text": ""}
     stop_evt = asyncio.Event()
 
     def _progress_cb(done: int, total: int, limit: int, in_use: int) -> None:
-        # коллбек вызывается из валидатора; не await
-        state["done"] = int(done or 0)
-        state["total"] = int(total or 0)
-        state["limit"] = int(limit or 0)
-        state["in_use"] = int(in_use or 0)
+        pass
 
-    def _progress_bar(done: int, total: int, width: int = 22) -> tuple[str, int]:
-        if total <= 0:
-            return "", 0
-        pct = int((done / total) * 100)
-        filled = int((done / total) * width)
-        filled = max(0, min(width, filled))
-        return ("█" * filled + "░" * (width - filled)), pct
+    def _ui_from_stats(vstats: dict, *, finished: bool = False) -> str:
+        total = int(vstats.get("offers_total") or total_offers)
+        seller_i = int(vstats.get("seller_index") or 0)
+        added = int(vstats.get("sellers_with_email") or 0)
+        short_n = int(vstats.get("short_nicks") or 0)
+        bl = int(vstats.get("blacklisted") or 0)
+        no_name = int(vstats.get("no_name") or 0)
+        dup = int(vstats.get("duplicates") or 0)
+        err = int(vstats.get("api_errors") or 0)
+        skip_fixed = short_n + bl + no_name
+        if finished:
+            processed = total
+        else:
+            processed = min(total, skip_fixed + seller_i)
+        eligible = int(vstats.get("offers_eligible") or 0)
+        if finished:
+            no_email = max(0, eligible - added)
+        else:
+            no_email = max(0, seller_i - added)
+        return _format_validation_status(
+            finished=finished,
+            user_line=user_line,
+            processed=processed,
+            total=total,
+            added=added,
+            duplicates=dup,
+            in_blacklist=0,
+            added_blacklist=bl,
+            short_nicks=short_n,
+            no_email=no_email,
+            errors=err,
+        )
 
-    def _fmt_eta(seconds: float) -> str:
-        seconds = max(0, int(seconds))
-        m, s = divmod(seconds, 60)
-        h, m = divmod(m, 60)
-        if h:
-            return f"{h}ч {m:02d}м"
-        return f"{m}м {s:02d}с"
+    try:
+        await status_msg.edit_text(
+            _ui_from_stats(live_stats, finished=False), parse_mode="HTML"
+        )
+    except Exception:
+        pass
 
-    async def _progress_updater(
-        msg: Message, st: dict, stop: asyncio.Event, vstats: dict
-    ) -> None:
+    async def _progress_updater(msg: Message, stop: asyncio.Event, vstats: dict) -> None:
         while not stop.is_set():
-            done = int(st.get("done", 0) or 0)
-            total = int(st.get("total", 0) or 0)
-            limit = int(st.get("limit", 0) or 0)
-            in_use = int(st.get("in_use", 0) or 0)
-            offers_total_ = int(vstats.get("offers_total") or st.get("offers_total") or 0)
-            eligible_ = int(vstats.get("offers_eligible") or st.get("offers_with_name") or 0)
-            sellers_found_ = int(
-                vstats.get("sellers_with_email") or vstats.get("offers_validated") or 0
-            )
-            remaining_ = int(
-                vstats.get("offers_remaining")
-                if vstats.get("offers_remaining") is not None
-                else max(0, eligible_ - sellers_found_)
-            )
-            combos_ok = int(vstats.get("combinations_valid") or 0)
-            cur_dom = str(vstats.get("current_domain") or "").strip()
-            seller_i = int(vstats.get("seller_index") or 0)
-            seller_n = int(vstats.get("sellers_total") or eligible_ or 0)
-            seller_name = str(vstats.get("current_seller_name") or "").strip()
-            cur_probe = str(vstats.get("current_probe") or "").strip()
-            last_ok = str(vstats.get("last_valid_email") or "").strip()
-
-            bar, pct = ("", 0)
-            if total > 0:
-                bar, pct = _progress_bar(done, total)
-            elapsed = max(0.1, time.time() - float(st.get("t0") or time.time()))
-            rate = done / elapsed if done > 0 else 0.0
-            eta = (total - done) / rate if total > 0 and rate > 0 else 0
-
-            text = (
-                "🔎 <b>Валидация email</b>\n\n"
-                f"📄 Объявлений в файле: <b>{offers_total_}</b>\n"
-                f"👤 С именем (к проверке): <b>{eligible_}</b>\n"
-                f"✅ Продавцов с email: <b>{sellers_found_}</b>\n"
-                f"⏳ Без email (ещё ищем): <b>{remaining_}</b>\n"
-            )
-            if seller_i > 0 and seller_n > 0:
-                text += f"\n👤 Продавец: <b>{seller_i}</b> / <b>{seller_n}</b>"
-                if seller_name:
-                    text += f" — <code>{seller_name[:40]}</code>"
-                text += "\n"
-            if cur_probe:
-                text += f"🔎 Проверяю: <code>{cur_probe[:52]}</code>\n"
-            elif cur_dom:
-                text += f"🌐 Домен: <code>@{cur_dom}</code>\n"
-            if total > 0:
-                text += (
-                    f"\n{bar} {pct}%\n"
-                    f"🔎 Проверено комбинаций: <b>{done}</b> / <b>{total}</b>\n"
-                    f"📬 Валидных ответов API: <b>{combos_ok}</b>\n"
-                    f"ETA: ~{_fmt_eta(eta)} · потоков: {in_use}/{(limit or 0)}"
-                )
-            if last_ok:
-                show = last_ok if len(last_ok) <= 48 else last_ok[:45] + "…"
-                text += f"\n<i>Последний найденный: <code>{show}</code></i>"
-            if text != st.get("last_text"):
+            text = _ui_from_stats(vstats, finished=False)
+            if text != ui_state.get("last_text"):
                 try:
                     await msg.edit_text(text, parse_mode="HTML")
-                    st["last_text"] = text
+                    ui_state["last_text"] = text
                 except Exception:
                     pass
             await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
 
-    updater = asyncio.create_task(
-        _progress_updater(progress_msg, state, stop_evt, live_stats)
-    )
+    updater = asyncio.create_task(_progress_updater(status_msg, stop_evt, live_stats))
 
     try:
         validated = await validate_offers(
@@ -446,15 +415,7 @@ async def validation_handler(message: Message):
         await updater
 
     validated_count = len(validated or [])
-    combos_checked = int(live_stats.get("emails_checked") or 0)
-    combos_valid = int(live_stats.get("combinations_valid") or 0)
-    eligible = int(live_stats.get("offers_eligible") or offers_with_name or 0)
-
-    await progress_msg.edit_text(
-        "💾 Сохраняю все объявления в базу…\n"
-        f"В файле: <b>{total_offers}</b> · с email: <b>{validated_count}</b>",
-        parse_mode="HTML",
-    )
+    eligible = int(live_stats.get("offers_eligible") or 0)
 
     async with Session() as session:
         user = await get_or_create_user(session, tg_id)
@@ -493,15 +454,17 @@ async def validation_handler(message: Message):
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
+    live_stats["sellers_with_email"] = offers_with_email
+    live_stats["offers_eligible"] = eligible
+
+    try:
+        await status_msg.edit_text(
+            _ui_from_stats(live_stats, finished=True), parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
     await message.answer_document(
         FSInputFile(out_path),
-        caption=(
-            f"💾 Сохранено в БД: {offers_saved}/{total_offers}\n"
-            f"👤 Имён к проверке: {eligible}\n"
-            f"🔎 Проверено: {combos_checked} (ValidEmail OK: {combos_valid})\n"
-            f"✅ Продавцов с email: {offers_with_email}\n"
-            f"⏳ Без email (имя есть): {max(0, eligible - offers_with_email)}\n"
-            f"📧 Email записей в БД: {saved_email_count}\n"
-            f"🌐 Домены: {dom_preview}"
-        ),
+        caption=f"📎 Результат · в БД {offers_saved}/{total_offers} · email {saved_email_count}",
     )
