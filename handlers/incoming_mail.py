@@ -278,11 +278,31 @@ async def _reply_notify_build_async(
     user_id: int | None = None,
 ) -> ReplyNotifyCtx | None:
     """Как _reply_notify_build + fallback на ConversationLink.tg_message_id."""
+    merged_state = dict(state_data)
+    if acc_id and uid:
+        try:
+            async with Session() as session:
+                to_e, subj, acc_e = await _resolve_reply_recipient(
+                    session,
+                    int(acc_id),
+                    str(uid),
+                    meta=meta,
+                    state_data=state_data,
+                )
+            if to_e:
+                merged_state.setdefault("to_email", to_e)
+            if subj:
+                merged_state.setdefault("subject", subj)
+            if acc_e:
+                merged_state.setdefault("account_email", acc_e)
+        except Exception:
+            pass
+
     ctx = _reply_notify_build(
         acc_id=acc_id,
         uid=uid,
         meta=meta,
-        state_data=state_data,
+        state_data=merged_state,
         body_text=body_text,
         is_preset=is_preset,
         is_html=is_html,
@@ -585,6 +605,76 @@ def _canon_email(email: str) -> str:
         local = local.replace(".", "")
         domain = "gmail.com"
     return f"{local}@{domain}"
+
+
+def _parse_imap_uid_key(uid: str) -> int | None:
+    uid_s = (uid or "").strip()
+    if ":" in uid_s:
+        uid_s = uid_s.rsplit(":", 1)[-1]
+    try:
+        return int(uid_s)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _load_incoming_mail_for_uid(session, acc_id: int, uid: str) -> IncomingMail | None:
+    uid_num = _parse_imap_uid_key(uid)
+    if uid_num is None:
+        return None
+    return (
+        await session.execute(
+            sa_select(IncomingMail)
+            .where(IncomingMail.account_id == int(acc_id))
+            .where(IncomingMail.imap_uid == int(uid_num))
+            .limit(1)
+        )
+    ).scalars().first()
+
+
+async def _resolve_reply_recipient(
+    session,
+    acc_id: int,
+    uid: str,
+    *,
+    meta: dict | None = None,
+    state_data: dict | None = None,
+) -> tuple[str, str, str]:
+    """
+    Email получателя ответа (контакт), тема, наш ящик.
+    Источник правды — IncomingMail в Postgres (переживает redeploy).
+    """
+    meta = meta or {}
+    state_data = state_data or {}
+
+    to_email = _canon_email(
+        state_data.get("to_email") or meta.get("from_email") or ""
+    )
+    subject = (state_data.get("subject") or meta.get("subject") or "").strip()
+    account_email = _canon_email(
+        state_data.get("account_email") or meta.get("account_email") or ""
+    )
+
+    mail = await _load_incoming_mail_for_uid(session, acc_id, uid)
+    if mail:
+        to_email = _canon_email(mail.from_email or "") or to_email
+        subject = (mail.subject or "").strip() or subject
+        account_email = _canon_email(mail.account_email or "") or account_email
+
+    if not account_email:
+        acc = await session.get(EmailAccount, int(acc_id))
+        if acc and acc.email:
+            account_email = _canon_email(acc.email)
+
+    if to_email:
+        fm_key = (int(acc_id), str(uid))
+        FULL_META[fm_key] = {
+            **(FULL_META.get(fm_key) or {}),
+            "from_email": to_email,
+            "subject": subject,
+            "account_email": account_email,
+        }
+
+    return to_email, subject, account_email
 
 
 def _e(s: str) -> str:
@@ -1698,12 +1788,16 @@ async def cb_mail_reply(callback: CallbackQuery, state: FSMContext):
         return await callback.answer("Неверные данные", show_alert=True)
 
     meta = FULL_META.get((acc_id, uid)) or {}
-    to_email = _canon_email(meta.get("from_email") or "")
-    subject = (meta.get("subject") or "").strip()
-    account_email = _canon_email(meta.get("account_email") or "")
+    async with Session() as session:
+        to_email, subject, account_email = await _resolve_reply_recipient(
+            session, acc_id, uid, meta=meta, state_data={}
+        )
 
     if not to_email or "@" not in to_email:
-        return await callback.answer("Не вижу email отправителя", show_alert=True)
+        return await callback.answer(
+            "Не вижу email получателя. Откройте карточку письма и нажмите «Написать ещё» снова.",
+            show_alert=True,
+        )
 
     inbox_label = ""
     try:
@@ -1804,15 +1898,34 @@ async def cb_mail_reply_mode(callback: CallbackQuery, state: FSMContext):
 
     # html picker
     if mode == "html":
+        async with Session() as session:
+            to_email, subject, account_email = await _resolve_reply_recipient(
+                session,
+                acc_id,
+                uid,
+                meta=FULL_META.get((acc_id, uid)),
+                state_data=data,
+            )
+        await state.update_data(
+            to_email=to_email,
+            subject=subject,
+            account_email=account_email,
+        )
+        html_text = (
+            "🧩 <b>HTML</b>\n\n"
+            f"Кому: <code>{_e(to_email) or '—'}</code>\n"
+            f"От ящика: <code>{_e(account_email) or '—'}</code>\n\n"
+            "Выберите шаблон:"
+        )
         try:
             await callback.message.edit_text(
-                "🧩 <b>HTML</b>\n\nВыберите шаблон:",
+                html_text,
                 parse_mode="HTML",
                 reply_markup=_kb_html_pick(acc_id, uid),
             )
         except Exception:
             ui = await callback.message.answer(
-                "🧩 <b>HTML</b>\n\nВыберите шаблон:",
+                html_text,
                 parse_mode="HTML",
                 reply_markup=_kb_html_pick(acc_id, uid),
             )
@@ -1834,10 +1947,24 @@ async def cb_mail_reply_preset_send(callback: CallbackQuery, state: FSMContext):
         return await callback.answer("Неверные данные", show_alert=True)
 
     data = await state.get_data()
-    to_email = str(data.get("to_email") or "").strip().lower()
-    subject = str(data.get("subject") or "").strip()
-    if not to_email:
-        return await callback.answer("Не вижу email отправителя", show_alert=True)
+    async with Session() as session:
+        to_email, subject, account_email = await _resolve_reply_recipient(
+            session,
+            acc_id,
+            mail_uid,
+            meta=FULL_META.get((acc_id, mail_uid)),
+            state_data=data,
+        )
+    if not to_email or "@" not in to_email:
+        return await callback.answer(
+            "Не вижу email получателя. Откройте карточку письма снова.",
+            show_alert=True,
+        )
+    await state.update_data(
+        to_email=to_email,
+        subject=subject,
+        account_email=account_email,
+    )
 
     tg_id = int(callback.from_user.id)
     preset_body = ""
@@ -1961,12 +2088,24 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
         return await callback.answer("Неверные данные", show_alert=True)
 
     data = await state.get_data()
-    to_email = str(data.get("to_email") or "").strip().lower()
-    subject_raw = str(data.get("subject") or "").strip()
-    account_email = str(data.get("account_email") or "").strip().lower()
-
-    if not to_email:
-        return await callback.answer("Не вижу email отправителя", show_alert=True)
+    async with Session() as session:
+        to_email, subject_raw, account_email = await _resolve_reply_recipient(
+            session,
+            acc_id,
+            uid,
+            meta=FULL_META.get((acc_id, uid)),
+            state_data=data,
+        )
+    if not to_email or "@" not in to_email:
+        return await callback.answer(
+            "Не вижу email получателя. Откройте карточку письма и «Написать ещё» → HTML.",
+            show_alert=True,
+        )
+    await state.update_data(
+        to_email=to_email,
+        subject=subject_raw,
+        account_email=account_email,
+    )
 
     if kind == "custom":
         await state.set_state(_MailReplyState.waiting_custom_html)
@@ -2134,12 +2273,23 @@ async def mail_reply_text(message: Message, state: FSMContext):
 
     acc_id = int(data.get("acc_id") or 0)
     uid = str(data.get("uid") or "")
-    to_email = str(data.get("to_email") or "").strip().lower()
-    subject = str(data.get("subject") or "").strip()
-
-    out_subject = _reply_subject(subject)
     tg_id = int(message.from_user.id)
     body_for_notify = text
+
+    async with Session() as session:
+        to_email, subject, _acc_em = await _resolve_reply_recipient(
+            session,
+            acc_id,
+            uid,
+            meta=FULL_META.get((acc_id, uid)),
+            state_data=data,
+        )
+    if not to_email or "@" not in to_email:
+        return await message.answer(
+            "❌ Не вижу email получателя. Откройте карточку письма и «Написать ещё» снова."
+        )
+
+    out_subject = _reply_subject(subject)
 
     async def _send() -> tuple[bool, str | None]:
         async with Session() as session:
@@ -2196,13 +2346,23 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
 
     acc_id = int(data.get("acc_id") or 0)
     mail_uid = str(data.get("uid") or "")
-    to_email = str(data.get("to_email") or "").strip().lower()
-    subject_raw = str(data.get("subject") or "").strip()
-    account_email = str(data.get("account_email") or "").strip().lower()
     tg_id = int(message.from_user.id)
     html_text = text
     body_for_notify = _preview_reply_body(html_text, is_html=True)
     sent_pkg: dict = {}
+
+    async with Session() as session:
+        to_email, subject_raw, account_email = await _resolve_reply_recipient(
+            session,
+            acc_id,
+            mail_uid,
+            meta=FULL_META.get((acc_id, mail_uid)),
+            state_data=data,
+        )
+    if not to_email or "@" not in to_email:
+        return await message.answer(
+            "❌ Не вижу email получателя. Откройте карточку письма снова."
+        )
 
     async def _send() -> tuple[bool, str | None]:
         async with Session() as session:

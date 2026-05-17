@@ -145,6 +145,11 @@ async def init_db() -> None:
             "БД: %s — для Railway добавьте Postgres и переменную DATABASE_URL",
             dialect,
         )
+        if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"):
+            log.error(
+                "RAILWAY без PostgreSQL: аккаунты/офферы/входящие пропадут при redeploy! "
+                "Postgres → Variables → DATABASE_URL (Reference). См. RAILWAY_DATABASE.txt"
+            )
 
     # создаём таблицы если нет
     async with engine.begin() as conn:
