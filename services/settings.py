@@ -69,7 +69,6 @@ def _timing_default() -> dict:
     return {
         "min": 1,
         "max": 5,
-        "fast_mode": False,
         "min_delay": 1,
         "max_delay": 5,
         "batch_size": 1,
@@ -93,8 +92,6 @@ async def load_timing(session: Session, tg_user_id: int) -> dict:
                 # нормализация
                 base["min"] = int(base.get("min", 1))
                 base["max"] = int(base.get("max", 5))
-                base["fast_mode"] = bool(base.get("fast_mode", False))
-
                 # совместимость с send.py, который может ожидать min_delay/max_delay/batch_size
                 base["min_delay"] = float(base.get("min_delay", base["min"]))
                 base["max_delay"] = float(base.get("max_delay", base["max"]))
@@ -114,7 +111,6 @@ async def save_timing(session: Session, tg_user_id: int, timing: dict) -> None:
     payload = {
         "min": int(timing.get("min", 1)),
         "max": int(timing.get("max", 5)),
-        "fast_mode": bool(timing.get("fast_mode", False)),
         "min_delay": float(timing.get("min_delay", timing.get("min", 1))),
         "max_delay": float(timing.get("max_delay", timing.get("max", 5))),
         "batch_size": int(timing.get("batch_size", 1)),

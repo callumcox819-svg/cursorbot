@@ -75,7 +75,6 @@ SEND_ONE_TIMEOUT = 25
 SEND_BATCH_TIMEOUT = 60
 
 # user settings keys (уже используются в проекте)
-COUNTRY_KEY = "country"
 GAG_PROFILE_NAME_KEY = "gag_profile_name"
 GAG_PROFILE_ADDRESS_KEY = "gag_profile_address"
 
@@ -161,12 +160,8 @@ async def _build_message_for_target(session: AsyncSession, tg_user_id: int, tgt:
     address = ""
 
     user = await get_or_create_user(session, tg_user_id)
-    country = ((await get_user_setting(session, user, COUNTRY_KEY)) or "").strip().upper()
-
-    # CH profile (как в авто-ответах)
-    if country == "CH":
-        buyer_name = ((await get_user_setting(session, user, GAG_PROFILE_NAME_KEY)) or "").strip()
-        address = ((await get_user_setting(session, user, GAG_PROFILE_ADDRESS_KEY)) or "").strip()
+    buyer_name = ((await get_user_setting(session, user, GAG_PROFILE_NAME_KEY)) or "").strip()
+    address = ((await get_user_setting(session, user, GAG_PROFILE_ADDRESS_KEY)) or "").strip()
 
     ctx = {
         "ITEM_TITLE": item_title,
@@ -210,7 +205,7 @@ async def send_cmd(message: Message):
     await start_sending(message)
 
 
-async def start_sending(message: Message, fast: bool = False):
+async def start_sending(message: Message):
     tg_user_id = message.from_user.id
     chat_id = message.chat.id
     bot = message.bot
@@ -218,14 +213,6 @@ async def start_sending(message: Message, fast: bool = False):
     async with async_session() as session:
         db_user = await get_or_create_user(session, tg_user_id)
         timing = await load_timing(session, tg_user_id)
-
-        fast_send_toggle = str(await get_user_setting(session, db_user, "fast_send") or "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        mode_fast = bool(timing.get("fast_mode", False)) or fast_send_toggle or fast
 
         db_user_id = db_user.id
         accounts = await _get_active_accounts(session, db_user_id)
@@ -283,24 +270,24 @@ async def start_sending(message: Message, fast: bool = False):
             accounts_total=int(accounts_total_db),
             accounts_active=len(accounts),
             last_error="",
-            last_status="FAST" if mode_fast else "NORMAL",
+            last_status="NORMAL",
         )
         set_sending_state(tg_user_id, state=state)
 
     await tg_answer_safe(
         message,
-        f"✅ Рассылка запущена ({'FAST' if mode_fast else 'NORMAL'}).\n"
+        "✅ Рассылка запущена (NORMAL).\n"
         f"В очереди: <b>{total_targets}</b> email",
         reply_markup=main_menu_kb(tg_user_id),
         parse_mode="HTML",
     )
 
     asyncio.create_task(
-        _sending_loop(bot=bot, chat_id=chat_id, tg_user_id=tg_user_id, mode_fast=mode_fast)
+        _sending_loop(bot=bot, chat_id=chat_id, tg_user_id=tg_user_id)
     )
 
 
-async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int, mode_fast: bool) -> None:
+async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
     state = get_sending_state(tg_user_id) or SendingState(user_id=tg_user_id)
     smtp_sem = asyncio.Semaphore(SMTP_CONCURRENCY_WITH_PROXY)
 
@@ -339,12 +326,6 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int, mode_fast: b
         min_delay = float(timing.get("min_delay", 1.5))
         max_delay = float(timing.get("max_delay", 3.0))
         batch_size = int(timing.get("batch_size", 1))
-        fast_mode = mode_fast
-
-        if fast_mode:
-            min_delay = 0.0
-            max_delay = 0.0
-            batch_size = max(batch_size, 5)
 
         try:
 

@@ -332,63 +332,6 @@ async def tmpl_send_for_mail(call: CallbackQuery) -> None:
 
 
 # =========================
-# AUTO-REPLY ENGINE COMPAT
-# =========================
-def render_template(*, template_title: str | None = None, html_name: str | None = None, context: dict | None = None) -> str:
-    """Render HTML for auto-reply.
-
-    This function is used by services.auto_reply_engine.
-    It does NOT touch UI/callbacks. It only loads an HTML file from data/html and replaces {PLACEHOLDER} tokens.
-
-    Supported placeholders in built-in templates: {LINK}, {BUYER_NAME}, {ITEM_TITLE}, {PRICE}, {ADDRESS}.
-    The values are taken from `context` by both exact key and lowercased key (e.g. LINK <- context['LINK'] or context['link']).
-    Missing placeholders are replaced with empty string.
-    """
-    ctx = context or {}
-
-    # Resolve html template file
-    name = (html_name or "").strip() or "confirmation.html"
-    p = Path("data") / "html" / name
-    if not p.exists():
-        # fallback to default
-        p = Path("data") / "html" / "confirmation.html"
-    try:
-        html_text = p.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        html_text = ""
-
-    # Optional injection of a text-template by title (only if the HTML contains {TEMPLATE_TEXT})
-    template_text = ""
-    if template_title:
-        try:
-            tg_id = int(ctx.get("tg_id") or ctx.get("telegram_id") or 0)
-            if tg_id:
-                items = _load_templates_sync(tg_id)
-                for it in items:
-                    if (it.title or "").strip() == str(template_title).strip():
-                        template_text = (it.text or "").strip()
-                        break
-        except Exception:
-            template_text = ""
-
-    if "{TEMPLATE_TEXT}" in html_text:
-        html_text = html_text.replace("{TEMPLATE_TEXT}", template_text)
-
-    # Replace {PLACEHOLDER}
-    def repl(m):
-        key = m.group(1)
-        if key in ctx:
-            return str(ctx.get(key) or "")
-        lk = key.lower()
-        if lk in ctx:
-            return str(ctx.get(lk) or "")
-        if key == "LINK" and "generated_link" in ctx:
-            return str(ctx.get("generated_link") or "")
-        return ""
-
-    html_text = re.sub(r"\{([A-Z0-9_]+)\}", repl, html_text)
-    return html_text
-# =========================
 # PRESETS / SMART PRESETS (единый экран как на скрине)
 # =========================
 

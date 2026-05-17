@@ -38,8 +38,4 @@ class Config:
     GAG_SEND_EMAIL_URL = os.getenv("GAG_SEND_EMAIL_URL", "https://imgbeoxo.com/send-email").strip()
     GAG_DEFAULT_VERSION = os.getenv("GAG_DEFAULT_VERSION", "lk").strip() or "lk"
 
-    # 🌐 API Goo.Network
-    GOO_API_URL = "https://api.goo.network/api/generate/single/offer"
-
-
 config = Config()

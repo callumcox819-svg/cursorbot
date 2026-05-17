@@ -12,7 +12,6 @@ from aiogram.exceptions import TelegramBadRequest
 from config import config
 from database import Session
 from services.users import get_or_create_user
-from services.team_keys import TEAM_OPTIONS, set_team_api_key, get_team_api_key
 from sqlalchemy import select, func
 
 from models import EmailAccount, SentEmail, OfferEmail, Offer, User
@@ -23,7 +22,6 @@ router = Router(name="admin_panel")
 
 
 class AdminState(StatesGroup):
-    waiting_teamkey_value = State()
     waiting_grant_admin = State()
     waiting_revoke_admin = State()
     waiting_allow = State()
@@ -37,7 +35,6 @@ def admin_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📊 Статистика пользователей", callback_data="admin_user_stats")],
             [InlineKeyboardButton(text="✅ Выдать доступ", callback_data="admin_allow")],
             [InlineKeyboardButton(text="⛔ Удалить доступ", callback_data="admin_deny")],
-            [InlineKeyboardButton(text="🔑 Ключ тимы", callback_data="admin_teamkey")],
             [InlineKeyboardButton(text="👑 Выдать админ права", callback_data="admin_grant_admin")],
             [InlineKeyboardButton(text="🔄 Рестарт", callback_data="admin_restart")],
         ]
@@ -200,81 +197,6 @@ async def admin_stats_finish(message: Message, state: FSMContext) -> None:
         f"✉️ Отправлено (антидубль): <b>{sent_count}</b>",
     )
     await message.answer("👑 <b>Админ-панель</b>", reply_markup=admin_kb())
-
-
-@router.callback_query(F.data == "admin_teamkey")
-async def admin_teamkey(callback: CallbackQuery) -> None:
-    if not await is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=t, callback_data=f"admin_teamkey:{t}") for t in TEAM_OPTIONS],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")],
-        ]
-    )
-    await callback.message.edit_text("🔑 <b>Ключ тимы</b>\n\nВыбери команду:", reply_markup=kb)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admin_teamkey:"))
-async def admin_teamkey_open(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    team = callback.data.split(":", 1)[1].strip().upper()
-    async with Session() as session:
-        key = await get_team_api_key(session, team)
-    status = "✅ установлен" if key else "❌ не установлен"
-    text = (
-        f"🔑 <b>Ключ тимы</b> — <b>{team}</b>\n\n"
-        f"Статус: <b>{status}</b>\n"
-        f"Ключ: <code>{key or '—'}</code>\n"
-    )
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🛠 Установить", callback_data=f"admin_teamkey_set:{team}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_teamkey")],
-        ]
-    )
-    await state.clear()
-    await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admin_teamkey_set:"))
-async def admin_teamkey_set(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    team = callback.data.split(":", 1)[1].strip().upper()
-    await state.update_data(team=team)
-    await state.set_state(AdminState.waiting_teamkey_value)
-    await callback.message.edit_text(
-        f"🔑 <b>Установить ключ тимы</b> — <b>{team}</b>\n\nОтправь Team API Key одним сообщением.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_teamkey:{team}")]]
-        ),
-    )
-    await callback.answer()
-
-
-@router.message(AdminState.waiting_teamkey_value)
-async def admin_teamkey_finish(message: Message, state: FSMContext) -> None:
-    if not await is_admin(message.from_user.id):
-        return
-    data = await state.get_data()
-    team = (data.get("team") or "").strip().upper()
-    key = (message.text or "").strip()
-    async with Session() as session:
-        await set_team_api_key(session, team, key if key else None)
-    await state.clear()
-    await message.answer("✅ Сохранено (глобально для всех пользователей).")
-    # reopen screen
-    fake_cb = type("obj", (), {"from_user": message.from_user, "data": f"admin_teamkey:{team}", "message": message, "answer": lambda *a, **k: None})
-    # Use normal flow:
-    await open_admin(message)
 
 
 @router.callback_query(F.data == "admin_grant_admin")

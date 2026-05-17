@@ -194,10 +194,6 @@ async def spoof_name_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     async with Session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
-        country = (await get_user_setting(session, user, COUNTRY_KEY) or "CH").strip().upper() or "CH"
-        if country != "CH":
-            return await callback.answer("Доступно только для Швейцарии", show_alert=True)
-
         service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
         if not service:
             return await callback.answer("Сначала выберите сервис в профиле", show_alert=True)
@@ -268,27 +264,6 @@ async def settings_open_cb(callback: CallbackQuery, state: FSMContext):
     await callback_answer_safe(callback)
     kb = await _settings_menu_kb_for_user(callback.from_user.id)
     await _cq_edit_text(callback, "Настройки", reply_markup=kb)
-
-
-@router.callback_query(F.data == "settings_countries")
-async def settings_countries(callback: CallbackQuery, state: FSMContext):
-    async with Session() as session:
-        user = await get_or_create_user(session, callback.from_user.id)
-        cur = (await get_user_setting(session, user, COUNTRY_KEY) or "CH").strip().upper() or "CH"
-
-    def mark(code: str, name: str) -> str:
-        return ("✅ " if cur == code else "") + name
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=mark("DE", "ГЕРМАНИЯ"), callback_data="country_set:DE")],
-            [InlineKeyboardButton(text=mark("NO", "НОРВЕГИЯ"), callback_data="country_set:NO")],
-            [InlineKeyboardButton(text=mark("CH", "ШВЕЙЦАРИЯ"), callback_data="country_set:CH")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open")],
-        ]
-    )
-    await callback.message.edit_text("🌍 <b>СТРАНЫ</b>\n\nВыберите страну:", reply_markup=kb, parse_mode="HTML")
-    await callback.answer()
 
 
 # =========================
@@ -418,7 +393,6 @@ async def settings_timings(callback: CallbackQuery, state: FSMContext) -> None:
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="✏️ Изменить тайминг", callback_data="timings_edit")],
-                [InlineKeyboardButton(text=" ", callback_data="timings_fast_toggle")],
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open")],
             ]
         ),
@@ -475,24 +449,6 @@ async def timings_set(message: Message, state: FSMContext) -> None:
     await message.answer("✅ Сохранено.")
 
 
-@router.callback_query(F.data.startswith("country_set:"))
-async def country_set(callback: CallbackQuery, state: FSMContext):
-    try:
-        _, code = (callback.data or "").split(":", 1)
-        code = (code or "").strip().upper()
-    except Exception:
-        return await callback.answer("Неверные данные", show_alert=True)
-
-    if code not in ("DE", "NO", "CH"):
-        return await callback.answer("Неизвестная страна", show_alert=True)
-
-    async with Session() as session:
-        user = await get_or_create_user(session, callback.from_user.id)
-        await set_user_setting(session, user, COUNTRY_KEY, code)
-
-    await settings_countries(callback, state)
-
-
 @router.callback_query(F.data == "settings_back")
 async def settings_back(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -541,10 +497,6 @@ class GAGProfileState(StatesGroup):
 async def gag_profile_create(callback: CallbackQuery, state: FSMContext) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
-        country = (await get_user_setting(session, user, COUNTRY_KEY) or "CH").strip().upper() or "CH"
-        if country != "CH":
-            return await callback.answer("Доступно только для Швейцарии", show_alert=True)
-
         cur_title = (await get_user_setting(session, user, GAG_PROFILE_TITLE_KEY) or "—").strip() or "—"
         cur_name = (await get_user_setting(session, user, GAG_PROFILE_NAME_KEY) or "—").strip() or "—"
         cur_addr = (await get_user_setting(session, user, GAG_PROFILE_ADDRESS_KEY) or "—").strip() or "—"
@@ -607,9 +559,6 @@ async def gag_profile_address(message: Message, state: FSMContext) -> None:
 async def gag_service_menu(callback: CallbackQuery) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
-        country = (await get_user_setting(session, user, COUNTRY_KEY) or "CH").strip().upper() or "CH"
-        if country != "CH":
-            return await callback.answer("Доступно только для Швейцарии", show_alert=True)
         cur = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
 
     def mark(service: str, label: str) -> str:
@@ -671,9 +620,6 @@ def _parse_gag_slot(raw: str | None) -> int | None:
 async def gag_domain_menu(callback: CallbackQuery) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
-        country = (await get_user_setting(session, user, COUNTRY_KEY) or "CH").strip().upper() or "CH"
-        if country != "CH":
-            return await callback.answer("Доступно только для Швейцарии", show_alert=True)
         cur_slot = _parse_gag_slot(await get_user_setting(session, user, GAG_DOMAIN_SLOT_KEY))
 
     def mark_slot(slot: int) -> str:
@@ -712,9 +658,6 @@ async def gag_domain_menu(callback: CallbackQuery) -> None:
 async def gag_domain_team(callback: CallbackQuery) -> None:
     async with Session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
-        country = (await get_user_setting(session, user, COUNTRY_KEY) or "CH").strip().upper() or "CH"
-        if country != "CH":
-            return await callback.answer("Доступно только для Швейцарии", show_alert=True)
         # Team domain = default => store empty/None
         await set_user_setting(session, user, GAG_DOMAIN_SLOT_KEY, None)
 
@@ -734,9 +677,6 @@ async def gag_domain_set(callback: CallbackQuery) -> None:
 
     async with Session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
-        country = (await get_user_setting(session, user, COUNTRY_KEY) or "CH").strip().upper() or "CH"
-        if country != "CH":
-            return await callback.answer("Доступно только для Швейцарии", show_alert=True)
         await set_user_setting(session, user, GAG_DOMAIN_SLOT_KEY, str(slot))
 
     await gag_domain_menu(callback)
@@ -758,9 +698,7 @@ _REF_TOGGLE_KEYS = {
     "saver": "saver",
     "card": "card",
     "block_control": "block_control",
-    "fast_send": "fast_send",
     "proxy_rotation": "proxy_rotation",
-        "auto_reply_enabled": "auto_reply_enabled",
 }
 
 
@@ -807,30 +745,21 @@ async def ref_open(callback: CallbackQuery, state: FSMContext):
     screen = (callback.data or "").split(":", 1)[1].strip()
     if screen == "commands":
         await state.clear()
-        async with Session() as session:
-            user = await get_or_create_user(session, callback.from_user.id)
-            country = (await get_user_setting(session, user, COUNTRY_KEY) or "CH").strip().upper() or "CH"
-            team = (await get_user_setting(session, user, TEAM_KEY) or "").strip().upper()
-
-        if country == "CH":
-            options = [("GAG", "GAG")]
-        else:
-            options = [("AQUA", "AQUA"), ("NURPP", "NURPP"), ("TSUM", "TSUM")]
-
-        rows = []
-        for code, title in options:
-            mark = "✅ " if team == code else ""
-            rows.append([InlineKeyboardButton(text=f"{mark}{title}", callback_data=f"team_pick:{code}")])
-        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open")])
-
-        kb = InlineKeyboardMarkup(inline_keyboard=rows)
         msg = (
             "⌨️ <b>Команды</b>\n\n"
-            f"Страна: <b>{country}</b>\n"
-            f"Команда: <b>{team or 'не выбрана'}</b>\n\n"
-            "Выберите команду:"
+            "Страна: <b>Швейцария (CH)</b>\n"
+            "Команда: <b>GAG</b>\n\n"
+            "/send — запустить рассылку\n"
+            "/stop — остановить рассылку\n"
+            "/stat — статус рассылки"
         )
-        await callback.message.edit_text(msg, reply_markup=kb, parse_mode="HTML")
+        await callback.message.edit_text(
+            msg,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open")]]
+            ),
+            parse_mode="HTML",
+        )
         await callback.answer()
         return
     if screen in {"themes", "themes_html"}:
@@ -838,7 +767,7 @@ async def ref_open(callback: CallbackQuery, state: FSMContext):
         title = "📌 <b>Темы</b>" if screen == "themes" else "🏷 <b>Тема для HTML</b>"
         text = (
             f"{title}\n\n"
-            "В этом проекте темы/шаблоны управляются через «🧾 Пресеты» и «🤖 Авто-ответ».\n"
+            "В этом проекте темы/шаблоны управляются через «🧾 Пресеты».\n"
             "Если нужно — добавлю отдельный менеджер тем 1в1 (лист/добавить/удалить/выбрать)."
         )
         await callback.message.edit_text(text, reply_markup=_simple_back_kb(), parse_mode="HTML")

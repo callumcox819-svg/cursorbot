@@ -21,7 +21,6 @@ from sqlalchemy.exc import OperationalError
 
 from database import Session
 from models import EmailAccount, User, ConversationLink, Offer, OfferEmail, IncomingMail
-from services.auto_reply_engine import handle_auto_for_mail
 from services.link_id import link_id_from_generated_url
 from services.user_settings import get_user_setting
 from services.offer_matching import resolve_offer_for_incoming as _resolve_offer_for_incoming
@@ -47,38 +46,6 @@ _EOF_LOG_COOLDOWN_SEC = 120.0
 
 FULL_BODIES: Dict[tuple[int, str], str] = {}
 FULL_META: Dict[tuple[int, str], Dict[str, Any]] = {}
-
-# ✅ держим ссылки на авто-таски, чтобы не терялись
-_AUTO_TASKS: set[asyncio.Task] = set()
-
-
-def _spawn_auto_reply_task(mail_id: int, meta: Dict[str, Any]) -> None:
-    """
-    Запускает авто-ответ устойчиво:
-    - передаём mail_id и meta в handle_auto_for_mail
-    - держим ссылку на таску
-    - логируем исключения
-    """
-    try:
-        task = asyncio.create_task(handle_auto_for_mail(int(mail_id), meta))
-
-        def _done_cb(t: asyncio.Task) -> None:
-            _AUTO_TASKS.discard(t)
-            try:
-                exc = t.exception()
-            except asyncio.CancelledError:
-                return
-            except Exception:
-                logger.exception("[AUTO] Failed to read task exception mail_id=%s", mail_id)
-                return
-            if exc:
-                logger.exception("[AUTO] Auto-reply task crashed mail_id=%s", mail_id, exc_info=exc)
-
-        _AUTO_TASKS.add(task)
-        task.add_done_callback(_done_cb)
-    except Exception:
-        logger.exception("[AUTO] Failed to start auto task mail_id=%s", mail_id)
-
 
 def _now() -> float:
     return time.time()
@@ -1244,13 +1211,6 @@ async def _process_mails_for_account(
                         await bot.send_message(chat_id=tg_id, text=warn)
                 except Exception:
                     logger.exception("Failed to mark smtp_blocked for %s", account_email)
-
-            # ✅ авто-ответ только после карточки письма
-            if mail_db_id:
-                meta = FULL_META.get((acc_id, uid_key), {})
-                meta["tg_msg_id"] = int(getattr(m, "message_id", 0) or 0)
-                FULL_META[(acc_id, uid_key)] = meta
-                _spawn_auto_reply_task(int(mail_db_id), meta)
 
             forwarded += 1
 

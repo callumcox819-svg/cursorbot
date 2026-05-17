@@ -17,9 +17,7 @@ from models import EmailAccount, ConversationLink, Offer, OfferEmail, IncomingMa
 
 from services.users import get_or_create_user
 from services.user_settings import get_user_setting
-from services.team_keys import get_team_api_key
 from services.gag_keys import gag_default_version, gag_generate_endpoint, get_user_gag_api_key
-from services.goo_network import generate_single_parse
 from services.gag_network import generate_gag_url, GAGError
 from services.incoming_mail_worker import FULL_META, _try_pin, build_mail_card_from_mail
 from services.offer_matching import resolve_offer_for_incoming
@@ -372,62 +370,6 @@ async def _offer_link_by_subject_or_name(
             return str(row_n[0]).strip()
 
     return None
-
-
-def _looks_transient_goo_error(msg: str) -> bool:
-    s = (msg or "").lower()
-    return any(
-        x in s
-        for x in (
-            "timeout",
-            "timed out",
-            "temporarily",
-            "temporary",
-            "connection",
-            "connect",
-            "network",
-            "eof",
-            "reset",
-            "502",
-            "503",
-            "504",
-        )
-    )
-
-
-async def _generate_goo_with_retries(
-    *,
-    user_api_key: str,
-    team_api_key: str,
-    team_name: str,
-    profile_id: str,
-    service: str,
-    url: str,
-    attempts: int = 3,
-) -> tuple[bool, str]:
-    """Call generate_single_parse with a few safe retries.
-
-    We only retry on errors that look transient (timeouts/network/5xx).
-    """
-    last_msg = ""
-    for i in range(max(1, int(attempts))):
-        ok, msg = await generate_single_parse(
-            user_api_key=user_api_key,
-            team_api_key=team_api_key,
-            team_name=team_name,
-            profile_id=profile_id,
-            service=service,
-            url=url,
-            need_balance_checker=False,
-        )
-        if ok:
-            return True, str(msg)
-        last_msg = str(msg)
-        if i < attempts - 1 and _looks_transient_goo_error(last_msg):
-            await asyncio.sleep(0.8 + (i * 0.8))
-            continue
-        break
-    return False, last_msg
 
 
 async def _get_acc_owner_user_id(session, acc_id: int) -> int | None:
@@ -895,221 +837,111 @@ async def cb_create_goo_link_from_db(callback: CallbackQuery):
             await callback.answer()
             return
 
-        # Switzerland: use GAG (imageoxo) instead of Goo
-        country = (await get_user_setting(session, tg_user, COUNTRY_KEY) or "DE").strip().upper() or "DE"
-        if country == "CH":
-            gag_key = await get_user_gag_api_key(session, tg_user)
-            if not gag_key:
-                await callback.message.answer(
-                    "❌ <b>GAG API ключ не установлен</b>\n\n"
-                    "Открой ⚙️ Настройки → 🔑 Ключ и вставь свой API-ключ команды.",
-                    parse_mode="HTML",
-                )
-                await callback.answer()
-                return
-
-            service = (await get_user_setting(session, tg_user, GAG_SERVICE_KEY) or "").strip()
-            if service not in ("tutti_ch", "post_ch", "ricardo_ch"):
-                await callback.message.answer(
-                    "❌ Не выбран сервис (ТУТТИ/ПОСТ/Ricardo.ch). Открой 👤 Профиль → 🧭 Выбор сервиса."
-                )
-                await callback.answer()
-                return
-
-            prof_title = (await get_user_setting(session, tg_user, GAG_PROFILE_TITLE_KEY) or "").strip()
-            prof_name = (await get_user_setting(session, tg_user, GAG_PROFILE_NAME_KEY) or "").strip()
-            prof_addr = (await get_user_setting(session, tg_user, GAG_PROFILE_ADDRESS_KEY) or "").strip()
-            if not (prof_title and prof_name and prof_addr):
-                await callback.message.answer(
-                    "❌ Профиль GAG не заполнен. Открой 👤 Профиль → ➕ Создать профиль."
-                )
-                await callback.answer()
-                return
-
-            offer_title = offer_price = offer_image = None
-            offer_id = None
-            if getattr(mail, "resolved_offer_id", None):
-                offer = (
-                    await session.execute(select(Offer).where(Offer.id == int(mail.resolved_offer_id)).limit(1))
-                ).scalars().first()
-                if offer:
-                    offer_title = (offer.title or "").strip() or None
-                    offer_price = (offer.price or "").strip() or None
-                    offer_image = (offer.photo or "").strip() or None
-                    offer_id = int(getattr(offer, "id", 0) or 0) or None
-
-            title = offer_title or (mail.subject or "").strip()
-            price = offer_price
-            if not title:
-                await callback.message.answer("❌ Нет названия объявления (title).")
-                await callback.answer()
-                return
-            if not price:
-                await callback.message.answer("❌ Нет цены объявления (price).")
-                await callback.answer()
-                return
-
-            # Map our internal service code to GAG API service code.
-            # GAG API expects POSTA.CH as "posta_ch" (not "post_ch").
-            api_service = "posta_ch" if service == "post_ch" else service
-
-            # Domain selection (CH/GAG):
-            # - If user selected personal domain slot 1..4, map to API 5..8
-            # - If not selected (team domain), omit "domain" so GAG uses its default (team)
-            dom_raw = (await get_user_setting(session, tg_user, "gag_domain_slot") or "").strip()
-            dom_slot = None
-            try:
-                if dom_raw and dom_raw.lower() not in {"team", "default", "0"}:
-                    dom_slot = int(dom_raw)
-            except Exception:
-                dom_slot = None
-            api_domain = (dom_slot + 4) if dom_slot in (1, 2, 3, 4) else None
-
-            try:
-                gag_url = await generate_gag_url(
-                    endpoint=gag_generate_endpoint(),
-                    apikey=gag_key,
-                    title=title,
-                    price=price,
-                    service=api_service,
-                    name=prof_name,
-                    address=prof_addr,
-                    image=offer_image,
-                    domain=api_domain,
-                    version=gag_default_version(),
-                )
-            except GAGError as e:
-                await callback.message.answer(f"❌ GAG ошибка: {e}")
-                await callback.answer()
-                return
-
-            # Persist convlink for downstream HTML sending
-            await _upsert_convlink(
-                session,
-                user_id=int(tg_user.id),
-                inbox_email=inbox_email,
-                contact_email=contact_email,
-                ad_url=url,
-                generated_link=gag_url,
-            )
-            try:
-                mail.generated_link = gag_url
-            except Exception:
-                pass
-            await session.commit()
-
-            await _send_generated_link_card(
-                callback=callback,
-                offer_title=offer_title or title,
-                offer_price=offer_price or price,
-                photo_url=offer_image,
-                profile_display=prof_title,
-                service_code=service,
-                link=gag_url,
-                offer_id=offer_id,
+        gag_key = await get_user_gag_api_key(session, tg_user)
+        if not gag_key:
+            await callback.message.answer(
+                "❌ <b>GAG API ключ не установлен</b>\n\n"
+                "Открой ⚙️ Настройки → 🔑 Ключ и вставь свой API-ключ команды.",
+                parse_mode="HTML",
             )
             await callback.answer()
             return
 
-        # keys
-        user_api_key = _clean(tg_user.goo_user_api_key or tg_user.goo_api_key)
-        team_name = _clean(tg_user.goo_team_key)
-        profile_id = _clean(tg_user.goo_profile_id)
+        service = (await get_user_setting(session, tg_user, GAG_SERVICE_KEY) or "").strip()
+        if service not in ("tutti_ch", "post_ch", "ricardo_ch"):
+            await callback.message.answer(
+                "❌ Не выбран сервис (ТУТТИ/ПОСТ/Ricardo.ch). Открой 👤 Профиль → 🧭 Выбор сервиса."
+            )
+            await callback.answer()
+            return
 
-        if not user_api_key:
-            return await callback.answer("❌ Не задан User API key (GOO)", show_alert=True)
-        if not team_name:
-            return await callback.answer("❌ Не задан Team (AQUA/TSUM/NUR)", show_alert=True)
-        if not profile_id:
-            return await callback.answer("❌ Не задан Goo Profile ID", show_alert=True)
+        prof_title = (await get_user_setting(session, tg_user, GAG_PROFILE_TITLE_KEY) or "").strip()
+        prof_name = (await get_user_setting(session, tg_user, GAG_PROFILE_NAME_KEY) or "").strip()
+        prof_addr = (await get_user_setting(session, tg_user, GAG_PROFILE_ADDRESS_KEY) or "").strip()
+        if not (prof_title and prof_name and prof_addr):
+            await callback.message.answer(
+                "❌ Профиль GAG не заполнен. Открой 👤 Профиль → ➕ Создать профиль."
+            )
+            await callback.answer()
+            return
 
-        team_api_key = _clean(await get_team_api_key(session, team_name))
-        if not team_api_key:
-            return await callback.answer("❌ Не задан Team API key для выбранной команды", show_alert=True)
+        offer_title = offer_price = offer_image = None
+        offer_id = None
+        if getattr(mail, "resolved_offer_id", None):
+            offer = (
+                await session.execute(select(Offer).where(Offer.id == int(mail.resolved_offer_id)).limit(1))
+            ).scalars().first()
+            if offer:
+                offer_title = (offer.title or "").strip() or None
+                offer_price = (offer.price or "").strip() or None
+                offer_image = (offer.photo or "").strip() or None
+                offer_id = int(getattr(offer, "id", 0) or 0) or None
 
-    # GOO
-    service = "ebay_de"
-    ok, msg = await _generate_goo_with_retries(
-        user_api_key=user_api_key,
-        team_api_key=team_api_key,
-        team_name=team_name,
-        profile_id=profile_id,
-        service=service,
-        url=url,
-        attempts=3,
-    )
+        title = offer_title or (mail.subject or "").strip()
+        price = offer_price
+        if not title:
+            await callback.message.answer("❌ Нет названия объявления (title).")
+            await callback.answer()
+            return
+        if not price:
+            await callback.message.answer("❌ Нет цены объявления (price).")
+            await callback.answer()
+            return
 
-    if not ok:
-        await callback.message.answer(f"❌ Goo ошибка: <code>{_e(str(msg))}</code>", parse_mode="HTML")
-        await callback.answer()
-        return
+        api_service = "posta_ch" if service == "post_ch" else service
 
-    link = str(msg).strip()
-    if not link:
-        return await callback.answer("❌ Goo вернул пустую ссылку", show_alert=True)
+        dom_raw = (await get_user_setting(session, tg_user, "gag_domain_slot") or "").strip()
+        dom_slot = None
+        try:
+            if dom_raw and dom_raw.lower() not in {"team", "default", "0"}:
+                dom_slot = int(dom_raw)
+        except Exception:
+            dom_slot = None
+        api_domain = (dom_slot + 4) if dom_slot in (1, 2, 3, 4) else None
 
-    # Persist convlink for downstream HTML sending
-    async with Session() as session:
+        try:
+            gag_url = await generate_gag_url(
+                endpoint=gag_generate_endpoint(),
+                apikey=gag_key,
+                title=title,
+                price=price,
+                service=api_service,
+                name=prof_name,
+                address=prof_addr,
+                image=offer_image,
+                domain=api_domain,
+                version=gag_default_version(),
+            )
+        except GAGError as e:
+            await callback.message.answer(f"❌ GAG ошибка: {e}")
+            await callback.answer()
+            return
+
         await _upsert_convlink(
             session,
             user_id=int(tg_user.id),
             inbox_email=inbox_email,
             contact_email=contact_email,
             ad_url=url,
-            generated_link=link,
+            generated_link=gag_url,
         )
-        # also store into IncomingMail for debugging/history
         try:
-            mail = (
-                await session.execute(sa_select(IncomingMail).where(IncomingMail.id == int(mail_id)).limit(1))
-            ).scalars().first()
-            if mail:
-                # keep resolved_offer_id if we can now match by url
-                if not mail.resolved_offer_id:
-                    off = (
-                        await session.execute(
-                            sa_select(Offer).where(Offer.user_id == int(tg_user.id)).where(Offer.link == url).limit(1)
-                        )
-                    ).scalars().first()
-                    if off:
-                        mail.resolved_offer_id = int(off.id)
-                await session.commit()
-        except Exception:
-            await session.rollback()
-
-    # Render the same reference-style card (photo + fields) for generated links
-    offer_title = offer_price = photo_url = None
-    offer_id = None
-    async with Session() as session:
-        try:
-            off = (
-                await session.execute(
-                    sa_select(Offer)
-                    .where(Offer.user_id == int(tg_user.id))
-                    .where(Offer.link == url)
-                    .order_by(Offer.id.desc())
-                    .limit(1)
-                )
-            ).scalars().first()
-            if off:
-                offer_title = (off.title or '').strip() or None
-                offer_price = (off.price or '').strip() or None
-                photo_url = (off.photo or '').strip() or None
-                offer_id = int(getattr(off, 'id', 0) or 0) or None
+            mail.generated_link = gag_url
         except Exception:
             pass
+        await session.commit()
 
-    await _send_generated_link_card(
-        callback=callback,
-        offer_title=offer_title,
-        offer_price=offer_price,
-        photo_url=photo_url,
-        profile_display=profile_id,
-        service_code=service,
-        link=link,
-        offer_id=offer_id,
-    )
-    await callback.answer()
+        await _send_generated_link_card(
+            callback=callback,
+            offer_title=offer_title or title,
+            offer_price=offer_price or price,
+            photo_url=offer_image,
+            profile_display=prof_title,
+            service_code=service,
+            link=gag_url,
+            offer_id=offer_id,
+        )
+        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("goo_link:"))
@@ -1224,211 +1056,118 @@ async def cb_create_goo_link(callback: CallbackQuery):
             await callback.answer()
             return
 
-        # ключи из User + TeamKey
         user = await get_or_create_user(session, int(callback.from_user.id))
 
-        # Switzerland: use GAG (imageoxo) instead of Goo
-        country = (await get_user_setting(session, user, COUNTRY_KEY) or "DE").strip().upper() or "DE"
-        if country == "CH":
-            gag_key = await get_user_gag_api_key(session, user)
-            if not gag_key:
-                await callback.message.answer(
-                    "❌ <b>GAG API ключ не установлен</b>\n\n"
-                    "Открой ⚙️ Настройки → 🔑 Ключ и вставь свой API-ключ команды.",
-                    parse_mode="HTML",
-                )
-                return await callback.answer()
+        gag_key = await get_user_gag_api_key(session, user)
+        if not gag_key:
+            await callback.message.answer(
+                "❌ <b>GAG API ключ не установлен</b>\n\n"
+                "Открой ⚙️ Настройки → 🔑 Ключ и вставь свой API-ключ команды.",
+                parse_mode="HTML",
+            )
+            return await callback.answer()
 
-            service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
-            if service not in ("tutti_ch", "post_ch", "ricardo_ch"):
-                await callback.message.answer("❌ Не выбран сервис (ТУТТИ/ПОСТ/Ricardo.ch). Открой 👤 Профиль → 🧭 Выбор сервиса.")
-                return await callback.answer()
+        service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
+        if service not in ("tutti_ch", "post_ch", "ricardo_ch"):
+            await callback.message.answer(
+                "❌ Не выбран сервис (ТУТТИ/ПОСТ/Ricardo.ch). Открой 👤 Профиль → 🧭 Выбор сервиса."
+            )
+            return await callback.answer()
 
-            prof_title = (await get_user_setting(session, user, GAG_PROFILE_TITLE_KEY) or "").strip()
-            prof_name = (await get_user_setting(session, user, GAG_PROFILE_NAME_KEY) or "").strip()
-            prof_addr = (await get_user_setting(session, user, GAG_PROFILE_ADDRESS_KEY) or "").strip()
-            if not (prof_title and prof_name and prof_addr):
-                await callback.message.answer("❌ Профиль GAG не заполнен. Открой 👤 Профиль → ➕ Создать профиль.")
-                return await callback.answer()
+        prof_title = (await get_user_setting(session, user, GAG_PROFILE_TITLE_KEY) or "").strip()
+        prof_name = (await get_user_setting(session, user, GAG_PROFILE_NAME_KEY) or "").strip()
+        prof_addr = (await get_user_setting(session, user, GAG_PROFILE_ADDRESS_KEY) or "").strip()
+        if not (prof_title and prof_name and prof_addr):
+            await callback.message.answer("❌ Профиль GAG не заполнен. Открой 👤 Профиль → ➕ Создать профиль.")
+            return await callback.answer()
 
-            offer_title = None
-            offer_price = None
-            offer_image = None
-            offer_id = None
-            mail = (
-                await session.execute(
-                    sa_select(IncomingMail)
-                    .where(IncomingMail.account_id == int(acc_id))
-                    .where(IncomingMail.imap_uid == int(uid))
-                    .where(IncomingMail.user_id == int(owner_user_id))
-                    .limit(1)
-                )
+        offer_title = None
+        offer_price = None
+        offer_image = None
+        offer_id = None
+        mail = (
+            await session.execute(
+                sa_select(IncomingMail)
+                .where(IncomingMail.account_id == int(acc_id))
+                .where(IncomingMail.imap_uid == int(uid))
+                .where(IncomingMail.user_id == int(owner_user_id))
+                .limit(1)
+            )
+        ).scalars().first()
+
+        if mail and getattr(mail, "resolved_offer_id", None):
+            offer = (
+                await session.execute(select(Offer).where(Offer.id == int(mail.resolved_offer_id)).limit(1))
             ).scalars().first()
+            if offer:
+                offer_title = (offer.title or "").strip() or None
+                offer_price = (offer.price or "").strip() or None
+                offer_image = (offer.photo or "").strip() or None
+                offer_id = int(getattr(offer, "id", 0) or 0) or None
 
-            if mail and getattr(mail, "resolved_offer_id", None):
-                offer = (
-                    await session.execute(select(Offer).where(Offer.id == int(mail.resolved_offer_id)).limit(1))
-                ).scalars().first()
-                if offer:
-                    offer_title = (offer.title or "").strip() or None
-                    offer_price = (offer.price or "").strip() or None
-                    offer_image = (offer.photo or "").strip() or None
-                    offer_id = int(getattr(offer, "id", 0) or 0) or None
+        title = offer_title or ((mail.subject or "").strip() if mail else "")
+        price = offer_price
+        if not title:
+            await callback.message.answer("❌ Нет названия объявления (title).")
+            return await callback.answer()
+        if not price:
+            await callback.message.answer("❌ Нет цены объявления (price).")
+            return await callback.answer()
 
-            title = offer_title or ((mail.subject or "").strip() if mail else "")
-            price = offer_price
-            if not title:
-                await callback.message.answer("❌ Нет названия объявления (title).")
-                return await callback.answer()
-            if not price:
-                await callback.message.answer("❌ Нет цены объявления (price).")
-                return await callback.answer()
+        api_service = "posta_ch" if service == "post_ch" else service
 
-            # Map our internal service code to GAG API service code.
-            api_service = "posta_ch" if service == "post_ch" else service
-
-            # Domain selection (CH/GAG): see handlers/settings.py (gag_domain_slot)
-            dom_raw = (await get_user_setting(session, user, "gag_domain_slot") or "").strip()
+        dom_raw = (await get_user_setting(session, user, "gag_domain_slot") or "").strip()
+        dom_slot = None
+        try:
+            if dom_raw and dom_raw.lower() not in {"team", "default", "0"}:
+                dom_slot = int(dom_raw)
+        except Exception:
             dom_slot = None
+        api_domain = (dom_slot + 4) if dom_slot in (1, 2, 3, 4) else None
+
+        try:
+            gag_url = await generate_gag_url(
+                endpoint=gag_generate_endpoint(),
+                apikey=gag_key,
+                title=title,
+                price=price,
+                service=api_service,
+                name=prof_name,
+                address=prof_addr,
+                image=offer_image,
+                domain=api_domain,
+                version=gag_default_version(),
+            )
+        except GAGError as e:
+            await callback.message.answer(f"❌ GAG ошибка: {e}")
+            return await callback.answer()
+
+        await _upsert_convlink(
+            session,
+            user_id=int(owner_user_id),
+            inbox_email=inbox_email,
+            contact_email=contact_email,
+            ad_url=url,
+            generated_link=gag_url,
+        )
+        if mail:
             try:
-                if dom_raw and dom_raw.lower() not in {"team", "default", "0"}:
-                    dom_slot = int(dom_raw)
+                mail.generated_link = gag_url
             except Exception:
-                dom_slot = None
-            api_domain = (dom_slot + 4) if dom_slot in (1, 2, 3, 4) else None
-
-            try:
-                gag_url = await generate_gag_url(
-                    endpoint=gag_generate_endpoint(),
-                    apikey=gag_key,
-                    title=title,
-                    price=price,
-                    service=api_service,
-                    name=prof_name,
-                    address=prof_addr,
-                    image=offer_image,
-                    domain=api_domain,
-                    version=gag_default_version(),
-                )
-            except GAGError as e:
-                await callback.message.answer(f"❌ GAG ошибка: {e}")
-                return await callback.answer()
-
-            await _upsert_convlink(
-                session,
-                user_id=int(owner_user_id),
-                inbox_email=inbox_email,
-                contact_email=contact_email,
-                ad_url=url,
-                generated_link=gag_url,
-            )
-            if mail:
-                try:
-                    mail.generated_link = gag_url
-                except Exception:
-                    pass
-            await session.commit()
-
-            await _send_generated_link_card(
-                callback=callback,
-                offer_title=offer_title or title,
-                offer_price=offer_price or price,
-                photo_url=offer_image,
-                profile_display=prof_title,
-                service_code=service,
-                link=gag_url,
-                offer_id=offer_id,
-            )
-            await callback.answer()
-            return
-
-        user_api_key = _clean(user.goo_user_api_key or user.goo_api_key)
-        team_name = _clean(user.goo_team_key)
-        profile_id = _clean(user.goo_profile_id)
-
-        if not user_api_key:
-            return await callback.answer("❌ Не задан User API key (GOO)", show_alert=True)
-        if not team_name:
-            return await callback.answer("❌ Не задан Team (AQUA/TSUM/NUR)", show_alert=True)
-        if not profile_id:
-            return await callback.answer("❌ Не задан Goo Profile ID", show_alert=True)
-
-        team_api_key = _clean(await get_team_api_key(session, team_name))
-        if not team_api_key:
-            return await callback.answer("❌ Не задан Team API key для выбранной команды", show_alert=True)
-
-        # GOO: для Kleinanzeigen используется сервис "ebay_de" (не "kleinanzeigen_de")
-    service = "ebay_de"
-
-    ok, msg = await generate_single_parse(
-        user_api_key=user_api_key,
-        team_api_key=team_api_key,
-        team_name=team_name,
-        profile_id=profile_id,
-        service=service,
-        url=url,
-        need_balance_checker=False,
-    )
-
-    if not ok:
-        await callback.message.answer(f"❌ Goo ошибка: <code>{_e(str(msg))}</code>", parse_mode="HTML")
-        await callback.answer()
-        return
-
-    link = str(msg).strip()
-    if not link:
-        return await callback.answer("❌ Goo вернул пустую ссылку", show_alert=True)
-
-    meta["generated_link"] = link
-    meta["ad_url"] = url
-
-    # Подготовим поля для красивой карточки ссылки
-    offer_title = ""
-    offer_price = ""
-    offer_row = None
-
-    async with Session() as session:
-        owner_user_id = await _get_acc_owner_user_id(session, acc_id)
-        if owner_user_id:
-            # связываем ящик + отправителя + объявление с созданной ссылкой
-            await _upsert_convlink(
-                session,
-                user_id=owner_user_id,
-                inbox_email=inbox_email,
-                contact_email=contact_email,
-                ad_url=url,
-                generated_link=link,
-            )
-
-            # пробуем найти оффер по точному URL, чтобы взять название и цену
-            try:
-                offer_row = (
-                    await session.execute(
-                        sa_select(Offer)
-                        .where(Offer.user_id == int(owner_user_id))
-                        .where(Offer.link == url)
-                        .order_by(Offer.id.desc())
-                        .limit(1)
-                    )
-                ).scalars().first()
-                if offer_row:
-                    offer_title = (offer_row.title or "").strip()
-                    offer_price = (offer_row.price or "").strip()
-            except Exception:
-                # на всякий случай не роняем обработчик
                 pass
-    await _send_generated_link_card(
-        callback=callback,
-        offer_title=offer_title,
-        offer_price=offer_price,
-        photo_url=(getattr(offer_row, "photo", None) or "").strip() if offer_row else None,
-        profile_display=profile_id,
-        service_code=service,
-        link=link,
-        offer_id=int(getattr(offer_row, "id", 0) or 0) or None,
-    )
+        await session.commit()
 
-    await callback.answer("Готово ✅")
+        await _send_generated_link_card(
+            callback=callback,
+            offer_title=offer_title or title,
+            offer_price=offer_price or price,
+            photo_url=offer_image,
+            profile_display=prof_title,
+            service_code=service,
+            link=gag_url,
+            offer_id=offer_id,
+        )
+        await callback.answer("Готово ✅")
 
 
 @router.callback_query(F.data.startswith("mail_reply:"))

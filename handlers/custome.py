@@ -21,25 +21,23 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 HTML_DIR = Path("data/html")
-COUNTRY_KEY = "country"
-
-
-def _country_html_dir(code: str) -> Path:
-    c = (code or "DE").strip().upper() or "DE"
-    return Path("data") / ("HTML" + c.lower())
+HTML_CH_DIR = Path("data/HTMLch")
+GAG_SERVICE_KEY = "gag_service"
 
 
 async def _get_html_dir(session: Session, tg_user_id: int) -> Path:
     user = await get_or_create_user(session, tg_user_id)
-    code = (await get_user_setting(session, user, COUNTRY_KEY) or "DE").strip().upper() or "DE"
-    cdir = _country_html_dir(code)
-    return cdir if cdir.exists() else HTML_DIR
+    service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
+    if service:
+        sub = HTML_CH_DIR / service
+        if sub.exists():
+            return sub
+    return HTML_CH_DIR if HTML_CH_DIR.exists() else HTML_DIR
 
 
 HTML_NICK_KEY = "html_nick"
 HTML_SIGNATURE_KEY = "html_signature"
 HTML_SUBJECT_KEY = "html_subject_theme"
-GAG_SERVICE_KEY = "gag_service"
 
 
 def _html_nick_key_for_service(service: str) -> str:
