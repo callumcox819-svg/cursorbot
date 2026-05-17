@@ -17,6 +17,7 @@ from models import EmailAccount, Offer, OfferEmail, UserSetting, IncomingMail
 from services.smtp_proxy_send import send_email_via_account_with_proxy
 from services.users import get_or_create_user
 from services.user_settings import get_user_setting
+from services.gag_keys import gag_service_for_html_dir
 from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 
 router = Router()
@@ -31,7 +32,7 @@ GAG_SERVICE_KEY = "gag_service"
 
 async def _get_html_dir(session: Session, tg_user_id: int) -> Path:
     user = await get_or_create_user(session, tg_user_id)
-    service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
+    service = gag_service_for_html_dir(await get_user_setting(session, user, GAG_SERVICE_KEY))
     if service:
         sub = HTML_CH_DIR / service
         if sub.exists():

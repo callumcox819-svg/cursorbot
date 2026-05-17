@@ -17,7 +17,14 @@ from models import EmailAccount, ConversationLink, Offer, OfferEmail, IncomingMa
 
 from services.users import get_or_create_user
 from services.user_settings import get_user_setting
-from services.gag_keys import gag_default_version, gag_generate_endpoint, get_user_gag_api_key
+from services.gag_keys import (
+    gag_default_version,
+    gag_generate_endpoint,
+    gag_service_for_api,
+    gag_service_for_html_dir,
+    get_user_gag_api_key,
+    is_valid_gag_service,
+)
 from services.gag_network import generate_gag_url, GAGError
 from services.incoming_mail_worker import FULL_META, _try_pin, build_mail_card_from_mail
 from services.offer_matching import resolve_offer_for_incoming
@@ -950,7 +957,7 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
             return
 
         service = (await get_user_setting(session, tg_user, GAG_SERVICE_KEY) or "").strip()
-        if service not in ("tutti_ch", "post_ch", "ricardo_ch"):
+        if not is_valid_gag_service(service):
             await callback.message.answer(
                 "❌ Не выбран сервис (ТУТТИ/ПОСТ/Ricardo.ch). Открой 👤 Профиль → 🧭 Выбор сервиса."
             )
@@ -990,7 +997,7 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
             await callback.answer()
             return
 
-        api_service = "posta_ch" if service == "post_ch" else service
+        api_service = gag_service_for_api(service)
 
         dom_raw = (await get_user_setting(session, tg_user, "gag_domain_slot") or "").strip()
         dom_slot = None
@@ -1186,7 +1193,7 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
             return await callback.answer()
 
         service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
-        if service not in ("tutti_ch", "post_ch", "ricardo_ch"):
+        if not is_valid_gag_service(service):
             await callback.message.answer(
                 "❌ Не выбран сервис (ТУТТИ/ПОСТ/Ricardo.ch). Открой 👤 Профиль → 🧭 Выбор сервиса."
             )
@@ -1232,7 +1239,7 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
             await callback.message.answer("❌ Нет цены объявления (price).")
             return await callback.answer()
 
-        api_service = "posta_ch" if service == "post_ch" else service
+        api_service = gag_service_for_api(service)
 
         dom_raw = (await get_user_setting(session, user, "gag_domain_slot") or "").strip()
         dom_slot = None
@@ -1467,7 +1474,7 @@ async def _load_html_template_for_user(session: Session, user_id: int, filename:
             .where(UserSetting.key == GAG_SERVICE_KEY)
         )
     ).scalar_one_or_none()
-    service = (str(service or "").strip() or "")
+    service = gag_service_for_html_dir(str(service or "").strip() or None)
 
     base = Path("data") / "HTMLch"
     p = base / service / filename if service else base / filename

@@ -467,22 +467,20 @@ async def settings_back(callback: CallbackQuery, state: FSMContext):
 GAG_PROFILE_TITLE_KEY = "gag_profile_title"
 GAG_PROFILE_NAME_KEY = "gag_profile_name"
 GAG_PROFILE_ADDRESS_KEY = "gag_profile_address"
-GAG_SERVICE_KEY = "gag_service"  # tutti_ch / post_ch
-
+GAG_SERVICE_KEY = "gag_service"  # tutti_ch / posta_ch / ricardo_ch
 
 
 # Spoof name per CH service (used for HTML sending)
 def _service_label(code: str) -> str:
-    code = (code or "").strip()
-    return {
-        "tutti_ch": "ТУТТИ",
-        "post_ch": "ПОСТ",
-        "ricardo_ch": "Ricardo.ch",
-    }.get(code, code or "—")
+    from services.gag_keys import gag_service_label
+
+    return gag_service_label(code)
 
 
 def _html_nick_key_for_service(service: str) -> str:
-    service = (service or "").strip()
+    from services.gag_keys import gag_service_for_html_dir
+
+    service = gag_service_for_html_dir((service or "").strip() or None)
     return f"html_nick_{service}" if service else HTMLNICK_KEY
 
 
@@ -561,13 +559,15 @@ async def gag_service_menu(callback: CallbackQuery) -> None:
         user = await get_or_create_user(session, callback.from_user.id)
         cur = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
 
+    from services.gag_keys import gag_service_matches
+
     def mark(service: str, label: str) -> str:
-        return ("🟩 " if cur == service else "⬜️ ") + label
+        return ("🟩 " if gag_service_matches(cur, service) else "⬜️ ") + label
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=mark("tutti_ch", "ТУТТИ"), callback_data="gag_service_set:tutti_ch")],
-            [InlineKeyboardButton(text=mark("post_ch", "ПОСТ"), callback_data="gag_service_set:post_ch")],
+            [InlineKeyboardButton(text=mark("posta_ch", "ПОСТ"), callback_data="gag_service_set:posta_ch")],
             [InlineKeyboardButton(text=mark("ricardo_ch", "Ricardo.ch"), callback_data="gag_service_set:ricardo_ch")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open")],
         ]
@@ -588,12 +588,15 @@ async def gag_service_set(callback: CallbackQuery) -> None:
     except Exception:
         return await callback.answer("Неверные данные", show_alert=True)
 
-    if service not in ("tutti_ch", "post_ch", "ricardo_ch"):
+    from services.gag_keys import normalize_gag_service
+
+    canonical = normalize_gag_service(service)
+    if not canonical:
         return await callback.answer("Неизвестный сервис", show_alert=True)
 
     async with Session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
-        await set_user_setting(session, user, GAG_SERVICE_KEY, service)
+        await set_user_setting(session, user, GAG_SERVICE_KEY, canonical)
 
     await gag_service_menu(callback)
 

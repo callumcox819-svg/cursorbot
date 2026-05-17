@@ -13,7 +13,12 @@ from aiogram.exceptions import TelegramBadRequest
 from database import Session
 from config import config
 from services.users import get_or_create_user
-from services.gag_keys import GAG_USER_API_KEY as GAG_USER_API_KEY_KEY, get_user_gag_api_key
+from services.gag_keys import (
+    GAG_USER_API_KEY as GAG_USER_API_KEY_KEY,
+    gag_service_label,
+    get_user_gag_api_key,
+    normalize_gag_service,
+)
 from services.user_settings import get_user_setting, set_user_setting
 from utils.secrets import clean_secret
 
@@ -97,7 +102,9 @@ async def _render_profile_screen(callback: CallbackQuery) -> None:
         prof_title = (await get_user_setting(session, user, GAG_PROFILE_TITLE_KEY) or "").strip() or "—"
         prof_name = (await get_user_setting(session, user, GAG_PROFILE_NAME_KEY) or "").strip() or "—"
         prof_addr = (await get_user_setting(session, user, GAG_PROFILE_ADDRESS_KEY) or "").strip() or "—"
-        service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip() or "—"
+        service_raw = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
+        service = gag_service_label(service_raw) if service_raw else "—"
+        api_code = normalize_gag_service(service_raw) or service_raw or "—"
         domain_mode = (await get_user_setting(session, user, GAG_DOMAIN_MODE_KEY) or "team").strip() or "team"
         domain_slot = int(await get_user_setting(session, user, GAG_DOMAIN_SLOT_KEY) or 1)
         domain_text = "Домен команды" if domain_mode != "personal" else f"Домен {domain_slot}"
@@ -106,7 +113,7 @@ async def _render_profile_screen(callback: CallbackQuery) -> None:
             f"Название профиля: <code>{prof_title}</code>\n"
             f"Имя покупателя: <code>{prof_name}</code>\n"
             f"Адрес: <code>{prof_addr}</code>\n"
-            f"Сервис: <b>{service}</b>\n\n"
+            f"Сервис: <b>{service}</b> (<code>{api_code}</code>)\n\n"
             f"🌐 Домен: <b>{domain_text}</b>\n\n"
             "🧩 Команда: <b>GAG</b> · 🇨🇭 Швейцария\n"
         )

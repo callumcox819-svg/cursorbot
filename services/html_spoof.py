@@ -25,7 +25,9 @@ async def get_spoof_display_name(session, user: User) -> str | None:
     """
     if not _setting_on(await get_user_setting(session, user, SPOOFING_KEY)):
         return None
-    service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
+    from services.gag_keys import gag_service_for_html_dir
+
+    service = gag_service_for_html_dir(await get_user_setting(session, user, GAG_SERVICE_KEY))
     nick = (await get_user_setting(session, user, html_nick_key_for_service(service)) or "").strip()
     return nick or None
 
