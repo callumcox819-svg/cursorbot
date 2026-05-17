@@ -182,8 +182,10 @@ async def _check_one(
             async with s.get(url, params=params, headers=headers, ssl=ssl) as r:
                 # иногда сервис возвращает json с неправильным content-type
                 data = await r.json(content_type=None)
-                ok = _normalize_ok(data)
                 raw = data if isinstance(data, dict) else {"raw": str(data)}
+                if isinstance(raw, dict):
+                    raw["_http_status"] = int(r.status)
+                ok = _normalize_ok(data) if int(r.status) == 200 else False
                 _cache_set(url, email_lc, ok, raw)
                 return email, ok, raw
         except Exception as e:

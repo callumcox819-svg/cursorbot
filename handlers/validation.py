@@ -339,7 +339,7 @@ async def validation_handler(message: Message):
     cfg = ValidationConfig(
         validemail_api_keys=api_keys,
         validation_url=config.VALIDEMAIL_URL,
-        concurrency=max(4, int(getattr(config, "VALIDEMAIL_CONCURRENCY", 12) or 12)),
+        concurrency=max(8, int(getattr(config, "VALIDEMAIL_CONCURRENCY", 20) or 20)),
         max_emails_per_seller=3,
         require_first_and_last=REQUIRE_FIRST_AND_LAST,
         max_len=40,

@@ -155,9 +155,37 @@ def _is_api_failure(_ok: bool, raw: object) -> bool:
     """Сбой API/сети. Ответ «email не существует» — не ошибка."""
     if not isinstance(raw, dict):
         return True
-    if raw.get("error") is not None:
-        es = str(raw.get("error") or "").strip().lower()
+    try:
+        st = int(raw.get("_http_status"))
+        if st in (401, 403, 429) or st >= 500:
+            return True
+    except (TypeError, ValueError):
+        pass
+    err = raw.get("error")
+    if err is None:
+        err = raw.get("message")
+    if err is not None:
+        es = str(err or "").strip().lower()
         if es in ("", "empty", "no api key"):
+            return False
+        benign = (
+            "invalid email",
+            "not valid",
+            "undeliverable",
+            "not deliverable",
+            "does not exist",
+            "doesn't exist",
+            "no mx",
+            "mailbox",
+            "rejected",
+            "disposable",
+            "unverified",
+            "unknown user",
+            "user unknown",
+            "address not found",
+            "no such user",
+        )
+        if any(p in es for p in benign):
             return False
         return True
     for key in (
@@ -359,9 +387,15 @@ async def _validate_offers_old(
     # хранит найденные валидные emails по индексу prepared
     found_by_idx: list[list[str]] = [[] for _ in prepared]
 
-    # общий прогресс (оценка): варианты имени × домены из настроек
-    locals_per = sum(len(p.get("locals") or []) for p in prepared)
-    overall_total = max(1, locals_per * len(domains_clean))
+    # оценка проверок: сначала 1 логин × домен, потом запасные варианты
+    n_dom = len(domains_clean)
+    overall_total = max(
+        1,
+        sum(
+            n_dom * max(1, len(p.get("locals") or []))
+            for p in prepared
+        ),
+    )
     overall_done = 0
 
     if stats is not None:
@@ -383,7 +417,75 @@ async def _validate_offers_old(
 
     seen_valid_emails: set[str] = set()
 
-    # 2) По каждому продавцу: домены по приоритету; нашли email — следующий продавец
+    async def _run_batch(
+        batch_emails: list[str],
+        *,
+        seller_i: int,
+        dom: str,
+    ) -> list[tuple[str, bool, dict]]:
+        if not batch_emails:
+            return []
+        if stats is not None:
+            stats["current_domain"] = dom
+            stats["current_probe"] = batch_emails[0]
+        base_done = overall_done
+
+        def _wrap_progress(
+            done: int, total: int, lim: int, in_use: int, _bd: int = base_done
+        ) -> None:
+            if not progress_cb:
+                return
+            try:
+                progress_cb(_bd + int(done or 0), overall_total, lim, in_use)
+            except Exception:
+                pass
+
+        return await validate_emails_fast(
+            batch_emails,
+            api_keys=api_keys,
+            concurrency=limit,
+            url=url,
+            use_ssl_verify=bool(cfg.use_ssl_verify),
+            progress_cb=lambda d, t, l, u, _bd=base_done: _wrap_progress(d, t, l, u, _bd),
+        )
+
+    def _consume_results(
+        seller_i: int, results: list[tuple[str, bool, dict]]
+    ) -> int:
+        nonlocal overall_done
+        overall_done += len(results)
+        combos_valid = 0
+        for _e, ok, raw in results:
+            if not ok:
+                if stats is not None and _is_api_failure(ok, raw):
+                    stats["api_errors"] = int(stats.get("api_errors") or 0) + 1
+                continue
+            combos_valid += 1
+            key = (_e or "").strip().lower()
+            lst = found_by_idx[seller_i]
+            if len(lst) >= per_seller_limit or key in lst:
+                continue
+            if key in seen_valid_emails:
+                if stats is not None:
+                    stats["duplicates"] = int(stats.get("duplicates") or 0) + 1
+                continue
+            seen_valid_emails.add(key)
+            lst.append(key)
+            if stats is not None:
+                stats["last_valid_email"] = key
+        return combos_valid
+
+    def _refresh_stats() -> None:
+        if stats is None:
+            return
+        sellers_found = sum(1 for f in found_by_idx if f)
+        stats["emails_checked"] = overall_done
+        stats["sellers_with_email"] = sellers_found
+        stats["offers_validated"] = sellers_found
+        eligible_o = int(stats.get("offers_eligible") or len(prepared))
+        stats["offers_remaining"] = max(0, eligible_o - sellers_found)
+
+    # 2) Продавец → домены по приоритету; основной логин (sam.day), затем запасные
     n_sellers = len(prepared)
     for i, row in enumerate(prepared):
         if stats is not None:
@@ -395,78 +497,33 @@ async def _validate_offers_old(
         if not locals_list:
             continue
 
+        primary = locals_list[0]
+        extra_locals = locals_list[1:]
+
         for dom in domains_clean:
             if len(found_by_idx[i]) >= per_seller_limit:
                 break
-
-            batch_emails: list[str] = []
-            seen_cand: set[str] = set()
-            for local in locals_list:
-                cand = f"{local}@{dom}".lower()
-                if cand in seen_cand:
-                    continue
-                seen_cand.add(cand)
-                batch_emails.append(cand)
-
-            if not batch_emails:
-                continue
-
+            batch = [f"{primary}@{dom}".lower()]
+            results = await _run_batch(batch, seller_i=i, dom=dom)
+            cv = _consume_results(i, results)
             if stats is not None:
-                stats["current_domain"] = dom
-                stats["current_probe"] = batch_emails[0]
+                stats["combinations_valid"] = int(stats.get("combinations_valid") or 0) + cv
+            _refresh_stats()
+            if found_by_idx[i]:
+                break
 
-            base_done = overall_done
+        if found_by_idx[i] or not extra_locals:
+            continue
 
-            def _wrap_progress(
-                done: int, total: int, lim: int, in_use: int, _bd: int = base_done
-            ) -> None:
-                if not progress_cb:
-                    return
-                try:
-                    progress_cb(_bd + int(done or 0), overall_total, lim, in_use)
-                except Exception:
-                    pass
-
-            results = await validate_emails_fast(
-                batch_emails,
-                api_keys=api_keys,
-                concurrency=limit,
-                url=url,
-                use_ssl_verify=bool(cfg.use_ssl_verify),
-                progress_cb=lambda d, t, l, u, _bd=base_done: _wrap_progress(d, t, l, u, _bd),
-            )
-
-            overall_done += len(batch_emails)
-
-            combos_valid = 0
-            for e, ok, raw in results:
-                if not ok:
-                    if stats is not None and _is_api_failure(ok, raw):
-                        stats["api_errors"] = int(stats.get("api_errors") or 0) + 1
-                    continue
-                combos_valid += 1
-                key = (e or "").strip().lower()
-                lst = found_by_idx[i]
-                if len(lst) >= per_seller_limit or key in lst:
-                    continue
-                if key in seen_valid_emails:
-                    if stats is not None:
-                        stats["duplicates"] = int(stats.get("duplicates") or 0) + 1
-                    continue
-                seen_valid_emails.add(key)
-                lst.append(key)
-                if stats is not None:
-                    stats["last_valid_email"] = key
-
-            sellers_found = sum(1 for f in found_by_idx if f)
+        for dom in domains_clean:
+            if len(found_by_idx[i]) >= per_seller_limit:
+                break
+            batch = [f"{local}@{dom}".lower() for local in extra_locals]
+            results = await _run_batch(batch, seller_i=i, dom=dom)
+            cv = _consume_results(i, results)
             if stats is not None:
-                stats["emails_checked"] = overall_done
-                stats["combinations_valid"] = int(stats.get("combinations_valid") or 0) + combos_valid
-                stats["sellers_with_email"] = sellers_found
-                stats["offers_validated"] = sellers_found
-                eligible_o = int(stats.get("offers_eligible") or n_sellers)
-                stats["offers_remaining"] = max(0, eligible_o - sellers_found)
-
+                stats["combinations_valid"] = int(stats.get("combinations_valid") or 0) + cv
+            _refresh_stats()
             if found_by_idx[i]:
                 break
 
