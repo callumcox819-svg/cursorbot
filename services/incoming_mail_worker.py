@@ -133,6 +133,35 @@ def _looks_like_spam(from_email: str, from_name: str, subject: str, body: str) -
     return False
 
 
+def _is_google_system_mail(from_email: str, from_name: str, subject: str) -> bool:
+    """Системные письма Google (безопасность, уведомления) — в Telegram не шлём."""
+    f = (from_email or "").strip().lower()
+    name = (from_name or "").strip().lower()
+    subj = (subject or "").strip().lower()
+    if name == "google":
+        return True
+    if not f or "@" not in f:
+        return False
+    local, _, domain = f.rpartition("@")
+    if domain in ("google.com", "accounts.google.com", "googlemail.com"):
+        return True
+    if domain.endswith(".google.com"):
+        return True
+    if "accounts.google" in domain:
+        return True
+    if domain == "google.com" and local in (
+        "no-reply",
+        "noreply",
+        "mail-noreply",
+        "notification",
+        "notifications",
+    ):
+        return True
+    if "keamanan" in subj or "security" in subj and "google" in f:
+        return True
+    return False
+
+
 def _extract_ad_link(text: str) -> str | None:
     if not text:
         return None
@@ -529,6 +558,44 @@ def _strip_html_to_text(text: str) -> str:
     return t
 
 
+def _clean_mail_body_for_card(raw: str) -> str:
+    """Текст письма для карточки: без HTML/CSS-мусора из шаблонов Google и т.п."""
+    if not raw:
+        return ""
+    txt = raw
+    low = txt.lower()
+    if "<style" in low or "<html" in low or "<div" in low or "<span" in low:
+        txt = re.sub(r"(?is)<style[^>]*>.*?</style>", "", txt)
+        txt = _strip_html_to_text(txt)
+    lines: list[str] = []
+    for line in txt.replace("\r", "\n").split("\n"):
+        s = line.strip()
+        if not s:
+            lines.append("")
+            continue
+        if re.match(r"^[\.\#\@\w\-\s,\[\]:]+\{", s):
+            continue
+        if re.match(r"^[\}\s;]+$", s):
+            continue
+        if s.startswith("@media") or s.startswith("@font-face"):
+            continue
+        lines.append(line.rstrip())
+    txt = "\n".join(lines)
+    txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+    return txt
+
+
+def _ensure_multiline_for_expandable(text: str) -> str:
+    """Telegram показывает стрелку разворота только у многострочного expandable blockquote."""
+    if not text:
+        return "—"
+    if "\n" in text:
+        return text
+    if len(text) <= 120:
+        return text
+    return "\n".join(text[i : i + 100] for i in range(0, len(text), 100))
+
+
 def _extract_reply_only_preview(raw: str) -> str:
     """Preview for card.
 
@@ -653,12 +720,9 @@ def render_mail_text_chunks(
     link_id: str | None = None,
     service_label: str | None = None,
     product_title: str | None = None,
-    expanded: bool = False,
     translation: str | None = None,
 ) -> list[str]:
-    full = (body or "").strip()
-    preview = _extract_reply_only_preview(full) or full
-    shown = full if expanded else preview
+    shown = _ensure_multiline_for_expandable(_clean_mail_body_for_card((body or "").strip()))
 
     extra = ""
     lid = (link_id or "").strip()
@@ -690,31 +754,26 @@ def render_mail_text_chunks(
     )
 
     body_limit = 1400 if translation else 3200
-    msg = head + f"<blockquote><code>{_e(shown[:body_limit] if shown else '—')}</code></blockquote>"
+    body_text = _e((shown[:body_limit] if shown else "—"))
+    msg = head + f"<blockquote expandable><code>{body_text}</code></blockquote>"
     if translation:
-        msg += "\n\n<b>Перевод:</b>\n<blockquote><code>" + _e(str(translation)[:1400]) + "</code></blockquote>"
+        tr = _ensure_multiline_for_expandable(str(translation)[:1400])
+        msg += (
+            "\n\n<b>Перевод:</b>\n"
+            f"<blockquote expandable><code>{_e(tr)}</code></blockquote>"
+        )
     return [msg]
 
 
 def build_kb(
     acc_id: int,
     uid: str,
-    has_more: bool,
     *,
     mail_id: int | None = None,
-    view_mode: str = "short",
 ) -> InlineKeyboardMarkup:
     translate_cb = f"mail_translate:{mail_id}" if mail_id else f"mail_translate_stub:{acc_id}:{uid}"
     link_cb = f"goo_mail:{mail_id}" if mail_id else f"goo_link:{acc_id}:{uid}"
-    rows: List[List[InlineKeyboardButton]] = []
-
-    if mail_id and has_more:
-        if str(view_mode).lower() in {"full", "expanded", "open"}:
-            rows.append([InlineKeyboardButton(text="⬆️ Свернуть", callback_data=f"mail_view:{mail_id}:short")])
-        else:
-            rows.append([InlineKeyboardButton(text="⬇️ Развернуть", callback_data=f"mail_view:{mail_id}:full")])
-
-    rows += [
+    rows: List[List[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="🌍 Перевести", callback_data=translate_cb)],
         [InlineKeyboardButton(text="🔗 Создать ссылку", callback_data=link_cb)],
         [InlineKeyboardButton(text="📝 Написать ещё", callback_data=f"mail_reply:{acc_id}:{uid}")],
@@ -768,13 +827,8 @@ async def build_mail_card_from_mail(
     mail: IncomingMail,
     *,
     inbox_label: str | None = None,
-    expanded: bool = False,
     translation: str | None = None,
-    view_mode: str = "short",
 ) -> tuple[str, InlineKeyboardMarkup]:
-    body_full = (getattr(mail, "body", None) or "").strip()
-    has_more = len(body_full) > 1500
-
     if inbox_label is None:
         try:
             u = (
@@ -813,16 +867,13 @@ async def build_mail_card_from_mail(
         link_id=link_id,
         service_label=service_label,
         product_title=product_title,
-        expanded=expanded,
         translation=translation,
     )
     text = (chunks[0] if chunks else "—")[:4096]
     kb = build_kb(
         int(getattr(mail, "account_id", 0) or 0),
         str(getattr(mail, "imap_uid", 0) or "0"),
-        has_more=has_more,
         mail_id=int(mail.id),
-        view_mode=view_mode,
     )
     return text, kb
 
@@ -918,6 +969,9 @@ async def _process_mails_for_account(
         try:
             body_clean = (body or "").strip()
             from_email_clean = (from_email or "").strip().lower()
+            skip_telegram_notify = _is_google_system_mail(
+                from_email_clean, from_name or "", subject or ""
+            )
             inbox_email_clean = (account_email or "").strip().lower()
 
             FULL_BODIES[(acc_id, uid_key)] = body_clean
@@ -974,6 +1028,10 @@ async def _process_mails_for_account(
 
             except Exception:
                 logger.exception("Failed to persist IncomingMail acc=%s uid=%s", acc_id, uid)
+
+            if skip_telegram_notify:
+                forwarded += 1
+                continue
 
             # ad_url берём ТОЛЬКО из БД (по ТЗ: не ищем ссылку в теле письма)
             ad_url: str | None = None
@@ -1104,8 +1162,7 @@ async def _process_mails_for_account(
                 product_title=product_title,
             )
 
-            has_more = len(body_clean) > 1500
-            kb = build_kb(acc_id, uid, has_more=has_more, mail_id=mail_db_id, view_mode="short")
+            kb = build_kb(acc_id, uid, mail_id=mail_db_id)
 
             # ✅ ТЗ: повторные письма от продавца должны крепиться к первому сообщению.
             reply_to_id: int | None = None

@@ -655,20 +655,6 @@ async def _offer_by_sender_email(session, user_id: int, from_email: str) -> tupl
     return None, 0
 
 
-def _kb_view_mode(reply_markup, mail_id: int) -> str:
-    try:
-        kb = reply_markup
-        if kb and getattr(kb, "inline_keyboard", None):
-            for row in kb.inline_keyboard:
-                for b in row:
-                    cd = getattr(b, "callback_data", "") or ""
-                    if cd == f"mail_view:{mail_id}:short":
-                        return "full"
-    except Exception:
-        pass
-    return "short"
-
-
 def _extract_translation_from_card(text: str) -> str | None:
     try:
         m = re.search(
@@ -703,22 +689,15 @@ async def cb_mail_translate(callback: CallbackQuery) -> None:
         if not body_full:
             return await callback.answer("Нет текста для перевода.", show_alert=True)
 
-        view_mode = _kb_view_mode(callback.message.reply_markup, mail_id)
-        shown = body_full
-        if view_mode != "full":
-            try:
-                from services.incoming_mail_worker import _extract_reply_only_preview
+        from services.incoming_mail_worker import _clean_mail_body_for_card
 
-                shown = (_extract_reply_only_preview(body_full) or body_full).strip()
-            except Exception:
-                shown = body_full
-
+        shown = _clean_mail_body_for_card(body_full)
         shown = _strip_html(shown)
         if not shown:
             return await callback.answer("Нет текста для перевода.", show_alert=True)
 
         await callback.answer("Перевожу…", show_alert=False)
-        translated = await translate_to_ru(shown, preserve_blocks=(view_mode == "full"))
+        translated = await translate_to_ru(shown, preserve_blocks=True)
         if not translated:
             try:
                 await callback.message.answer(
@@ -729,13 +708,10 @@ async def cb_mail_translate(callback: CallbackQuery) -> None:
                 pass
             return await callback.answer("Не удалось перевести.", show_alert=True)
 
-        expanded = view_mode == "full"
         new_text, new_kb = await build_mail_card_from_mail(
             session,
             mail,
-            expanded=expanded,
             translation=translated,
-            view_mode=view_mode,
         )
 
     try:
@@ -760,11 +736,11 @@ async def cb_mail_translate_stub(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("mail_view:"))
-async def cb_mail_view_toggle(callback: CallbackQuery) -> None:
+async def cb_mail_view_legacy(callback: CallbackQuery) -> None:
+    """Старые кнопки «Развернуть» — обновляем карточку на формат со стрелкой в тексте."""
     try:
-        _, mail_id_s, mode = (callback.data or "").split(":", 2)
+        _, mail_id_s, _mode = (callback.data or "").split(":", 2)
         mail_id = int(mail_id_s)
-        mode = (mode or "short").strip().lower()
     except Exception:
         return await callback.answer("Неверные данные", show_alert=True)
 
@@ -776,18 +752,9 @@ async def cb_mail_view_toggle(callback: CallbackQuery) -> None:
         ).scalars().first()
         if not mail:
             return await callback.answer("Письмо не найдено.", show_alert=True)
-
         cur = (callback.message.html_text or callback.message.text or "").strip()
         translation = _extract_translation_from_card(cur)
-        expanded = mode == "full"
-        view_mode = "full" if expanded else "short"
-        new_text, new_kb = await build_mail_card_from_mail(
-            session,
-            mail,
-            expanded=expanded,
-            translation=translation,
-            view_mode=view_mode,
-        )
+        new_text, new_kb = await build_mail_card_from_mail(session, mail, translation=translation)
 
     try:
         await callback.message.edit_text(

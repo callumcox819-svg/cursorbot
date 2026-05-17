@@ -205,9 +205,9 @@ async def preview_imap_card(message: Message) -> None:
         service_label="ricardo.ch",
         product_title="Johann Jakob Couchtisch, Messing-Glas",
     )
-    kb = build_kb(0, "preview", has_more=len(demo_body) > 1500, mail_id=None, view_mode="short")
+    kb = build_kb(0, "preview", mail_id=None)
     await message.answer(
-        "ℹ️ <b>Демо-карточка</b> (не реальное IMAP-письмо). Кнопки «Перевести/Развернуть» работают только на живых письмах с ID в БД.",
+        "ℹ️ <b>Демо-карточка</b> (не реальное IMAP-письмо). Разворот текста — стрелкой в блоке «Текст». Кнопки «Перевести» — на живых письмах с ID в БД.",
         parse_mode="HTML",
     )
     await message.answer(chunks[0], reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
