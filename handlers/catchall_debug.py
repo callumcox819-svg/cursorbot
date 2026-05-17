@@ -25,17 +25,10 @@ if DEBUG_CATCHALL:
         )
 
 
-@router.callback_query()
-async def _catch_any_callback(call: CallbackQuery):
-    data = call.data or ""
-    logging.warning("[CATCHALL] callback from=%s data=%r", getattr(call.from_user, "id", None), data)
+if DEBUG_CATCHALL:
 
-    # ✅ Чтобы Telegram не крутил "loading"
-    if not DEBUG_CATCHALL:
-        try:
-            await call.answer()
-        except Exception:
-            pass
-        return
-
-    await call.answer(f"🧯 DEBUG: callback дошёл\nDATA: {data!r}", show_alert=True)
+    @router.callback_query()
+    async def _catch_any_callback(call: CallbackQuery):
+        data = call.data or ""
+        logging.warning("[CATCHALL] callback from=%s data=%r", getattr(call.from_user, "id", None), data)
+        await call.answer(f"🧯 DEBUG: callback дошёл\nDATA: {data!r}", show_alert=True)

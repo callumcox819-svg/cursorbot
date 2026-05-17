@@ -1,6 +1,7 @@
 # handlers/settings.py
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -10,7 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.exceptions import TelegramBadRequest
 
-from database import Session
+from database import Session, db_session
 from services.users import get_or_create_user
 from services.user_settings import get_user_setting, set_user_setting
 from keyboards.main_menu import main_menu_kb
@@ -77,15 +78,27 @@ def match_settings_menu_text(text: str | None) -> bool:
 
 async def open_settings_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
+    tg_id = int(message.from_user.id)
+    logger.info("open_settings_menu tg=%s text=%r", tg_id, message.text)
     try:
-        kb = await _settings_menu_kb_for_user(message.from_user.id)
+        kb = await asyncio.wait_for(
+            _settings_menu_kb_for_user(tg_id),
+            timeout=float(__import__("os").getenv("SETTINGS_MENU_DB_TIMEOUT_SEC", "12")),
+        )
         await message.answer(
             SETTINGS_MENU_TEXT,
             reply_markup=kb,
             parse_mode="HTML",
         )
+    except asyncio.TimeoutError:
+        logger.error("open_settings_menu DB timeout tg=%s", tg_id)
+        await message.answer(
+            SETTINGS_MENU_TEXT,
+            reply_markup=settings_menu_kb({}),
+            parse_mode="HTML",
+        )
     except Exception:
-        logger.exception("open_settings_menu failed tg=%s", message.from_user.id)
+        logger.exception("open_settings_menu failed tg=%s", tg_id)
         await message.answer(
             "❌ Не удалось открыть настройки (ошибка БД). Попробуйте через 5 сек или /start.",
             parse_mode="HTML",
@@ -175,7 +188,7 @@ def settings_menu_kb(flags: dict[str, bool]) -> InlineKeyboardMarkup:
 
 async def _settings_menu_kb_for_user(tg_user_id: int) -> InlineKeyboardMarkup:
     """Return settings menu keyboard with current toggle states (per-user)."""
-    async with Session() as session:
+    async with db_session() as session:
         user = await get_or_create_user(session, tg_user_id)
 
         async def _b(key: str, default: bool = False) -> bool:
@@ -195,8 +208,11 @@ async def _settings_menu_kb_for_user(tg_user_id: int) -> InlineKeyboardMarkup:
     return settings_menu_kb(flags)
 
 
-@router.message(F.text.func(lambda t: match_settings_menu_text(t)))
-@router.message(F.text.in_({"⚙️ Настройки", "Настройки"}))
+def _is_settings_menu_message(message: Message) -> bool:
+    return match_settings_menu_text(message.text)
+
+
+@router.message(F.func(_is_settings_menu_message))
 async def settings_open(message: Message, state: FSMContext) -> None:
     await open_settings_menu(message, state)
 
@@ -275,7 +291,17 @@ async def spoof_name_save(message: Message, state: FSMContext) -> None:
 async def settings_open_cb(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback_answer_safe(callback)
-    kb = await _settings_menu_kb_for_user(callback.from_user.id)
+    try:
+        kb = await asyncio.wait_for(
+            _settings_menu_kb_for_user(callback.from_user.id),
+            timeout=float(__import__("os").getenv("SETTINGS_MENU_DB_TIMEOUT_SEC", "12")),
+        )
+    except asyncio.TimeoutError:
+        logger.error("settings_open_cb DB timeout tg=%s", callback.from_user.id)
+        kb = settings_menu_kb({})
+    except Exception:
+        logger.exception("settings_open_cb failed tg=%s", callback.from_user.id)
+        kb = settings_menu_kb({})
     await _cq_edit_text(callback, "Настройки", reply_markup=kb)
 
 

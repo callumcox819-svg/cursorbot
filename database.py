@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import logging
+from contextlib import asynccontextmanager
 
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
@@ -56,6 +57,16 @@ async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncS
 
 # ✅ алиас для старого кода (как ждёт middlewares/access.py)
 Session = async_session
+
+
+@asynccontextmanager
+async def db_session():
+    """Postgres/SQLite сессия со сбросом PySocks-патча (иначе пул зависает под SMTP)."""
+    from proxy_manager import database_socket_guard
+
+    async with database_socket_guard():
+        async with Session() as session:
+            yield session
 
 
 async def _ensure_users_telegram_bigint() -> None:

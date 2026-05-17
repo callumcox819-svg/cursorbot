@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, Awaitable, Callable
@@ -7,7 +8,8 @@ from typing import Any, Awaitable, Callable
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, TelegramObject, ReplyKeyboardRemove
 
-from database import Session
+from database import db_session
+from keyboards.main_menu import is_main_menu_text
 from services.bot_roles import config_admin_ids
 from services.users import get_or_create_user
 
@@ -16,6 +18,7 @@ logger = logging.getLogger(__name__)
 # Кэш доступа — без запроса в БД на каждую кнопку (главная причина «подлагиваний»).
 _ACCESS_CACHE: dict[int, tuple[bool, bool, float]] = {}
 _ACCESS_CACHE_TTL_SEC = float(__import__("os").getenv("BOT_ACCESS_CACHE_TTL_SEC", "25"))
+_ACCESS_DB_TIMEOUT_SEC = float(__import__("os").getenv("BOT_ACCESS_DB_TIMEOUT_SEC", "8"))
 
 ACCESS_DENIED_TEXT = (
     "⛔ У тебя нет доступа к использованию этого бота. Обратись к администратору."
@@ -67,7 +70,7 @@ async def _resolve_access(telegram_id: int) -> tuple[bool, bool]:
 
     is_admin = False
     has_access = False
-    async with Session() as session:
+    async with db_session() as session:
         user = await get_or_create_user(session, tg_id)
         if getattr(user, "is_banned", False):
             is_admin, has_access = False, False
@@ -113,7 +116,23 @@ class BotAccessMiddleware(BaseMiddleware):
             if getattr(user, "is_bot", False):
                 return await handler(event, data)
 
-        is_admin, has_access = await _resolve_access(int(user.id))
+        try:
+            is_admin, has_access = await asyncio.wait_for(
+                _resolve_access(int(user.id)),
+                timeout=_ACCESS_DB_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            logger.error("BotAccessMiddleware: DB timeout tg=%s", user.id)
+            if isinstance(event, Message) and (
+                _is_start_message(event) or is_main_menu_text(event.text)
+            ):
+                return await handler(event, data)
+            if isinstance(event, CallbackQuery):
+                try:
+                    await event.answer("⏳ База данных занята, попробуйте через 5 сек.", show_alert=True)
+                except Exception:
+                    pass
+            return None
 
         if is_admin:
             return await handler(event, data)

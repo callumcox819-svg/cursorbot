@@ -7,8 +7,9 @@ import sys
 from pathlib import Path
 from typing import List, Tuple
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.context import FSMContext
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.types import ErrorEvent
@@ -78,6 +79,64 @@ def _sort_routers(routers: List[Tuple[str, Router]]) -> List[Tuple[str, Router]]
         return (100, mod_name)
 
     return sorted(routers, key=key)
+
+
+def _bind_settings_dispatcher_handlers(dp: Dispatcher) -> None:
+    """
+    Главное меню и inline «Настройки» на корне Dispatcher — первыми в очереди,
+    без зависимости от порядка include_router (обход «/start есть — кнопки мёртвые»).
+    """
+    from aiogram.types import Message
+
+    from handlers.accounts import open_accounts_from_settings
+    from handlers.api_keys import goo_show_key, goo_show_profile
+    from handlers.first_sms import firstsms_open
+    from handlers.proxies import open_proxies
+    from handlers.settings import (
+        _force_settings_menu,
+        match_settings_menu_text,
+        open_settings_menu,
+        priority_menu,
+        ref_hide,
+        ref_toggle,
+        settings_open_cb,
+        settings_timings,
+        spoof_name_menu,
+    )
+    from handlers.templates import presets_menu
+
+    async def _dp_settings_message(message: Message, state: FSMContext) -> None:
+        logger.info("⚙️ settings (dispatcher) tg=%s", message.from_user.id)
+        await open_settings_menu(message, state)
+
+    dp.message.register(
+        _dp_settings_message,
+        F.func(lambda m: match_settings_menu_text(getattr(m, "text", None))),
+    )
+
+    _deprecated = frozenset({"settings_menu", "goo:settings", "goo_settings", "settings_main"})
+    bindings = (
+        (settings_open_cb, F.data == "settings_open"),
+        (priority_menu, F.data == "priority_menu"),
+        (presets_menu, F.data == "presets_menu"),
+        (firstsms_open, F.data == "firstsms_open"),
+        (spoof_name_menu, F.data == "spoof_name_menu"),
+        (open_accounts_from_settings, F.data == "settings_accounts"),
+        (open_proxies, F.data == "settings_proxies"),
+        (settings_timings, F.data == "settings_timings"),
+        (goo_show_key, F.data.in_({"goo_show:key", "gag_show:key"})),
+        (goo_show_profile, F.data.in_({"goo_show:profile", "gag_show:profile"})),
+        (ref_hide, F.data == "ref_hide"),
+        (_force_settings_menu, F.data.in_(_deprecated)),
+        (ref_toggle, F.data.startswith("ref_toggle:")),
+    )
+    for cb, flt in bindings:
+        dp.callback_query.register(cb, flt)
+
+    logger.info(
+        "Привязано к Dispatcher: 1 message (⚙️ Настройки) + %d callback настроек",
+        len(bindings),
+    )
 
 
 def _load_all_routers(package_name: str = "handlers") -> List[Tuple[str, Router]]:
@@ -187,6 +246,8 @@ async def main() -> None:
 
     dp.message.middleware(BotAccessMiddleware())
     dp.callback_query.middleware(BotAccessMiddleware())
+
+    _bind_settings_dispatcher_handlers(dp)
 
     for mod_name, r in _load_all_routers("handlers"):
         dp.include_router(r)

@@ -3,7 +3,7 @@ from aiogram.types import Message, ReplyKeyboardRemove
 from aiogram.filters import CommandStart
 
 from keyboards.main_menu import main_menu_kb_for
-from database import Session
+from database import db_session
 from services.users import get_or_create_user
 from services.bot_access import deny_access_message, user_has_bot_access
 
@@ -12,7 +12,7 @@ router = Router()
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    async with Session() as session:
+    async with db_session() as session:
         user = await get_or_create_user(session, int(message.from_user.id))
         if getattr(user, "is_banned", False):
             await message.answer(
