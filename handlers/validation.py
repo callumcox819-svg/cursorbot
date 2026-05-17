@@ -23,6 +23,7 @@ from services.validemail_validator import (
 )
 from services.offer_storage import save_all_offers_from_import
 from services.seller_name import MIN_NAME_TOKEN_LEN, seller_name_eligible_for_validation, seller_name_from_item
+from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 
 router = Router()
 
@@ -286,6 +287,18 @@ async def validation_handler(message: Message):
     if not items:
         return await status_msg.edit_text("❌ В файле не найдено записей.")
 
+    tg_id = message.from_user.id
+    if bg_is_running(tg_id, "validation"):
+        return await message.answer("⏳ Валидация уже выполняется. Дождитесь результата.")
+
+    async def _validation_job() -> None:
+        await _run_validation_pipeline(message, status_msg, items)
+
+    if not bg_start(tg_id, "validation", _validation_job()):
+        return await message.answer("⏳ Валидация уже выполняется. Дождитесь результата.")
+
+
+async def _run_validation_pipeline(message: Message, status_msg: Message, items: list) -> None:
     total_offers = len(items)
     user_line = _validation_user_line(message)
     tg_id = message.from_user.id

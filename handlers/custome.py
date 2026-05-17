@@ -1,6 +1,7 @@
 # handlers/custome.py
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -16,8 +17,11 @@ from models import EmailAccount, Offer, OfferEmail, UserSetting, IncomingMail
 from services.smtp_proxy_send import send_email_via_account_with_proxy
 from services.users import get_or_create_user
 from services.user_settings import get_user_setting
+from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 
 router = Router()
+
+_SMTP_TIMEOUT = 25
 logger = logging.getLogger(__name__)
 
 HTML_DIR = Path("data/html")
@@ -120,6 +124,43 @@ async def cust_close(callback: CallbackQuery):
     await callback.answer("Ок")
 
 
+async def _bg_cust_smtp(callback: CallbackQuery, coro_fn) -> bool:
+    uid = callback.from_user.id
+    try:
+        await callback.answer("⏳ Отправляю…", show_alert=False)
+    except Exception:
+        pass
+    if bg_is_running(uid, "smtp"):
+        try:
+            await callback.answer("⏳ Отправка уже идёт…", show_alert=True)
+        except Exception:
+            pass
+        return False
+
+    bot = callback.bot
+    chat_id = callback.message.chat.id
+
+    async def _job() -> None:
+        try:
+            ok, err = await asyncio.wait_for(coro_fn(), timeout=_SMTP_TIMEOUT + 10)
+        except asyncio.TimeoutError:
+            ok, err = False, "Timeout SMTP"
+        except Exception as e:
+            ok, err = False, str(e)
+        if ok:
+            await bot.send_message(chat_id, "✅ Отправлено.", parse_mode="HTML")
+        else:
+            await bot.send_message(chat_id, f"❌ Ошибка: <code>{_e(err)}</code>", parse_mode="HTML")
+
+    if not bg_start(uid, "smtp", _job()):
+        try:
+            await callback.answer("⏳ Отправка уже идёт…", show_alert=True)
+        except Exception:
+            pass
+        return False
+    return True
+
+
 @router.callback_query(F.data.startswith("cust_send_imap:"))
 async def cust_send_imap(callback: CallbackQuery):
     try:
@@ -128,73 +169,62 @@ async def cust_send_imap(callback: CallbackQuery):
     except Exception:
         return await callback.answer("Неверные данные", show_alert=True)
 
-    async with Session() as session:
-        meta = await _load_incoming_meta(session, acc_id, uid)
-        if not meta:
-            return await callback.answer("Письмо устарело", show_alert=True)
+    tg_id = callback.from_user.id
+    mail_uid = uid
+    filename_copy = filename
 
-        to_email = (meta.get("from_email") or "").strip()
-        if not to_email:
-            return await callback.answer("Не найден email получателя", show_alert=True)
+    async def _send() -> tuple[bool, str | None]:
+        async with Session() as session:
+            meta = await _load_incoming_meta(session, acc_id, mail_uid)
+            if not meta:
+                return False, "Письмо устарело"
+            to_email = (meta.get("from_email") or "").strip()
+            if not to_email:
+                return False, "Не найден email получателя"
+            account = (
+                await session.execute(select(EmailAccount).where(EmailAccount.id == int(acc_id)))
+            ).scalars().first()
+            if not account:
+                return False, "Аккаунт не найден"
+            user = await get_or_create_user(session, tg_id)
+            from services.html_reply import get_html_reply_subject, get_html_sender_name, prepare_html_body
 
-        account = (
-            await session.execute(select(EmailAccount).where(EmailAccount.id == int(acc_id)))
-        ).scalars().first()
-        if not account:
-            return await callback.answer("Аккаунт не найден", show_alert=True)
-
-        user = await get_or_create_user(session, callback.from_user.id)
-
-        from services.html_reply import get_html_reply_subject, get_html_sender_name, prepare_html_body
-
-        subject = await get_html_reply_subject(
-            session,
-            user,
-            fallback=_normalize_subject({"subject": meta.get("subject") or ""}),
-        )
-        sender_name = await get_html_sender_name(session, user)
-
-        html_signature = (
-            await session.execute(
-                select(UserSetting.value)
-                .where(UserSetting.user_id == int(user.id))
-                .where(UserSetting.key == HTML_SIGNATURE_KEY)
+            subject = await get_html_reply_subject(
+                session,
+                user,
+                fallback=_normalize_subject({"subject": meta.get("subject") or ""}),
             )
-        ).scalar_one_or_none()
+            sender_name = await get_html_sender_name(session, user)
+            html_signature = (
+                await session.execute(
+                    select(UserSetting.value)
+                    .where(UserSetting.user_id == int(user.id))
+                    .where(UserSetting.key == HTML_SIGNATURE_KEY)
+                )
+            ).scalar_one_or_none()
+            html_dir = await _get_html_dir(session, tg_id)
+            file_path = html_dir / filename_copy
+            if not file_path.exists():
+                file_path = HTML_DIR / filename_copy
+            if not file_path.exists():
+                return False, "HTML шаблон не найден"
+            raw_html = file_path.read_text(encoding="utf-8", errors="ignore")
+            html_body = prepare_html_body(raw_html, session, user)
+            if html_signature:
+                html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
+            return await send_email_via_account_with_proxy(
+                session,
+                int(user.id),
+                account,
+                to_email,
+                subject,
+                html_body,
+                is_html=True,
+                sender_name=sender_name,
+            )
 
-        html_dir = await _get_html_dir(session, callback.from_user.id)
-        file_path = html_dir / filename
-        if not file_path.exists():
-            file_path = HTML_DIR / filename
-        if not file_path.exists():
-            return await callback.answer("HTML шаблон не найден", show_alert=True)
-
-        raw_html = file_path.read_text(encoding="utf-8", errors="ignore")
-        html_body = prepare_html_body(raw_html, session, user)
-        if html_signature:
-            html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
-
-        ok, err = await send_email_via_account_with_proxy(
-            session,
-            int(user.id),
-            account,
-            to_email,
-            subject,
-            html_body,
-            is_html=True,
-            sender_name=sender_name,
-        )
-
-    if ok:
-        await callback.message.answer(
-            "✅ <b>Ответ успешно отправлен пользователю</b>\n"
-            f"<code>{_e(to_email)}</code> ⚡\n\n"
-            f"<b>Шаблон:</b> <code>{_e(filename)}</code>",
-            parse_mode="HTML",
-        )
-        return await callback.answer("Отправлено ✅")
-
-    return await callback.answer(f"❌ Ошибка SMTP: {err}", show_alert=True)
+    if not await _bg_cust_smtp(callback, _send):
+        return
 
 
 def _e(s: str) -> str:
@@ -217,77 +247,67 @@ async def cust_send_html(callback: CallbackQuery):
     except Exception:
         return await callback.answer("Неверные данные", show_alert=True)
 
-    async with Session() as session:
-        offer_email = (
-            await session.execute(
-                select(OfferEmail).where(OfferEmail.id == offer_email_id)
+    tg_id = callback.from_user.id
+    filename_copy = filename
+
+    async def _send() -> tuple[bool, str | None]:
+        async with Session() as session:
+            offer_email = (
+                await session.execute(
+                    select(OfferEmail).where(OfferEmail.id == offer_email_id)
+                )
+            ).scalars().first()
+            if not offer_email:
+                return False, "Email не найден"
+            account = (
+                await session.execute(
+                    select(EmailAccount).where(EmailAccount.id == offer_email.account_id)
+                )
+            ).scalars().first()
+            if not account:
+                return False, "Аккаунт не найден"
+            from models import User
+            from services.html_reply import get_html_reply_subject, get_html_sender_name, prepare_html_body
+
+            user = (
+                await session.execute(select(User).where(User.id == int(offer_email.user_id)))
+            ).scalars().first()
+            if not user:
+                return False, "Пользователь не найден"
+            sender_name = await get_html_sender_name(session, user)
+            html_signature = (
+                await session.execute(
+                    select(UserSetting.value)
+                    .where(UserSetting.user_id == offer_email.user_id)
+                    .where(UserSetting.key == HTML_SIGNATURE_KEY)
+                )
+            ).scalar_one_or_none()
+            meta = {}
+            try:
+                meta = json.loads(offer_email.meta or "{}")
+            except Exception:
+                pass
+            subject = await get_html_reply_subject(session, user, fallback=_normalize_subject(meta))
+            html_dir = await _get_html_dir(session, tg_id)
+            file_path = html_dir / filename_copy
+            if not file_path.exists():
+                file_path = HTML_DIR / filename_copy
+            if not file_path.exists():
+                return False, "HTML шаблон не найден"
+            raw_html = file_path.read_text(encoding="utf-8", errors="ignore")
+            html_body = prepare_html_body(raw_html, session, user)
+            if html_signature:
+                html_body = html_body.replace("{{SIGNATURE}}", html_signature)
+            return await send_email_via_account_with_proxy(
+                session,
+                int(user.id),
+                account,
+                offer_email.email,
+                subject,
+                html_body,
+                is_html=True,
+                sender_name=sender_name,
             )
-        ).scalars().first()
 
-        if not offer_email:
-            return await callback.answer("Email не найден", show_alert=True)
-
-        account = (
-            await session.execute(
-                select(EmailAccount)
-                .where(EmailAccount.id == offer_email.account_id)
-            )
-        ).scalars().first()
-
-        if not account:
-            return await callback.answer("Аккаунт не найден", show_alert=True)
-
-        from models import User
-        from services.html_reply import get_html_reply_subject, get_html_sender_name, prepare_html_body
-
-        user = (
-            await session.execute(select(User).where(User.id == int(offer_email.user_id)))
-        ).scalars().first()
-        if not user:
-            return await callback.answer("Пользователь не найден", show_alert=True)
-
-        sender_name = await get_html_sender_name(session, user)
-
-        html_signature = (
-            await session.execute(
-                select(UserSetting.value)
-                .where(UserSetting.user_id == offer_email.user_id)
-                .where(UserSetting.key == HTML_SIGNATURE_KEY)
-            )
-        ).scalar_one_or_none()
-
-        meta = {}
-        try:
-            meta = json.loads(offer_email.meta or "{}")
-        except Exception:
-            pass
-
-        subject = await get_html_reply_subject(session, user, fallback=_normalize_subject(meta))
-
-        html_dir = await _get_html_dir(session, callback.from_user.id)
-        file_path = html_dir / filename
-        if not file_path.exists():
-            file_path = HTML_DIR / filename
-        if not file_path.exists():
-            return await callback.answer("HTML шаблон не найден", show_alert=True)
-
-        raw_html = file_path.read_text(encoding="utf-8", errors="ignore")
-        html_body = prepare_html_body(raw_html, session, user)
-
-        if html_signature:
-            html_body = html_body.replace("{{SIGNATURE}}", html_signature)
-
-        ok, err = await send_email_via_account_with_proxy(
-            session,
-            int(user.id),
-            account,
-            offer_email.email,
-            subject,
-            html_body,
-            is_html=True,
-            sender_name=sender_name,
-        )
-
-        if ok:
-            return await callback.answer("✅ Отправлено", show_alert=True)
-        return await callback.answer(f"❌ Ошибка: {err}", show_alert=True)
+    if not await _bg_cust_smtp(callback, _send):
+        return

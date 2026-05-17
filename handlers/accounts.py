@@ -24,6 +24,7 @@ from database import Session
 from models import User, EmailAccount
 from keyboards.main_menu import main_menu_kb
 from keyboards.settings_menu import settings_menu
+from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -502,31 +503,38 @@ async def quick_gmail_creds(message: Message, state: FSMContext) -> None:
     if not lines:
         return await message.answer("Не вижу строк. Формат: <code>login@gmail.com:пароль</code>", parse_mode="HTML")
 
-    async with Session() as session:
-        user = await get_user(session, message.from_user.id)
-        if not user:
-            user = User(telegram_id=message.from_user.id)
-            session.add(user)
-            await session.commit()
-            await session.refresh(user)
-
-        user.sender_name = sender_name
-        ok_count, fail_count, details = await _bulk_add_accounts(
-            message, session, user, lines, gmail_only=True,
-        )
-        await session.commit()
+    tg_id = message.from_user.id
+    if bg_is_running(tg_id, "accounts_add"):
+        return await message.answer("⏳ Добавление аккаунтов уже выполняется…")
 
     await state.clear()
+    await message.answer("⏳ Проверяю Gmail (IMAP)…")
 
-    summary = (
-        f"⚡ <b>Готово</b>\n\n"
-        f"Имя отправителя: <b>{_e(sender_name)}</b>\n"
-        f"Аккаунтов добавлено: <b>{ok_count}</b>\n"
-        f"Ошибок: <b>{fail_count}</b>\n\n"
-        + _trim_details(details)
-    )
-    await message.answer(summary, parse_mode="HTML")
-    await render_accounts_menu(message, message.from_user.id, page=1, status_filter="all")
+    async def _job() -> None:
+        async with Session() as session:
+            user = await get_user(session, tg_id)
+            if not user:
+                user = User(telegram_id=tg_id)
+                session.add(user)
+                await session.commit()
+                await session.refresh(user)
+            user.sender_name = sender_name
+            ok_count, fail_count, details = await _bulk_add_accounts(
+                message, session, user, lines, gmail_only=True,
+            )
+            await session.commit()
+        summary = (
+            f"⚡ <b>Готово</b>\n\n"
+            f"Имя отправителя: <b>{_e(sender_name)}</b>\n"
+            f"Аккаунтов добавлено: <b>{ok_count}</b>\n"
+            f"Ошибок: <b>{fail_count}</b>\n\n"
+            + _trim_details(details)
+        )
+        await message.answer(summary, parse_mode="HTML")
+        await render_accounts_menu(message, tg_id, page=1, status_filter="all")
+
+    if not bg_start(tg_id, "accounts_add", _job()):
+        await message.answer("⏳ Добавление аккаунтов уже выполняется…")
 
 
 @router.callback_query(F.data == "accounts_add_menu")
@@ -551,27 +559,34 @@ async def process_accounts_input(message: Message, state: FSMContext) -> None:
         await message.answer("Я не увидел ни одной строки с аккаунтом. Попробуй ещё раз.")
         return
 
-    async with Session() as session:
-        user = await get_user(session, message.from_user.id)
-        if not user:
-            user = User(telegram_id=message.from_user.id)
-            session.add(user)
-            await session.commit()
-            await session.refresh(user)
-
-        ok_count, fail_count, details = await _bulk_add_accounts(
-            message, session, user, lines, gmail_only=False,
-        )
-        await session.commit()
-
-    summary = (
-        f"Готово.\n\nУспешно: {ok_count}\nОшибок: {fail_count}\n\n"
-        + _trim_details(details)
-    )
-    await message.answer(summary, parse_mode="HTML")
+    tg_id = message.from_user.id
+    if bg_is_running(tg_id, "accounts_add"):
+        return await message.answer("⏳ Добавление аккаунтов уже выполняется…")
 
     await state.clear()
-    await render_accounts_menu(message, message.from_user.id, page=1, status_filter="all")
+    await message.answer("⏳ Проверяю аккаунты (IMAP)…")
+
+    async def _job() -> None:
+        async with Session() as session:
+            user = await get_user(session, tg_id)
+            if not user:
+                user = User(telegram_id=tg_id)
+                session.add(user)
+                await session.commit()
+                await session.refresh(user)
+            ok_count, fail_count, details = await _bulk_add_accounts(
+                message, session, user, lines, gmail_only=False,
+            )
+            await session.commit()
+        summary = (
+            f"Готово.\n\nУспешно: {ok_count}\nОшибок: {fail_count}\n\n"
+            + _trim_details(details)
+        )
+        await message.answer(summary, parse_mode="HTML")
+        await render_accounts_menu(message, tg_id, page=1, status_filter="all")
+
+    if not bg_start(tg_id, "accounts_add", _job()):
+        await message.answer("⏳ Добавление аккаунтов уже выполняется…")
 
 @router.callback_query(F.data.startswith("acc_info:"))
 async def account_info_click(callback: CallbackQuery) -> None:

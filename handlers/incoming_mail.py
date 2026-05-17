@@ -26,8 +26,11 @@ from services.translate import translate_to_ru, _strip_html
 
 # Email reply "presets" must use the same storage/UI as ⚡ Шаблоны (handlers/templates.py)
 from handlers.templates import load_templates, TemplateItem
+from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 
 router = Router()
+
+_INCOMING_SMTP_TIMEOUT = 25
 
 COUNTRY_KEY = "country"
 GAG_PROFILE_TITLE_KEY = "gag_profile_title"
@@ -37,6 +40,72 @@ GAG_SERVICE_KEY = "gag_service"
 HTML_NICK_KEY = "html_nick"
 HTML_SIGNATURE_KEY = "html_signature"
 HTML_SUBJECT_KEY = "html_subject_theme"
+
+
+async def _bg_incoming_smtp(callback: CallbackQuery, user_id: int, coro_fn) -> bool:
+    """SMTP в фоне — polling не блокируется."""
+    try:
+        await callback.answer("⏳ Отправляю…", show_alert=False)
+    except Exception:
+        pass
+    if bg_is_running(user_id, "smtp"):
+        try:
+            await callback.answer("⏳ Отправка уже идёт…", show_alert=True)
+        except Exception:
+            pass
+        return False
+
+    chat_id = callback.message.chat.id
+    bot = callback.bot
+
+    async def _job() -> None:
+        try:
+            ok, err = await asyncio.wait_for(coro_fn(), timeout=_INCOMING_SMTP_TIMEOUT + 10)
+        except asyncio.TimeoutError:
+            ok, err = False, "Timeout: SMTP отправка заняла слишком долго"
+        except Exception as e:
+            ok, err = False, f"{type(e).__name__}: {e}"
+        if ok:
+            await bot.send_message(chat_id, "✅ Отправлено.", parse_mode="HTML")
+        else:
+            err_s = _e(err or "unknown")
+            await bot.send_message(chat_id, f"❌ Ошибка SMTP:\n<code>{err_s}</code>", parse_mode="HTML")
+
+    if not bg_start(user_id, "smtp", _job()):
+        try:
+            await callback.answer("⏳ Отправка уже идёт…", show_alert=True)
+        except Exception:
+            pass
+        return False
+    return True
+
+
+async def _bg_message_smtp(message: Message, user_id: int, coro_fn) -> bool:
+    """SMTP из текстового ответа — в фоне."""
+    if bg_is_running(user_id, "smtp"):
+        await message.answer("⏳ Отправка уже идёт…")
+        return False
+
+    chat_id = message.chat.id
+    bot = message.bot
+
+    async def _job() -> None:
+        try:
+            ok, err = await asyncio.wait_for(coro_fn(), timeout=_INCOMING_SMTP_TIMEOUT + 10)
+        except asyncio.TimeoutError:
+            ok, err = False, "Timeout: SMTP отправка заняла слишком долго"
+        except Exception as e:
+            ok, err = False, f"{type(e).__name__}: {e}"
+        if ok:
+            await bot.send_message(chat_id, "✅ Отправлено.", parse_mode="HTML")
+        else:
+            err_s = _e(err or "unknown")
+            await bot.send_message(chat_id, f"❌ Ошибка SMTP:\n<code>{err_s}</code>", parse_mode="HTML")
+
+    if not bg_start(user_id, "smtp", _job()):
+        await message.answer("⏳ Отправка уже идёт…")
+        return False
+    return True
 
 
 class _MailReplyState(StatesGroup):
@@ -638,38 +707,59 @@ async def cb_mail_translate(callback: CallbackQuery) -> None:
         if not shown:
             return await callback.answer("Нет текста для перевода.", show_alert=True)
 
+        uid = callback.from_user.id
+        if bg_is_running(uid, "translate"):
+            return await callback.answer("⏳ Перевод уже выполняется…", show_alert=True)
         await callback.answer("Перевожу…", show_alert=False)
-        translated = await translate_to_ru(shown, preserve_blocks=True)
-        if not translated:
+
+        mail_id_copy = int(mail.id)
+        msg = callback.message
+        bot = callback.bot
+
+        async def _translate_job() -> None:
+            translated = await translate_to_ru(shown, preserve_blocks=True)
+            if not translated:
+                try:
+                    await bot.send_message(
+                        msg.chat.id,
+                        "❌ Не удалось перевести. Попробуйте позже.",
+                        reply_to_message_id=msg.message_id,
+                    )
+                except Exception:
+                    pass
+                return
+            async with Session() as session2:
+                mail2 = (
+                    await session2.execute(
+                        sa_select(IncomingMail).where(IncomingMail.id == mail_id_copy).limit(1)
+                    )
+                ).scalars().first()
+                if not mail2:
+                    return
+                new_text, new_kb = await build_mail_card_from_mail(
+                    session2,
+                    mail2,
+                    translation=translated,
+                )
             try:
-                await callback.message.answer(
-                    "❌ Не удалось перевести. Попробуйте позже.",
-                    reply_to_message_id=callback.message.message_id,
+                await msg.edit_text(
+                    new_text,
+                    reply_markup=new_kb,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
                 )
             except Exception:
-                pass
-            return await callback.answer("Не удалось перевести.", show_alert=True)
+                await bot.send_message(
+                    msg.chat.id,
+                    new_text,
+                    reply_markup=new_kb,
+                    parse_mode="HTML",
+                    reply_to_message_id=msg.message_id,
+                )
 
-        new_text, new_kb = await build_mail_card_from_mail(
-            session,
-            mail,
-            translation=translated,
-        )
-
-    try:
-        await callback.message.edit_text(
-            new_text,
-            reply_markup=new_kb,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        await callback.message.answer(
-            new_text,
-            reply_markup=new_kb,
-            parse_mode="HTML",
-            reply_to_message_id=callback.message.message_id,
-        )
+        if not bg_start(uid, "translate", _translate_job()):
+            return await callback.answer("⏳ Перевод уже выполняется…", show_alert=True)
+        return
 
 
 @router.callback_query(F.data.startswith("mail_translate_stub:"))
@@ -712,11 +802,7 @@ async def cb_mail_view_legacy(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("goo_mail:"))
 async def cb_create_goo_link_from_db(callback: CallbackQuery):
-    """Create goo-link for the exact incoming mail snapshot stored in DB.
-
-    This avoids relying on in-memory FULL_META and binds the link to the specific
-    message the user clicked.
-    """
+    """Create GAG link for incoming mail stored in DB."""
 
     try:
         _, mail_id = (callback.data or "").split(":", 1)
@@ -724,6 +810,22 @@ async def cb_create_goo_link_from_db(callback: CallbackQuery):
     except Exception:
         return await callback.answer("Неверные данные", show_alert=True)
 
+    uid = callback.from_user.id
+    if bg_is_running(uid, "gag_link"):
+        return await callback.answer("⏳ Ссылка уже создаётся…", show_alert=True)
+    try:
+        await callback.answer("⏳ Создаю ссылку…", show_alert=False)
+    except Exception:
+        pass
+
+    async def _link_job() -> None:
+        await _create_gag_link_from_db_work(callback, mail_id)
+
+    if not bg_start(uid, "gag_link", _link_job()):
+        return await callback.answer("⏳ Ссылка уже создаётся…", show_alert=True)
+
+
+async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -> None:
     async with Session() as session:
         # Ensure the telegram user is the owner in our DB
         tg_user = await get_or_create_user(session, int(callback.from_user.id))
@@ -956,6 +1058,22 @@ async def cb_create_goo_link(callback: CallbackQuery):
     if not meta:
         return await callback.answer("Письмо устарело", show_alert=True)
 
+    uid_tg = callback.from_user.id
+    if bg_is_running(uid_tg, "gag_link"):
+        return await callback.answer("⏳ Ссылка уже создаётся…", show_alert=True)
+    try:
+        await callback.answer("⏳ Создаю ссылку…", show_alert=False)
+    except Exception:
+        pass
+
+    async def _link_job() -> None:
+        await _create_gag_link_work(callback, acc_id, uid, meta)
+
+    if not bg_start(uid_tg, "gag_link", _link_job()):
+        return await callback.answer("⏳ Ссылка уже создаётся…", show_alert=True)
+
+
+async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, meta: dict) -> None:
     inbox_email = _canon_email((meta.get("account_email") or ""))
     contact_email = _canon_email((meta.get("from_email") or ""))
 
@@ -1274,39 +1392,38 @@ async def cb_mail_reply_preset_send(callback: CallbackQuery, state: FSMContext):
     if not to_email:
         return await callback.answer("Не вижу email отправителя", show_alert=True)
 
-    async with Session() as session:
-        user = await get_or_create_user(session, int(callback.from_user.id))
-        tmpl = (
-            await session.execute(
-                sa_select(QuickTemplate)
-                .where(QuickTemplate.user_id == int(user.id))
-                .where(QuickTemplate.id == int(tid))
+    uid = int(callback.from_user.id)
+
+    async def _send() -> tuple[bool, str | None]:
+        async with Session() as session:
+            user = await get_or_create_user(session, uid)
+            tmpl = (
+                await session.execute(
+                    sa_select(QuickTemplate)
+                    .where(QuickTemplate.user_id == int(user.id))
+                    .where(QuickTemplate.id == int(tid))
+                )
+            ).scalar_one_or_none()
+            if not tmpl:
+                return False, "Пресет не найден"
+            acc = (
+                await session.execute(sa_select(EmailAccount).where(EmailAccount.id == int(acc_id)))
+            ).scalar_one_or_none()
+            if not acc:
+                return False, "SMTP аккаунт не найден"
+            out_subject = _reply_subject(subject)
+            return await send_email_via_account_with_proxy(
+                session,
+                int(user.id),
+                acc,
+                to_email,
+                out_subject,
+                tmpl.body or "",
             )
-        ).scalar_one_or_none()
-        if not tmpl:
-            return await callback.answer("Пресет не найден", show_alert=True)
 
-        acc = (
-            await session.execute(sa_select(EmailAccount).where(EmailAccount.id == int(acc_id)))
-        ).scalar_one_or_none()
-        if not acc:
-            await state.clear()
-            return await callback.message.answer("❌ SMTP аккаунт не найден в БД.")
-
-        out_subject = _reply_subject(subject)
-        ok, err = await send_email_via_account_with_proxy(
-            session,
-            int(user.id),
-            acc,
-            to_email,
-            out_subject,
-            tmpl.body or "",
-        )
     await state.clear()
-    if ok:
-        await callback.message.answer("✅ Отправлено.")
-        return await callback.answer("Отправлено ✅")
-    return await callback.answer(f"❌ Ошибка SMTP: {err}", show_alert=True)
+    if not await _bg_incoming_smtp(callback, uid, _send):
+        return
 
 
 def _reply_subject(subject: str) -> str:
@@ -1407,105 +1524,103 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
     if not filename:
         return await callback.answer("Неизвестный шаблон", show_alert=True)
 
-    async with Session() as session:
-        user = await get_or_create_user(session, int(callback.from_user.id))
-        acc = (
-            await session.execute(sa_select(EmailAccount).where(EmailAccount.id == int(acc_id)))
-        ).scalar_one_or_none()
-        if not acc:
-            await state.clear()
-            return await callback.message.answer("❌ SMTP аккаунт не найден в БД.")
+    uid = int(callback.from_user.id)
 
-        from services.html_reply import (
-            get_html_reply_subject,
-            get_html_sender_name,
-            prepare_html_body,
-        )
+    async def _send() -> tuple[bool, str | None]:
+        async with Session() as session:
+            user = await get_or_create_user(session, uid)
+            acc = (
+                await session.execute(sa_select(EmailAccount).where(EmailAccount.id == int(acc_id)))
+            ).scalar_one_or_none()
+            if not acc:
+                return False, "SMTP аккаунт не найден"
 
-        subject = await get_html_reply_subject(session, user, fallback=_reply_subject(subject_raw))
-        sender_name = await get_html_sender_name(session, user)
-
-        html_signature = (
-            await session.execute(
-                sa_select(UserSetting.value)
-                .where(UserSetting.user_id == int(user.id))
-                .where(UserSetting.key == HTML_SIGNATURE_KEY)
+            from services.html_reply import (
+                get_html_reply_subject,
+                get_html_sender_name,
+                prepare_html_body,
             )
-        ).scalar_one_or_none()
 
-        raw_html = await _load_html_template_for_user(session, int(user.id), filename)
-        if not raw_html:
-            return await callback.answer("HTML шаблон не найден", show_alert=True)
+            subject = await get_html_reply_subject(session, user, fallback=_reply_subject(subject_raw))
+            sender_name = await get_html_sender_name(session, user)
 
-        # link (only if created)
-        link = ""
-        if account_email:
-            conv = (
+            html_signature = (
                 await session.execute(
-                    sa_select(ConversationLink)
-                    .where(ConversationLink.user_id == int(user.id))
-                    .where(ConversationLink.account_email == account_email)
-                    .where(ConversationLink.from_email == to_email)
+                    sa_select(UserSetting.value)
+                    .where(UserSetting.user_id == int(user.id))
+                    .where(UserSetting.key == HTML_SIGNATURE_KEY)
                 )
             ).scalar_one_or_none()
-            if conv and conv.generated_link:
-                link = str(conv.generated_link)
 
-        html_body = prepare_html_body(_apply_link(raw_html, link), session, user)
-        if html_signature:
-            html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
+            raw_html = await _load_html_template_for_user(session, int(user.id), filename)
+            if not raw_html:
+                return False, "HTML шаблон не найден"
 
-        # ✅ Переменные в HTML ({{ITEM_TITLE}}, {{PRICE}}, {{IMAGE_URL}}, {{IMAGE}} и т.д.)
-        try:
-            from services.placeholders import apply_placeholders
+            link = ""
+            if account_email:
+                conv = (
+                    await session.execute(
+                        sa_select(ConversationLink)
+                        .where(ConversationLink.user_id == int(user.id))
+                        .where(ConversationLink.account_email == account_email)
+                        .where(ConversationLink.from_email == to_email)
+                    )
+                ).scalar_one_or_none()
+                if conv and conv.generated_link:
+                    link = str(conv.generated_link)
 
-            offer_title = await _offer_title_for_email(session, int(user.id), to_email)
-            offer_price = ""
-            offer_photo = ""
-            if offer_title:
-                try:
-                    canon = _canon_email(to_email)
-                    off = (
-                        await session.execute(
-                            sa_select(Offer)
-                            .join(OfferEmail, OfferEmail.offer_id == Offer.id)
-                            .where(Offer.user_id == int(user.id))
-                            .where(OfferEmail.email == canon)
-                            .order_by(Offer.id.desc())
-                            .limit(1)
-                        )
-                    ).scalars().first()
-                    if off:
-                        offer_price = (off.price or "").strip()
-                        offer_photo = (off.photo or "").strip()
-                except Exception:
-                    pass
+            html_body = prepare_html_body(_apply_link(raw_html, link), session, user)
+            if html_signature:
+                html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
 
-            ctx = {
-                "ITEM_TITLE": offer_title,
-                "PRICE": offer_price,
-                "IMAGE_URL": offer_photo,
-            }
-            html_body = apply_placeholders(html_body, link=link, ctx=ctx)
-        except Exception:
-            pass
+            try:
+                from services.placeholders import apply_placeholders
 
-        ok, err = await send_email_via_account_with_proxy(
-            session,
-            int(user.id),
-            acc,
-            to_email,
-            subject,
-            html_body,
-            is_html=True,
-            sender_name=sender_name,
-        )
+                offer_title = await _offer_title_for_email(session, int(user.id), to_email)
+                offer_price = ""
+                offer_photo = ""
+                if offer_title:
+                    try:
+                        canon = _canon_email(to_email)
+                        off = (
+                            await session.execute(
+                                sa_select(Offer)
+                                .join(OfferEmail, OfferEmail.offer_id == Offer.id)
+                                .where(Offer.user_id == int(user.id))
+                                .where(OfferEmail.email == canon)
+                                .order_by(Offer.id.desc())
+                                .limit(1)
+                            )
+                        ).scalars().first()
+                        if off:
+                            offer_price = (off.price or "").strip()
+                            offer_photo = (off.photo or "").strip()
+                    except Exception:
+                        pass
+
+                ctx = {
+                    "ITEM_TITLE": offer_title,
+                    "PRICE": offer_price,
+                    "IMAGE_URL": offer_photo,
+                }
+                html_body = apply_placeholders(html_body, link=link, ctx=ctx)
+            except Exception:
+                pass
+
+            return await send_email_via_account_with_proxy(
+                session,
+                int(user.id),
+                acc,
+                to_email,
+                subject,
+                html_body,
+                is_html=True,
+                sender_name=sender_name,
+            )
 
     await state.clear()
-    if ok:
-        await callback.message.answer("✅ Отправлено.")
-        return await callback.answer("Отправлено ✅")
-    return await callback.answer(f"❌ Ошибка SMTP: {err}", show_alert=True)
+    if not await _bg_incoming_smtp(callback, uid, _send):
+        return
 
 
 @router.message(_MailReplyState.waiting_choice)
@@ -1523,45 +1638,38 @@ async def mail_reply_text(message: Message, state: FSMContext):
     subject = str(data.get("subject") or "").strip()
 
     out_subject = _reply_subject(subject)
+    tg_id = int(message.from_user.id)
 
-    async with Session() as session:
-        acc = (
-            await session.execute(sa_select(EmailAccount).where(EmailAccount.id == acc_id))
-        ).scalar_one_or_none()
-        if not acc:
-            await state.clear()
-            return await message.answer("❌ SMTP аккаунт не найден в БД.")
-
-        user = await get_or_create_user(session, int(message.from_user.id))
-        owner_user_id = await _get_acc_owner_user_id(session, acc_id)
-        if owner_user_id and int(owner_user_id) != int(user.id):
-            await state.clear()
-            return await message.answer("❌ Этот ящик не принадлежит вам.")
-
-        ok, err = await send_email_via_account_with_proxy(
-            session,
-            int(user.id),
-            acc,
-            to_email,
-            out_subject,
-            text,
-        )
+    async def _send() -> tuple[bool, str | None]:
+        async with Session() as session:
+            acc = (
+                await session.execute(sa_select(EmailAccount).where(EmailAccount.id == acc_id))
+            ).scalar_one_or_none()
+            if not acc:
+                return False, "SMTP аккаунт не найден в БД."
+            user = await get_or_create_user(session, tg_id)
+            owner_user_id = await _get_acc_owner_user_id(session, acc_id)
+            if owner_user_id and int(owner_user_id) != int(user.id):
+                return False, "Этот ящик не принадлежит вам."
+            return await send_email_via_account_with_proxy(
+                session,
+                int(user.id),
+                acc,
+                to_email,
+                out_subject,
+                text,
+            )
 
     await state.clear()
-    if ok:
-        await message.answer("✅ Отправлено.")
+    await message.answer("⏳ Отправляю…")
+    if await _bg_message_smtp(message, tg_id, _send):
         try:
             FULL_META[(acc_id, uid)] = {
                 **(FULL_META.get((acc_id, uid)) or {}),
-                "last_reply": "sent",
+                "last_reply": "pending",
             }
         except Exception:
             pass
-    else:
-        await message.answer(
-            f"❌ Ошибка отправки: <code>{_e(err) or 'unknown'}</code>",
-            parse_mode="HTML",
-        )
 
 
 @router.message(_MailReplyState.waiting_custom_html)
@@ -1577,99 +1685,100 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
     to_email = str(data.get("to_email") or "").strip().lower()
     subject_raw = str(data.get("subject") or "").strip()
     account_email = str(data.get("account_email") or "").strip().lower()
+    tg_id = int(message.from_user.id)
+    html_text = text
 
-    async with Session() as session:
-        user = await get_or_create_user(session, int(message.from_user.id))
-        acc = (
-            await session.execute(sa_select(EmailAccount).where(EmailAccount.id == acc_id))
-        ).scalar_one_or_none()
-        if not acc:
-            await state.clear()
-            return await message.answer("❌ SMTP аккаунт не найден в БД.")
+    async def _send() -> tuple[bool, str | None]:
+        async with Session() as session:
+            user = await get_or_create_user(session, tg_id)
+            acc = (
+                await session.execute(sa_select(EmailAccount).where(EmailAccount.id == acc_id))
+            ).scalar_one_or_none()
+            if not acc:
+                return False, "SMTP аккаунт не найден в БД."
 
-        from services.html_reply import (
-            get_html_reply_subject,
-            get_html_sender_name,
-            prepare_html_body,
-        )
-
-        subject = await get_html_reply_subject(session, user, fallback=_reply_subject(subject_raw))
-        sender_name = await get_html_sender_name(session, user)
-
-        html_signature = (
-            await session.execute(
-                sa_select(UserSetting.value)
-                .where(UserSetting.user_id == int(user.id))
-                .where(UserSetting.key == HTML_SIGNATURE_KEY)
+            from services.html_reply import (
+                get_html_reply_subject,
+                get_html_sender_name,
+                prepare_html_body,
             )
-        ).scalar_one_or_none()
 
-        link = ""
-        if account_email:
-            conv = (
+            subject = await get_html_reply_subject(session, user, fallback=_reply_subject(subject_raw))
+            sender_name = await get_html_sender_name(session, user)
+
+            html_signature = (
                 await session.execute(
-                    sa_select(ConversationLink)
-                    .where(ConversationLink.user_id == int(user.id))
-                    .where(ConversationLink.account_email == account_email)
-                    .where(ConversationLink.from_email == to_email)
+                    sa_select(UserSetting.value)
+                    .where(UserSetting.user_id == int(user.id))
+                    .where(UserSetting.key == HTML_SIGNATURE_KEY)
                 )
             ).scalar_one_or_none()
-            if conv and conv.generated_link:
-                link = str(conv.generated_link)
 
-        html_body = prepare_html_body(_apply_link(text, link), session, user)
-        if html_signature:
-            html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
+            link = ""
+            if account_email:
+                conv = (
+                    await session.execute(
+                        sa_select(ConversationLink)
+                        .where(ConversationLink.user_id == int(user.id))
+                        .where(ConversationLink.account_email == account_email)
+                        .where(ConversationLink.from_email == to_email)
+                    )
+                ).scalar_one_or_none()
+                if conv and conv.generated_link:
+                    link = str(conv.generated_link)
 
-        try:
-            from services.placeholders import apply_placeholders
+            html_body = prepare_html_body(_apply_link(html_text, link), session, user)
+            if html_signature:
+                html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
 
-            offer_title = await _offer_title_for_email(session, int(user.id), to_email)
-            offer_price = ""
-            offer_photo = ""
-            if offer_title:
-                try:
-                    canon = _canon_email(to_email)
-                    off = (
-                        await session.execute(
-                            sa_select(Offer)
-                            .join(OfferEmail, OfferEmail.offer_id == Offer.id)
-                            .where(Offer.user_id == int(user.id))
-                            .where(OfferEmail.email == canon)
-                            .order_by(Offer.id.desc())
-                            .limit(1)
-                        )
-                    ).scalars().first()
-                    if off:
-                        offer_price = (off.price or "").strip()
-                        offer_photo = (off.photo or "").strip()
-                except Exception:
-                    pass
+            try:
+                from services.placeholders import apply_placeholders
 
-            ctx = {
-                "ITEM_TITLE": offer_title,
-                "PRICE": offer_price,
-                "IMAGE_URL": offer_photo,
-            }
-            html_body = apply_placeholders(html_body, link=link, ctx=ctx)
-        except Exception:
-            pass
+                offer_title = await _offer_title_for_email(session, int(user.id), to_email)
+                offer_price = ""
+                offer_photo = ""
+                if offer_title:
+                    try:
+                        canon = _canon_email(to_email)
+                        off = (
+                            await session.execute(
+                                sa_select(Offer)
+                                .join(OfferEmail, OfferEmail.offer_id == Offer.id)
+                                .where(Offer.user_id == int(user.id))
+                                .where(OfferEmail.email == canon)
+                                .order_by(Offer.id.desc())
+                                .limit(1)
+                            )
+                        ).scalars().first()
+                        if off:
+                            offer_price = (off.price or "").strip()
+                            offer_photo = (off.photo or "").strip()
+                    except Exception:
+                        pass
 
-        ok, err = await send_email_via_account_with_proxy(
-            session,
-            int(user.id),
-            acc,
-            to_email,
-            subject,
-            html_body,
-            is_html=True,
-            sender_name=sender_name,
-        )
+                ctx = {
+                    "ITEM_TITLE": offer_title,
+                    "PRICE": offer_price,
+                    "IMAGE_URL": offer_photo,
+                }
+                html_body = apply_placeholders(html_body, link=link, ctx=ctx)
+            except Exception:
+                pass
+
+            return await send_email_via_account_with_proxy(
+                session,
+                int(user.id),
+                acc,
+                to_email,
+                subject,
+                html_body,
+                is_html=True,
+                sender_name=sender_name,
+            )
 
     await state.clear()
-    if ok:
-        return await message.answer("✅ Отправлено.")
-    return await message.answer(f"❌ Ошибка SMTP: {err}")
+    await message.answer("⏳ Отправляю…")
+    await _bg_message_smtp(message, tg_id, _send)
 
 
 @router.callback_query(F.data.startswith("mail_info:"))

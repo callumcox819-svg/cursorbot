@@ -74,7 +74,10 @@ class ProxyManager:
         session: AsyncSession, user_id: int
     ) -> Optional[Proxy]:
         result = await session.execute(
-            select(Proxy).where(Proxy.user_id == user_id, Proxy.is_active == True)
+            select(Proxy).where(
+                Proxy.user_id == user_id,
+                or_(Proxy.is_active.is_(True), Proxy.is_active.is_(None)),
+            )
         )
         proxies = list(result.scalars().all())
         if not proxies:

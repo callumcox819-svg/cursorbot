@@ -22,6 +22,7 @@ from sqlalchemy import select
 from database import Session
 from models import User, Proxy
 from services.proxy_verify import test_proxy, refresh_proxies_status
+from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -518,6 +519,29 @@ async def proxy_add_process(message: Message, state: FSMContext):
                 else:
                     parsed_items.append((b, parse_proxy_string(b)))
 
+    if bg_is_running(telegram_id, "proxy_add"):
+        return await message.answer("⏳ Добавление прокси уже идёт. Подождите завершения.")
+
+    status_msg = await message.answer(
+        f"⏳ Проверяю <b>{len(parsed_items)}</b> прокси…\n"
+        "<i>Не отправляйте новый список, пока идёт проверка.</i>",
+        parse_mode="HTML",
+    )
+
+    async def _job() -> None:
+        await _proxy_add_work(message, state, telegram_id, parsed_items, status_msg)
+
+    if not bg_start(telegram_id, "proxy_add", _job()):
+        return await message.answer("⏳ Добавление прокси уже идёт. Подождите завершения.")
+
+
+async def _proxy_add_work(
+    message: Message,
+    state: FSMContext,
+    telegram_id: int,
+    parsed_items: list[tuple[str, Optional[dict]]],
+    status_msg: Message,
+) -> None:
     ok_count = 0
     fail_count = 0
     details: List[str] = []
@@ -552,7 +576,12 @@ async def proxy_add_process(message: Message, state: FSMContext):
                 details.append(f"❌ `{preview}` — {err}")
                 continue
 
-            ok, info = await test_proxy(parsed)
+            try:
+                ok, info = await asyncio.wait_for(test_proxy(parsed, timeout=10), timeout=25)
+            except asyncio.TimeoutError:
+                ok, info = False, "Timeout: проверка прокси заняла слишком долго"
+            except Exception as e:
+                ok, info = False, f"{type(e).__name__}: {e}"
 
             proxy = Proxy(
                 user_id=user.id,
@@ -590,7 +619,10 @@ async def proxy_add_process(message: Message, state: FSMContext):
     if len(details) > 50:
         summary += f"\n…и ещё {len(details) - 50} строк"
 
-    await message.answer(summary, parse_mode="Markdown")
+    try:
+        await status_msg.edit_text(summary[:4000], parse_mode="Markdown")
+    except Exception:
+        await message.answer(summary, parse_mode="Markdown")
     await state.clear()
     await render_proxy_menu(message, telegram_id)
 
@@ -765,6 +797,14 @@ async def proxy_test(callback: CallbackQuery):
 
     proxy_id = int(callback.data.split(":")[1])
     telegram_id = callback.from_user.id
+    job_key = f"proxy_test:{proxy_id}"
+
+    if bg_is_running(telegram_id, job_key):
+        try:
+            await callback.answer("⏳ Этот прокси уже проверяется…", show_alert=True)
+        except TelegramBadRequest:
+            pass
+        return
 
     async with Session() as session:
         proxy = await session.get(Proxy, proxy_id)
@@ -811,4 +851,8 @@ async def proxy_test(callback: CallbackQuery):
         except Exception:
             logger.exception("render_proxy_menu failed")
 
-    asyncio.create_task(run())
+    if not bg_start(telegram_id, job_key, run()):
+        try:
+            await callback.answer("⏳ Этот прокси уже проверяется…", show_alert=True)
+        except TelegramBadRequest:
+            pass

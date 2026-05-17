@@ -14,6 +14,7 @@ from sqlalchemy import select, func
 from services.smtp_proxy_send import send_email_via_account_with_proxy
 from handlers.templates import pick_random_smart_preset
 from handlers.first_sms import pick_random_first_sms
+from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 
 router = Router()
 
@@ -96,46 +97,52 @@ async def test_mail_send(message: Message, state: FSMContext):
     if not (body or "").strip():
         body = await pick_random_first_sms(message.from_user.id, offer_title)
 
-    try:
-        async with async_session() as session_proxy:
-            ok, err = await send_email_via_account_with_proxy(
-                session_proxy,
-                user_id,
-                account,
-                to_email,
-                subject,
-                body,
-            )
-        if ok:
-            await message.answer(
-                f"✅ Тестовое письмо отправлено на: {to_email}\n"
-                f"Тема: {subject}\n"
-                f"От: {account.email}"
-            )
+    await state.clear()
+    if bg_is_running(tg_id, "test_mail"):
+        return await message.answer("⏳ Тест уже отправляется…")
 
-            # 2) отдельная сессия БД для записи
-            async with async_session() as session2:
-                raw_link = await pick_random_raw_link(session2)
-                if raw_link:
-                    test_offer = Offer(
-                        user_id=user_id,
-                        title="TEST MAIL",
-                        link=raw_link,
-                        price=None,
-                        photo=None,
-                        person_name="TEST",
-                    )
-                    session2.add(test_offer)
-                    await session2.flush()
-                    session2.add(OfferEmail(offer_id=test_offer.id, email=to_email))
-                    await session2.commit()
+    status = await message.answer(f"⏳ Отправляю тест на <code>{to_email}</code>…", parse_mode="HTML")
+    acc_email = account.email
 
-        else:
-            await message.answer(f"❌ [TESTMAIL v3] Ошибка отправки (От: {account.email}): {err}")
-    except Exception as e:
-        await message.answer(f"❌ [TESTMAIL v3] Ошибка отправки (От: {account.email}): {e}")
-    finally:
-        await state.clear()
+    async def _job() -> None:
+        try:
+            async with async_session() as session_proxy:
+                ok, err = await send_email_via_account_with_proxy(
+                    session_proxy,
+                    user_id,
+                    account,
+                    to_email,
+                    subject,
+                    body,
+                )
+            if ok:
+                await status.edit_text(
+                    f"✅ Тестовое письмо отправлено на: {to_email}\n"
+                    f"Тема: {subject}\n"
+                    f"От: {acc_email}"
+                )
+                async with async_session() as session2:
+                    raw_link = await pick_random_raw_link(session2)
+                    if raw_link:
+                        test_offer = Offer(
+                            user_id=user_id,
+                            title="TEST MAIL",
+                            link=raw_link,
+                            price=None,
+                            photo=None,
+                            person_name="TEST",
+                        )
+                        session2.add(test_offer)
+                        await session2.flush()
+                        session2.add(OfferEmail(offer_id=test_offer.id, email=to_email))
+                        await session2.commit()
+            else:
+                await status.edit_text(f"❌ Ошибка отправки (От: {acc_email}): {err}")
+        except Exception as e:
+            await status.edit_text(f"❌ Ошибка отправки (От: {acc_email}): {e}")
+
+    if not bg_start(tg_id, "test_mail", _job()):
+        await message.answer("⏳ Тест уже отправляется…")
 
 
 def _is_valid_ad_link(url: str) -> bool:

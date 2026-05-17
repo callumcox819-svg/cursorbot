@@ -15,6 +15,7 @@ from models import EmailAccount, User
 from services.incoming_mail_worker import FULL_META
 from services.smtp_proxy_send import send_email_via_account_with_proxy
 from handlers.templates import load_templates, TemplateItem
+from handlers.incoming_mail import _bg_incoming_smtp
 from models import IncomingMail
 
 router = Router()
@@ -161,23 +162,26 @@ async def mail_tmpl_send(callback: CallbackQuery):
 
     subject_orig = (meta.get("subject") or "").strip()
     subject = _safe_re_subject(subject_orig)
+    tg_id = callback.from_user.id
+    body_copy = body
 
-    async with Session() as session:
-        acc = (await session.execute(select(EmailAccount).where(EmailAccount.id == acc_id))).scalars().first()
-        if not acc:
-            return await callback.answer("SMTP аккаунт не найден", show_alert=True)
+    async def _send() -> tuple[bool, str | None]:
+        async with Session() as session:
+            acc = (await session.execute(select(EmailAccount).where(EmailAccount.id == acc_id))).scalars().first()
+            if not acc:
+                return False, "SMTP аккаунт не найден"
+            user = (
+                await session.execute(select(User).where(User.telegram_id == int(tg_id)))
+            ).scalars().first()
+            if not user:
+                return False, "Пользователь не найден"
+            out_subject = subject
+            try:
+                from services.user_settings import get_user_setting
 
-        user = (await session.execute(select(User).where(User.telegram_id == int(callback.from_user.id)))).scalars().first()
-
-        # ✅ "Подставлять тему" + OFFER (строго по ТЗ)
-        # - тумблер: user_setting "subj_insert"
-        # - шаблон: user_setting "subject_template"
-        # - OFFER: title из IncomingMail.resolved_offer_id (если есть)
-        try:
-            from services.user_settings import get_user_setting
-
-            if user:
-                subj_insert = str(await get_user_setting(session, user, "subj_insert") or "").strip().lower() in {"1", "true", "yes", "on"}
+                subj_insert = str(await get_user_setting(session, user, "subj_insert") or "").strip().lower() in {
+                    "1", "true", "yes", "on",
+                }
                 if subj_insert:
                     uid_num = _parse_uid(uid)
                     offer_title = ""
@@ -200,36 +204,20 @@ async def mail_tmpl_send(callback: CallbackQuery):
                             ).scalars().first()
                             if off:
                                 offer_title = (off.title or "").strip()
-
                     tpl = str(await get_user_setting(session, user, "subject_template") or "Re: OFFER")
-                    subject = _render_subject_with_offer(tpl, offer_title)
-        except Exception:
-            pass
+                    out_subject = _render_subject_with_offer(tpl, offer_title)
+            except Exception:
+                pass
+            return await send_email_via_account_with_proxy(
+                session,
+                int(user.id),
+                acc,
+                to_email,
+                out_subject,
+                body_copy,
+                sender_name=getattr(user, "sender_name", None),
+            )
 
-        if not user:
-            return await callback.answer("Пользователь не найден", show_alert=True)
-
-        ok, err = await send_email_via_account_with_proxy(
-            session,
-            int(user.id),
-            acc,
-            to_email,
-            subject,
-            body,
-            sender_name=getattr(user, "sender_name", None),
-        )
-
-    if ok:
-        # ✅ как WORKHASL: отдельным сообщением видно что реально отправлено + текст ответа
-        await callback.message.answer(
-            "✅ <b>Ответ успешно отправлен пользователю</b>\n"
-            f"<code>{to_email}</code> ⚡\n\n"
-            "<b>Ответ:</b>\n"
-            f"<blockquote><code>{body}</code></blockquote>",
-            parse_mode="HTML",
-        )
-        logger.info("MAIL_TEMPLATE sent to=%s acc_id=%s uid=%s idx=%s", to_email, acc_id, uid, idx)
-        return await callback.answer("Отправлено ✅")
-
-    await callback.answer(f"Ошибка SMTP: {err}", show_alert=True)
-    logger.warning("MAIL_TEMPLATE FAILED to=%s acc_id=%s uid=%s idx=%s err=%s", to_email, acc_id, uid, idx, err)
+    if not await _bg_incoming_smtp(callback, tg_id, _send):
+        return
+    logger.info("MAIL_TEMPLATE queued to=%s acc_id=%s uid=%s idx=%s", to_email, acc_id, uid, idx)
