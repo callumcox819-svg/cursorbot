@@ -2074,7 +2074,7 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
                 mail_generated_link=mail_gen_link,
             )
             ctx = await build_offer_html_ctx(session, int(user.id), to_email, link=link)
-            html_body = prepare_html_body(_apply_link(raw_html, link), session, user)
+            html_body = await prepare_html_body(_apply_link(raw_html, link), session, user)
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
             html_body = apply_placeholders(html_body, link=link, ctx=ctx)
@@ -2262,7 +2262,7 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
                 mail_generated_link=mail_gen_link,
             )
             ctx = await build_offer_html_ctx(session, int(user.id), to_email, link=link)
-            html_body = prepare_html_body(_apply_link(html_text, link), session, user)
+            html_body = await prepare_html_body(_apply_link(html_text, link), session, user)
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
             html_body = apply_placeholders(html_body, link=link, ctx=ctx)

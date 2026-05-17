@@ -249,7 +249,7 @@ async def cust_send_imap(callback: CallbackQuery):
                 mail_generated_link=mail_gen_link,
             )
             ctx = await build_offer_html_ctx(session, int(user.id), to_email, link=link)
-            html_body = prepare_html_body(raw_html, session, user)
+            html_body = await prepare_html_body(raw_html, session, user)
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
             html_body = apply_placeholders(html_body, link=link, ctx=ctx)
@@ -350,7 +350,7 @@ async def cust_send_html(callback: CallbackQuery):
                 mail_generated_link=(meta.get("generated_link") if isinstance(meta, dict) else None),
             )
             ctx = await build_offer_html_ctx(session, int(user.id), to_email, link=link)
-            html_body = prepare_html_body(raw_html, session, user)
+            html_body = await prepare_html_body(raw_html, session, user)
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", html_signature)
             html_body = apply_placeholders(html_body, link=link, ctx=ctx)
