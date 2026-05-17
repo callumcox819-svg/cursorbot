@@ -47,14 +47,15 @@ async def send_email_via_account_with_proxy(
     body: str,
     sender_name: Optional[str] = None,
     is_html: Optional[bool] = None,
-) -> Tuple[bool, Optional[str]]:
+) -> Tuple[bool, Optional[str], Optional[str]]:
     last_err: str | None = None
     tried_ids: set[int] = set()
+    last_msgid: str | None = None
 
     while True:
         proxy, pick_err = await choose_required_proxy(session, user_id, exclude_ids=tried_ids)
         if pick_err:
-            return False, pick_err
+            return False, pick_err, None
         if not proxy:
             break
 
@@ -62,7 +63,7 @@ async def send_email_via_account_with_proxy(
         tried_ids.add(pid)
 
         async with ProxySMTPContext(proxy):
-            ok, err = await send_email_via_account(
+            ok, err, msgid = await send_email_via_account(
                 account,
                 to_email,
                 subject,
@@ -72,11 +73,12 @@ async def send_email_via_account_with_proxy(
             )
         err = normalize_send_error(err)
         if ok:
-            return True, err
+            return True, err, msgid
 
         last_err = err
+        last_msgid = msgid
         if not should_retry_send_with_other_proxy(err):
-            return False, err
+            return False, err, last_msgid
 
         deactivate = is_definite_proxy_failure(err)
         try:
@@ -88,8 +90,8 @@ async def send_email_via_account_with_proxy(
         continue
 
     if last_err:
-        return False, last_err
-    return False, NO_ACTIVE_PROXY
+        return False, last_err, last_msgid
+    return False, NO_ACTIVE_PROXY, None
 
 
 async def send_batch_via_account_with_proxy(

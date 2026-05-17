@@ -1,3 +1,4 @@
+import asyncio
 import random
 import pathlib
 import re
@@ -13,6 +14,7 @@ from models import EmailAccount, Offer, OfferEmail, User
 from sqlalchemy import select, func
 from services.smtp_proxy_send import send_email_via_account_with_proxy
 from services.smtp_block_control import is_smtp_account_block_error, mark_account_smtp_blocked
+from services.smtp_delivery_verify import verify_message_in_sent
 from handlers.templates import pick_random_smart_preset
 from handlers.first_sms import pick_random_first_sms
 from utils.bg_jobs import is_running as bg_is_running, start as bg_start
@@ -20,6 +22,10 @@ from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 router = Router()
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def _canon_email(addr: str) -> str:
+    return (addr or "").strip().lower()
 
 
 class TestMailStates(StatesGroup):
@@ -86,7 +92,15 @@ async def test_mail_send(message: Message, state: FSMContext):
             await message.answer("❌ Нет активных email-аккаунтов для отправки. Добавьте аккаунт в 📮 Аккаунты.")
             await state.clear()
             return
-        account = random.choice(accs)
+        eligible = [a for a in accs if _canon_email(a.email) != to_email]
+        if not eligible:
+            await message.answer(
+                "❌ Нельзя тестировать на тот же ящик, что и единственный аккаунт отправителя.\n"
+                "Добавьте второй аккаунт или укажите другой email получателя."
+            )
+            await state.clear()
+            return
+        account = random.choice(eligible)
 
         title_row = (await session.execute(
             select(Offer.title).where(Offer.title.is_not(None)).order_by(func.random()).limit(1)
@@ -97,6 +111,10 @@ async def test_mail_send(message: Message, state: FSMContext):
     body = await pick_random_smart_preset(message.from_user.id, offer_title)
     if not (body or "").strip():
         body = await pick_random_first_sms(message.from_user.id, offer_title)
+    if not (body or "").strip():
+        await message.answer("❌ Пустое тело письма — нет шаблона для теста.")
+        await state.clear()
+        return
 
     await state.clear()
     if bg_is_running(tg_id, "test_mail"):
@@ -108,7 +126,7 @@ async def test_mail_send(message: Message, state: FSMContext):
     async def _job() -> None:
         try:
             async with async_session() as session_proxy:
-                ok, err = await send_email_via_account_with_proxy(
+                ok, err, msgid = await send_email_via_account_with_proxy(
                     session_proxy,
                     user_id,
                     account,
@@ -117,17 +135,35 @@ async def test_mail_send(message: Message, state: FSMContext):
                     body,
                 )
             if ok:
-                await status.edit_text(
-                    "✅ <b>SMTP принял письмо</b> (сервер отправителя не вернул ошибку)\n\n"
-                    f"Кому: <code>{to_email}</code>\n"
-                    f"От: <code>{acc_email}</code>\n"
-                    f"Тема: {subject}\n\n"
-                    "<i>Это ещё не гарантия, что письмо во «Входящих» у получателя.</i>\n"
-                    "Проверьте у отправителя папку <b>«Отправленные»</b> — если письма там нет, "
-                    "рассылка реально не ушла.\n"
-                    "Если в «Отправленных» есть, а у получателя нет — фильтр Gmail/прокси/репутация ящика.",
-                    parse_mode="HTML",
+                await asyncio.sleep(4)
+                verified, verify_msg = await verify_message_in_sent(
+                    account.email,
+                    account.password or "",
+                    subject=subject,
+                    to_email=to_email,
+                    message_id=msgid,
                 )
+                if verified:
+                    await status.edit_text(
+                        "✅ <b>Письмо реально ушло</b> — найдено в «Отправленных» у отправителя\n\n"
+                        f"Кому: <code>{to_email}</code>\n"
+                        f"От: <code>{acc_email}</code>\n"
+                        f"Тема: {subject}\n\n"
+                        f"<i>{verify_msg}</i>\n\n"
+                        "Если у получателя во «Входящих» нет — смотрите спам/«Вся почта» или репутацию ящика.",
+                        parse_mode="HTML",
+                    )
+                else:
+                    await status.edit_text(
+                        "❌ <b>Отправка не подтверждена</b>\n\n"
+                        "SMTP не вернул ошибку, но в «Отправленных» у "
+                        f"<code>{acc_email}</code> письма нет — через прокси оно, скорее всего, "
+                        "не дошло до почтового ящика.\n\n"
+                        f"<i>{verify_msg}</i>\n\n"
+                        "Проверьте SOCKS5-прокси (🌐 Прокси → проверка) и попробуйте другой прокси.",
+                        parse_mode="HTML",
+                    )
+                    return
                 async with async_session() as session2:
                     raw_link = await pick_random_raw_link(session2)
                     if raw_link:

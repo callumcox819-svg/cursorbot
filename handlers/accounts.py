@@ -314,21 +314,13 @@ def accounts_menu_kb(
         nav.append(InlineKeyboardButton(text="След. ➡️", callback_data=f"acc_page:{page+1}:{status_filter}"))
     rows.append(nav)
 
-    # Действия (как на скрине)
-    rows.append([InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="accounts_add_menu")])
-    rows.append([InlineKeyboardButton(text="📥 Массовое добавление", callback_data="accounts_add_menu")])
-    rows.append([InlineKeyboardButton(text="⚡ Быстрое добавление (Gmail)", callback_data="accounts_quick_gmail")])
-
-    # ✅ ТЗ: имя отправителя задаётся отдельной кнопкой в меню E-mail.
-    # Используем уже существующий экран sender_name_menu (handlers/settings.py).
-    rows.append([InlineKeyboardButton(text="📝 Задать имя отправителя", callback_data="sender_name_menu")])
-
-    # Фильтр
-    filt_title = "🔎 Фильтр по статусу"
-    rows.append([InlineKeyboardButton(text=filt_title, callback_data=f"acc_filter:{status_filter}:{page}")])
-
-    # (Опционально) Массовое удаление — пока безопасный “заглушечный” пункт, чтобы не ломать
-    rows.append([InlineKeyboardButton(text="🧹 Удалить аккаунты", callback_data="acc_bulk_delete_stub")])
+    rows.append(
+        [InlineKeyboardButton(text="🗑 Удалить все неактивные", callback_data="acc_delete_inactive")]
+    )
+    rows.append([InlineKeyboardButton(text="🗑 Удалить все почты", callback_data="acc_delete_all")])
+    rows.append(
+        [InlineKeyboardButton(text="🔍 Проверить статус почт", callback_data="acc_check_smtp")]
+    )
 
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open")])
 
@@ -371,10 +363,8 @@ async def render_accounts_menu(message_or_cb, telegram_id: int, page: int = 1, s
         text = (
             "📬 <b>Почтовые аккаунты</b>\n\n"
             "У тебя пока нет добавленных аккаунтов.\n"
-            "Нажми «➕ Добавить аккаунт» и введи:\n"
-            "<code>email:app_password</code>\n\n"
-            "Поддерживаются: Gmail, iCloud, GMX.\n"
-            "Используй APP PASSWORD (пароль приложения)."
+            "Формат для импорта: <code>email:app_password</code> (APP PASSWORD).\n"
+            "Поддерживаются: Gmail, iCloud, GMX."
         )
 
     kb = accounts_menu_kb(page_accounts, page, total_pages, status_filter)
@@ -426,10 +416,175 @@ async def acc_filter(callback: CallbackQuery) -> None:
     await render_accounts_menu(callback, callback.from_user.id, page=1, status_filter=nxt)
     await callback.answer(f"Фильтр: {nxt}")
 
-@router.callback_query(F.data == "acc_bulk_delete_stub")
-async def acc_bulk_delete_stub(callback: CallbackQuery) -> None:
-    # Заглушка, чтобы не ломать — массовое удаление добавим отдельным безопасным шагом.
-    await callback.answer("Массовое удаление добавим отдельно (безопасно). Пока удаляй 🗑 справа.", show_alert=True)
+@router.callback_query(F.data == "acc_delete_inactive")
+async def acc_delete_inactive(callback: CallbackQuery) -> None:
+    async with Session() as session:
+        user = await get_user(session, callback.from_user.id)
+        if not user:
+            return await callback.answer("Пользователь не найден", show_alert=True)
+
+        result = await session.execute(
+            select(EmailAccount).where(EmailAccount.user_id == user.id)
+        )
+        all_accs = list(result.scalars())
+        to_del = [a for a in all_accs if (a.status or "active").strip().lower() != "active"]
+        if not to_del:
+            return await callback.answer("Нет неактивных аккаунтов для удаления.", show_alert=True)
+
+        for acc in to_del:
+            await session.delete(acc)
+        await session.commit()
+        n = len(to_del)
+
+    await callback.answer(f"Удалено неактивных: {n}", show_alert=False)
+    await render_accounts_menu(callback, callback.from_user.id, page=1, status_filter="all")
+
+
+@router.callback_query(F.data == "acc_delete_all")
+async def acc_delete_all_confirm(callback: CallbackQuery) -> None:
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Да, удалить ВСЕ",
+                    callback_data="acc_delete_all_yes",
+                )
+            ],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="settings_accounts")],
+        ]
+    )
+    await callback.message.edit_text(
+        "⚠️ <b>Удалить все почтовые аккаунты?</b>\n\n"
+        "Будут удалены все ящики из списка. Это действие нельзя отменить.",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "acc_delete_all_yes")
+async def acc_delete_all_yes(callback: CallbackQuery) -> None:
+    async with Session() as session:
+        user = await get_user(session, callback.from_user.id)
+        if not user:
+            return await callback.answer("Пользователь не найден", show_alert=True)
+
+        result = await session.execute(
+            select(EmailAccount).where(EmailAccount.user_id == user.id)
+        )
+        all_accs = list(result.scalars())
+        n = len(all_accs)
+        for acc in all_accs:
+            await session.delete(acc)
+        await session.commit()
+
+    await callback.answer(f"Удалено аккаунтов: {n}", show_alert=False)
+    await render_accounts_menu(callback, callback.from_user.id, page=1, status_filter="all")
+
+
+@router.callback_query(F.data == "acc_check_smtp")
+async def acc_check_smtp(callback: CallbackQuery) -> None:
+    tg_id = int(callback.from_user.id)
+    if bg_is_running(tg_id, "accounts_smtp_check"):
+        return await callback.answer("Проверка SMTP уже выполняется…", show_alert=True)
+
+    async with Session() as session:
+        user = await get_user(session, tg_id)
+        if not user:
+            return await callback.answer("Пользователь не найден", show_alert=True)
+        result = await session.execute(
+            select(EmailAccount).where(EmailAccount.user_id == user.id).order_by(EmailAccount.id)
+        )
+        accounts = list(result.scalars())
+
+    if not accounts:
+        return await callback.answer("Нет аккаунтов для проверки.", show_alert=True)
+
+    await callback.answer("Запускаю проверку SMTP…")
+    status_msg = await callback.message.answer(
+        f"⏳ <b>Проверка SMTP</b>\n\n0/{len(accounts)}",
+        parse_mode="HTML",
+    )
+
+    async def _job() -> None:
+        from services.smtp_account_check import check_smtp_account_with_proxy
+        from services.smtp_block_control import short_block_reason
+
+        ok_n = 0
+        blocked_n = 0
+        bad_n = 0
+        skip_n = 0
+        lines: List[str] = []
+        total = len(accounts)
+
+        async with Session() as session:
+            user = await get_user(session, tg_id)
+            if not user:
+                await status_msg.edit_text("❌ Пользователь не найден.")
+                return
+            db_uid = int(user.id)
+
+            for i, acc in enumerate(accounts, start=1):
+                try:
+                    await status_msg.edit_text(
+                        f"⏳ <b>Проверка SMTP</b>\n\n{i}/{total}\n"
+                        f"<code>{_e(acc.email)}</code>",
+                        parse_mode="HTML",
+                    )
+                except TelegramBadRequest:
+                    pass
+
+                st, err = await check_smtp_account_with_proxy(session, db_uid, acc)
+                row = await session.get(EmailAccount, int(acc.id))
+                if not row:
+                    continue
+
+                if st is None:
+                    skip_n += 1
+                    lines.append(f"⏭ <code>{_e(acc.email)}</code> — прокси/таймаут")
+                    continue
+
+                prev = (row.status or "").strip().lower()
+                row.status = st
+                row.last_error = (err or "")[:1000] if err else None
+                await session.commit()
+
+                if st == "active":
+                    ok_n += 1
+                    if prev != "active":
+                        lines.append(f"🟢 <code>{_e(acc.email)}</code> — снова активен (SMTP)")
+                    else:
+                        lines.append(f"🟢 <code>{_e(acc.email)}</code> — SMTP OK")
+                elif st == "smtp_blocked":
+                    blocked_n += 1
+                    reason = short_block_reason(err)
+                    lines.append(
+                        f"🟡 <code>{_e(acc.email)}</code> — лимит/блок SMTP\n"
+                        f"   <i>{_e(reason)}</i>"
+                    )
+                else:
+                    bad_n += 1
+                    lines.append(
+                        f"🔴 <code>{_e(acc.email)}</code> — {_e(short_block_reason(err))}"
+                    )
+
+        summary = (
+            "✅ <b>Проверка SMTP завершена</b>\n\n"
+            f"🟢 активны: <b>{ok_n}</b>\n"
+            f"🟡 лимит/блок (smtp_blocked): <b>{blocked_n}</b>\n"
+            f"🔴 ошибка/пароль: <b>{bad_n}</b>\n"
+            f"⏭ без смены статуса (прокси): <b>{skip_n}</b>\n\n"
+            + _trim_details(lines, limit=25)
+        )
+        try:
+            await status_msg.edit_text(summary, parse_mode="HTML")
+        except TelegramBadRequest:
+            await callback.message.answer(summary, parse_mode="HTML")
+
+        await render_accounts_menu(callback, tg_id, page=1, status_filter="all")
+
+    if not bg_start(tg_id, "accounts_smtp_check", _job()):
+        await callback.answer("Проверка SMTP уже выполняется…", show_alert=True)
 
 
 def _is_gmail_address(email: str) -> bool:

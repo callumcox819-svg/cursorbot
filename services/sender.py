@@ -436,10 +436,10 @@ def _send_plain_sync(
     body: str,
     sender_name: Optional[str] = None,
     is_html: Optional[bool] = None,
-) -> Tuple[bool, Optional[str]]:
+) -> Tuple[bool, Optional[str], Optional[str]]:
     guard_err = smtp_proxy_required_error()
     if guard_err:
-        return False, guard_err
+        return False, guard_err, None
 
     # Safe placeholder pass (does not require ctx/link; keeps existing behavior if none)
     body = apply_placeholders(body)
@@ -460,43 +460,44 @@ def _send_plain_sync(
             s.ehlo()
             s.login(account.email, (account.password or "").strip())
 
-            refused = s.sendmail(account.email, [to_email], msg.as_string())
+            refused = s.send_message(msg, from_addr=account.email, to_addrs=[to_email])
             if refused:
                 logger.warning("[SMTP] Recipient refused: %s", refused)
-                return False, "RECIPIENT_REFUSED"
+                return False, "RECIPIENT_REFUSED", None
 
+        msgid = msg.get("Message-ID")
         logger.info(
             "[SMTP] Sent mail via %s -> %s subject=%r msgid=%s",
             account.email,
             to_email,
             subject,
-            msg.get("Message-ID"),
+            msgid,
         )
-        return True, None
+        return True, None, msgid
 
     except Exception as e:
         code, text = _extract_code_text_from_exception(e)
 
         if _is_proxy_error(e, text):
-            return False, _marker("PROXY_ERROR", code or "socks", text or str(e))
+            return False, _marker("PROXY_ERROR", code or "socks", text or str(e)), None
         if _is_smtp_timeout_text(text or str(e)):
-            return False, _marker("SMTP_TIMEOUT", code or "timeout", text or str(e))
+            return False, _marker("SMTP_TIMEOUT", code or "timeout", text or str(e)), None
 
         if _is_invalid_creds(code, text):
-            return False, _marker("ACCOUNT_INVALID_CREDENTIALS", code, text)
+            return False, _marker("ACCOUNT_INVALID_CREDENTIALS", code, text), None
         if _is_web_login_required(text):
-            return False, _marker("ACCOUNT_WEB_LOGIN_REQUIRED", code, text)
+            return False, _marker("ACCOUNT_WEB_LOGIN_REQUIRED", code, text), None
 
         if _is_rate_limit(code, text):
-            return False, _marker("ACCOUNT_RATE_LIMIT", code, text)
+            return False, _marker("ACCOUNT_RATE_LIMIT", code, text), None
 
         if _is_blocked(code, text):
-            return False, _marker("ACCOUNT_BLOCKED", code, text)
+            return False, _marker("ACCOUNT_BLOCKED", code, text), None
 
         if _is_hard_bounce(code, text):
-            return False, _marker("RECIPIENT_DEAD", code, text)
+            return False, _marker("RECIPIENT_DEAD", code, text), None
 
-        return False, f"{type(e).__name__}: {code or ''} {text}".strip() or str(e)
+        return False, f"{type(e).__name__}: {code or ''} {text}".strip() or str(e), None
 
 
 async def send_email_via_account(
@@ -506,7 +507,7 @@ async def send_email_via_account(
     body: str,
     sender_name: Optional[str] = None,
     is_html: Optional[bool] = None,
-) -> Tuple[bool, Optional[str]]:
+) -> Tuple[bool, Optional[str], Optional[str]]:
     return await asyncio.to_thread(_send_plain_sync, account, to_email, subject, body, sender_name, is_html)
 
 

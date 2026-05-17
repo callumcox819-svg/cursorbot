@@ -218,12 +218,14 @@ def test_smtp_tunnel_sync(proxy: Proxy, *, timeout: int = 20) -> tuple[bool, str
         s = _smtplib.SMTP(_SMTP_TEST_HOST, _SMTP_TEST_PORT, timeout=timeout)
         try:
             s.ehlo()
+            s.starttls()
+            s.ehlo()
         finally:
             try:
                 s.close()
             except Exception:
                 pass
-        return True, f"SMTP OK ({_SMTP_TEST_HOST}:{_SMTP_TEST_PORT})"
+        return True, f"SMTP+STARTTLS OK ({_SMTP_TEST_HOST}:{_SMTP_TEST_PORT})"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
     finally:
