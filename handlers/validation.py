@@ -16,7 +16,12 @@ from models import Offer, OfferEmail, Domain
 from services.users import get_or_create_user
 from config import config
 from services.validemail_keys import resolve_validemail_api_keys
-from services.validemail_validator import ValidationConfig, validate_offers
+from services.validemail_validator import (
+    ValidationConfig,
+    merge_validation_domains,
+    probe_domains_for_import,
+    validate_offers,
+)
 from services.offer_storage import save_all_offers_from_import
 from services.seller_name import MIN_NAME_TOKEN_LEN, seller_name_eligible_for_validation, seller_name_from_item
 
@@ -24,7 +29,7 @@ router = Router()
 
 REPLACE_OLD_FOR_USER = True
 REQUIRE_FIRST_AND_LAST = False
-PROGRESS_UPDATE_INTERVAL = 20  # seconds
+PROGRESS_UPDATE_INTERVAL = 5  # seconds
 
 
 def _norm_email(e: str) -> str:
@@ -294,16 +299,8 @@ async def validation_handler(message: Message):
             priority_list = []
 
         pr = [str(x or "").strip().lower() for x in priority_list if str(x or "").strip()]
-        seen: set[str] = set()
-        domains: list[str] = []
-
-        # Приоритетные домены первыми, затем остальные из БД (больше шансов найти email).
-        for d in pr + db_domains:
-            d = str(d or "").strip().lower()
-            if d and d not in seen:
-                seen.add(d)
-                domains.append(d)
-
+        domains = merge_validation_domains(pr + db_domains, items)
+        probe = probe_domains_for_import(items)
 
         if not domains:
             return await status_msg.edit_text("❌ У тебя нет доменов.")
@@ -319,14 +316,19 @@ async def validation_handler(message: Message):
     )
 
     n_keys = len(api_keys)
-    dom_preview = ", ".join(domains[:8])
-    if len(domains) > 8:
-        dom_preview += f" … (+{len(domains) - 8})"
+    dom_preview = ", ".join(domains[:10])
+    if len(domains) > 10:
+        dom_preview += f" … (+{len(domains) - 10})"
+    probe_hint = ""
+    if probe:
+        probe_hint = (
+            f"\n<i>+ поиск по Marketplace: {', '.join(probe)}</i>"
+        )
     progress_msg = await message.answer(
         f"🔎 Запуск валидации…\n"
-        f"Схема: <b>имя (слово ≥{MIN_NAME_TOKEN_LEN} букв или ник alinafor20)</b> → логин → <b>@ваши домены</b> → ValidEmail\n"
-        f"Домены ({len(domains)}): <code>{dom_preview}</code>\n"
-        f"Ключей API: <b>{n_keys}</b> | параллельно: <b>{cfg.concurrency}</b>",
+        f"Схема: <b>имя</b> → варианты логина → <b>@домен</b> → ValidEmail API\n"
+        f"Домены ({len(domains)}): <code>{dom_preview}</code>{probe_hint}\n"
+        f"Ключей API: <b>{n_keys}</b> | потоков: <b>{cfg.concurrency}</b>",
         parse_mode="HTML",
     )
 
@@ -375,13 +377,20 @@ async def validation_handler(message: Message):
             limit = int(st.get("limit", 0) or 0)
             in_use = int(st.get("in_use", 0) or 0)
             offers_total_ = int(vstats.get("offers_total") or st.get("offers_total") or 0)
-            validated_ = int(vstats.get("offers_validated") or 0)
+            eligible_ = int(vstats.get("offers_eligible") or st.get("offers_with_name") or 0)
+            sellers_found_ = int(
+                vstats.get("sellers_with_email") or vstats.get("offers_validated") or 0
+            )
             remaining_ = int(
                 vstats.get("offers_remaining")
                 if vstats.get("offers_remaining") is not None
-                else max(0, offers_total_ - validated_)
+                else max(0, eligible_ - sellers_found_)
             )
-            eligible_ = int(vstats.get("offers_eligible") or st.get("offers_with_name") or 0)
+            combos_ok = int(vstats.get("combinations_valid") or 0)
+            cur_dom = str(vstats.get("current_domain") or "").strip()
+            dom_i = int(vstats.get("domain_index") or 0)
+            dom_n = int(vstats.get("domains_total") or 0)
+            last_ok = str(vstats.get("last_valid_email") or "").strip()
 
             bar, pct = ("", 0)
             if total > 0:
@@ -392,18 +401,26 @@ async def validation_handler(message: Message):
 
             text = (
                 "🔎 <b>Валидация email</b>\n\n"
-                f"👁 Просмотрено: <b>{offers_total_}</b>\n"
-                f"📝 С именем (проверяем): <b>{eligible_}</b>\n"
-                f"✅ Валидировано: <b>{validated_}</b>\n"
-                f"⏳ Осталось: <b>{remaining_}</b>\n"
+                f"📄 Объявлений в файле: <b>{offers_total_}</b>\n"
+                f"👤 С именем (к проверке): <b>{eligible_}</b>\n"
+                f"✅ Продавцов с email: <b>{sellers_found_}</b>\n"
+                f"⏳ Без email (ещё ищем): <b>{remaining_}</b>\n"
             )
+            if cur_dom:
+                dom_line = f"🌐 Сейчас домен: <code>@{cur_dom}</code>"
+                if dom_n > 0 and dom_i > 0:
+                    dom_line += f" ({dom_i}/{dom_n})"
+                text += f"\n{dom_line}\n"
             if total > 0:
                 text += (
                     f"\n{bar} {pct}%\n"
-                    f"Проверено адресов: {done}/{total}\n"
-                    f"ETA: ~{_fmt_eta(eta)}\n"
-                    f"Потоков: {in_use}/{(limit or 0)}"
+                    f"🔎 Проверено комбинаций: <b>{done}</b> / <b>{total}</b>\n"
+                    f"📬 Валидных ответов API: <b>{combos_ok}</b>\n"
+                    f"ETA: ~{_fmt_eta(eta)} · потоков: {in_use}/{(limit or 0)}"
                 )
+            if last_ok:
+                show = last_ok if len(last_ok) <= 48 else last_ok[:45] + "…"
+                text += f"\n<i>Последний найденный: <code>{show}</code></i>"
             if text != st.get("last_text"):
                 try:
                     await msg.edit_text(text, parse_mode="HTML")
@@ -472,14 +489,19 @@ async def validation_handler(message: Message):
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
+    probe_note = ""
+    if probe_domains_for_import(items):
+        probe_note = f"\n🌐 Marketplace-домены: {', '.join(probe_domains_for_import(items))}"
+
     await message.answer_document(
         FSInputFile(out_path),
         caption=(
             f"💾 Сохранено в БД: {offers_saved}/{total_offers}\n"
-            f"👤 Имён проверено: {eligible}\n"
-            f"🔎 Комбинаций имя@домен: {combos_checked} (валидных: {combos_valid})\n"
+            f"👤 Имён к проверке: {eligible}\n"
+            f"🔎 Проверено комбинаций: {combos_checked} · API valid: {combos_valid}\n"
             f"✅ Продавцов с email: {offers_with_email}\n"
-            f"⏳ Без email (имя есть): {max(0, offers_saved - offers_with_email)}\n"
-            f"📧 Email записей: {saved_email_count}"
+            f"⏳ Без email (имя есть): {max(0, eligible - offers_with_email)}\n"
+            f"📧 Email записей в БД: {saved_email_count}"
+            f"{probe_note}"
         ),
     )

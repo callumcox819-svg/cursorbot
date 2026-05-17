@@ -38,6 +38,17 @@ def normalize_seller_name(raw: str) -> str:
     return s.replace("'", "'").replace("`", "'")
 
 
+def pick_name_tokens_for_email(name: str) -> list[str]:
+    """
+    Токены для local-part: сначала слова ≥4 букв; если пары нет — слова ≥2 букв
+    (Sam Day → sam.day, как у типичных gmail).
+    """
+    long_t = pick_name_tokens(name, min_len=MIN_NAME_TOKEN_LEN)
+    if len(long_t) >= 2 or len(long_t) == 1:
+        return long_t
+    return pick_name_tokens(name, min_len=2)
+
+
 def pick_name_tokens(name: str, *, min_len: int = MIN_NAME_TOKEN_LEN) -> list[str]:
     """Буквенные части имени (каждая >= min_len символов, только буквы)."""
     s = normalize_seller_name(name)
@@ -95,8 +106,9 @@ def pick_handle_locals(name: str, *, min_len: int = MIN_NAME_TOKEN_LEN) -> list[
 
 
 def seller_name_eligible_for_validation(name: str, *, min_token_len: int = MIN_NAME_TOKEN_LEN) -> bool:
-    """Имя подходит для имя@домен: слово из букв >=4 или ник (alinafor20)."""
-    return bool(
-        pick_name_tokens(name, min_len=min_token_len)
-        or pick_handle_locals(name, min_len=min_token_len)
-    )
+    """Имя подходит для имя@домен: слово ≥4 букв, пара слов ≥2 букв, или ник."""
+    if pick_handle_locals(name, min_len=min_token_len):
+        return True
+    if pick_name_tokens(name, min_len=min_token_len):
+        return True
+    return len(pick_name_tokens(name, min_len=2)) >= 2

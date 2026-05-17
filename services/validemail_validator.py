@@ -19,9 +19,13 @@ from services.seller_name import (
     normalize_seller_name,
     pick_handle_locals,
     pick_name_tokens,
+    pick_name_tokens_for_email,
     seller_name_eligible_for_validation,
     seller_name_from_item,
 )
+
+# Домены для поиска email по имени (VoidParser / Facebook Marketplace — почти всегда gmail).
+_MARKETPLACE_PROBE_DOMAINS = ("gmail.com", "gmx.ch", "gmx.net")
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +58,7 @@ def _normalize_name(raw: str) -> str:
 
 
 def _pick_alpha_tokens(name: str) -> list[str]:
-    return pick_name_tokens(name, min_len=MIN_NAME_TOKEN_LEN)
+    return pick_name_tokens_for_email(name)
 
 
 def _pick_first_last_alpha_tokens(name: str) -> tuple[str, str]:
@@ -199,6 +203,37 @@ async def _get_validemail_key_for_user(session: Session, telegram_id: int) -> st
 ProgressCb = Callable[[int, int, int, int], None]
 
 
+def probe_domains_for_import(items: list[dict[str, Any]]) -> list[str]:
+    """Доп. домены для валидации по имени (не заменяют домены пользователя)."""
+    has_fb = False
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        link = str(it.get("item_link") or it.get("link") or it.get("url") or "").lower()
+        if "facebook.com" in link:
+            has_fb = True
+            break
+    if not has_fb:
+        return []
+    return list(_MARKETPLACE_PROBE_DOMAINS)
+
+
+def merge_validation_domains(
+    user_domains: list[str], items: list[dict[str, Any]]
+) -> list[str]:
+    """Для Facebook: сначала gmail/gmx (как VoidParser), затем домены пользователя."""
+    probe = probe_domains_for_import(items)
+    ordered = (list(probe) + list(user_domains or [])) if probe else list(user_domains or [])
+    seen: set[str] = set()
+    out: list[str] = []
+    for d in ordered:
+        dd = str(d or "").strip().lower()
+        if dd and dd not in seen:
+            seen.add(dd)
+            out.append(dd)
+    return out
+
+
 async def _validate_offers_old(
     items: list[dict[str, Any]],
     domains: list[str],
@@ -240,6 +275,9 @@ async def _validate_offers_old(
                 "emails_checked": 0,
                 "emails_total": 0,
                 "combinations_valid": 0,
+                "current_domain": "",
+                "sellers_with_email": 0,
+                "last_valid_email": "",
             }
         )
 
@@ -312,7 +350,11 @@ async def _validate_offers_old(
     url = str(cfg.validation_url or DEFAULT_VALIDEMAIL_URL).strip()
 
     # 2) имя → local-part → @домен → ValidEmail (домены по приоритету)
-    for dom in domains_clean:
+    for dom_idx, dom in enumerate(domains_clean):
+        if stats is not None:
+            stats["current_domain"] = dom
+            stats["domain_index"] = dom_idx + 1
+            stats["domains_total"] = len(domains_clean)
         # индексы офферов, которым ещё нужны email
         need_idx = [i for i, f in enumerate(found_by_idx) if len(f) < per_seller_limit]
         if not need_idx:
@@ -353,11 +395,13 @@ async def _validate_offers_old(
         # считаем, что батч "проверен"
         overall_done += len(batch_emails)
 
+        sellers_found = sum(1 for f in found_by_idx if f)
         if stats is not None:
             stats["emails_checked"] = overall_done
-            stats["offers_validated"] = sum(1 for f in found_by_idx if f)
-            total_o = int(stats.get("offers_total") or 0)
-            stats["offers_remaining"] = max(0, total_o - int(stats["offers_validated"]))
+            stats["sellers_with_email"] = sellers_found
+            stats["offers_validated"] = sellers_found
+            eligible_o = int(stats.get("offers_eligible") or len(prepared))
+            stats["offers_remaining"] = max(0, eligible_o - sellers_found)
 
         combos_valid = 0
         for e, ok, _raw in results:
@@ -371,9 +415,15 @@ async def _validate_offers_old(
             lst = found_by_idx[idx]
             if len(lst) < per_seller_limit and key not in lst:
                 lst.append(key)
+                if stats is not None:
+                    stats["last_valid_email"] = key
 
         if stats is not None:
             stats["combinations_valid"] = int(stats.get("combinations_valid") or 0) + combos_valid
+            stats["sellers_with_email"] = sum(1 for f in found_by_idx if f)
+            stats["offers_validated"] = stats["sellers_with_email"]
+            eligible_o = int(stats.get("offers_eligible") or len(prepared))
+            stats["offers_remaining"] = max(0, eligible_o - int(stats["sellers_with_email"]))
 
     # 3) собираем результат
     out_rows: list[dict[str, Any]] = []
