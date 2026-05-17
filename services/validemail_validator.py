@@ -24,8 +24,8 @@ from services.seller_name import (
     seller_name_from_item,
 )
 
-# Домены для поиска email по имени (VoidParser / Facebook Marketplace — почти всегда gmail).
-_MARKETPLACE_PROBE_DOMAINS = ("gmail.com", "gmx.ch", "gmx.net")
+# Всегда первый домен при подстановке имени (далее — домены пользователя из настроек).
+_GMAIL_PROBE_DOMAIN = "gmail.com"
 
 logger = logging.getLogger(__name__)
 
@@ -89,11 +89,13 @@ def _make_local_part_from_name(name: str, *, require_first_and_last: bool) -> st
 
 def _make_local_part_variants(name: str, *, require_first_and_last: bool) -> list[str]:
     """
-    Несколько типичных local-part для одного продавца.
-    Реальные люди часто используют не только first.last.
-  """
+    Логины из имени продавца (готовые email из JSON не используем).
+    Приоритет: ник (Semiuel2421) или first.last (Sam Day → sam.day), затем firstlast.
+    """
     out: list[str] = []
     seen: set[str] = set()
+    norm = _normalize_name(name)
+    parts = [p for p in re.split(r"[\s\-']+", norm) if p.strip()]
 
     def _add(local: str) -> None:
         local = re.sub(r"[^a-z0-9._+\-]", "", (local or "").lower())
@@ -103,17 +105,25 @@ def _make_local_part_variants(name: str, *, require_first_and_last: bool) -> lis
         seen.add(local)
         out.append(local)
 
-    # Ники: alinafor20 → сразу как local-part
-    for handle in pick_handle_locals(name):
-        _add(handle)
+    handles = pick_handle_locals(name)
+    if handles and len(parts) <= 1:
+        for h in handles:
+            _add(h)
+        return out
 
     tokens = _pick_alpha_tokens(name)
     if require_first_and_last and len(tokens) < 2:
+        for h in handles:
+            _add(h)
         return out
     if not tokens:
+        for h in handles:
+            _add(h)
         return out
 
     if len(tokens) == 1:
+        for h in handles:
+            _add(h)
         _add(tokens[0])
         return out
 
@@ -121,19 +131,10 @@ def _make_local_part_variants(name: str, *, require_first_and_last: bool) -> lis
     if len(first) < 1 or len(last) < 1:
         return out
 
+    for h in handles:
+        _add(h)
     _add(f"{first}.{last}")
     _add(f"{first}{last}")
-    _add(f"{first}_{last}")
-    if len(last) >= 2:
-        _add(f"{first}{last[0]}")
-    if len(first) >= 1:
-        _add(f"{first[0]}{last}")
-    _add(f"{last}.{first}")
-    _add(f"{last}{first}")
-    if len(tokens) >= 3:
-        mid = tokens[1]
-        if len(mid) >= 2:
-            _add(f"{first}.{mid}.{last}")
     return out
 
 
@@ -203,34 +204,26 @@ async def _get_validemail_key_for_user(session: Session, telegram_id: int) -> st
 ProgressCb = Callable[[int, int, int, int], None]
 
 
-def probe_domains_for_import(items: list[dict[str, Any]]) -> list[str]:
-    """Доп. домены для валидации по имени (не заменяют домены пользователя)."""
-    has_fb = False
-    for it in items or []:
-        if not isinstance(it, dict):
-            continue
-        link = str(it.get("item_link") or it.get("link") or it.get("url") or "").lower()
-        if "facebook.com" in link:
-            has_fb = True
-            break
-    if not has_fb:
-        return []
-    return list(_MARKETPLACE_PROBE_DOMAINS)
-
-
 def merge_validation_domains(
-    user_domains: list[str], items: list[dict[str, Any]]
+    user_domains: list[str], items: list[dict[str, Any]] | None = None,
 ) -> list[str]:
-    """Для Facebook: сначала gmail/gmx (как VoidParser), затем домены пользователя."""
-    probe = probe_domains_for_import(items)
-    ordered = (list(probe) + list(user_domains or [])) if probe else list(user_domains or [])
+    """
+    Порядок подстановки: сначала gmail.com, затем домены из настроек (получатели).
+    Email из JSON не участвует — только имя + домен + ValidEmail API.
+    """
+    _ = items
     seen: set[str] = set()
     out: list[str] = []
-    for d in ordered:
+
+    def _push(d: str) -> None:
         dd = str(d or "").strip().lower()
         if dd and dd not in seen:
             seen.add(dd)
             out.append(dd)
+
+    _push(_GMAIL_PROBE_DOMAIN)
+    for d in user_domains or []:
+        _push(d)
     return out
 
 
@@ -281,7 +274,7 @@ async def _validate_offers_old(
             }
         )
 
-    # 1) подготовка офферов (имя из JSON + blacklist + длина local-part)
+    # 1) Имя из JSON → local-part (готовые email в файле игнорируем)
     prepared: list[dict[str, Any]] = []
     for it in items:
         if not isinstance(it, dict):

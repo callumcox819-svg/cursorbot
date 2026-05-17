@@ -19,7 +19,6 @@ from services.validemail_keys import resolve_validemail_api_keys
 from services.validemail_validator import (
     ValidationConfig,
     merge_validation_domains,
-    probe_domains_for_import,
     validate_offers,
 )
 from services.offer_storage import save_all_offers_from_import
@@ -247,10 +246,12 @@ async def validation_handler(message: Message):
 
     try:
         await status_msg.edit_text(
-            "📥 Файл принят. Подготавливаю данные…\n"
+            "📥 Файл принят. Сохраню все объявления в БД.\n"
             f"Всего объявлений: <b>{total_offers}</b>\n"
-            f"К валидации (имя ≥{MIN_NAME_TOKEN_LEN} букв / ник): <b>{offers_with_name}</b>\n"
-            f"Всего с полем имени: <b>{offers_name_any}</b>",
+            f"К подстановке email по имени: <b>{offers_with_name}</b>\n"
+            f"С полем имени: <b>{offers_name_any}</b>\n\n"
+            "<i>Готовые email из JSON не используем — только имя → "
+            "логин → @gmail.com → ваши домены → ValidEmail.</i>",
             parse_mode="HTML",
         )
     except Exception:
@@ -300,7 +301,6 @@ async def validation_handler(message: Message):
 
         pr = [str(x or "").strip().lower() for x in priority_list if str(x or "").strip()]
         domains = merge_validation_domains(pr + db_domains, items)
-        probe = probe_domains_for_import(items)
 
         if not domains:
             return await status_msg.edit_text("❌ У тебя нет доменов.")
@@ -319,15 +319,12 @@ async def validation_handler(message: Message):
     dom_preview = ", ".join(domains[:10])
     if len(domains) > 10:
         dom_preview += f" … (+{len(domains) - 10})"
-    probe_hint = ""
-    if probe:
-        probe_hint = (
-            f"\n<i>+ поиск по Marketplace: {', '.join(probe)}</i>"
-        )
     progress_msg = await message.answer(
         f"🔎 Запуск валидации…\n"
-        f"Схема: <b>имя</b> → варианты логина → <b>@домен</b> → ValidEmail API\n"
-        f"Домены ({len(domains)}): <code>{dom_preview}</code>{probe_hint}\n"
+        f"<b>Sam Day</b> → <code>sam.day@gmail.com</code> → ValidEmail → "
+        f"если нет — следующий домен из списка\n"
+        f"Ники (Semiuel2421) → <code>semiuel2421@gmail.com</code>\n"
+        f"Домены ({len(domains)}): <code>{dom_preview}</code>\n"
         f"Ключей API: <b>{n_keys}</b> | потоков: <b>{cfg.concurrency}</b>",
         parse_mode="HTML",
     )
@@ -489,19 +486,15 @@ async def validation_handler(message: Message):
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
-    probe_note = ""
-    if probe_domains_for_import(items):
-        probe_note = f"\n🌐 Marketplace-домены: {', '.join(probe_domains_for_import(items))}"
-
     await message.answer_document(
         FSInputFile(out_path),
         caption=(
             f"💾 Сохранено в БД: {offers_saved}/{total_offers}\n"
             f"👤 Имён к проверке: {eligible}\n"
-            f"🔎 Проверено комбинаций: {combos_checked} · API valid: {combos_valid}\n"
+            f"🔎 Проверено: {combos_checked} (ValidEmail OK: {combos_valid})\n"
             f"✅ Продавцов с email: {offers_with_email}\n"
             f"⏳ Без email (имя есть): {max(0, eligible - offers_with_email)}\n"
-            f"📧 Email записей в БД: {saved_email_count}"
-            f"{probe_note}"
+            f"📧 Email записей в БД: {saved_email_count}\n"
+            f"🌐 Порядок: gmail.com → ваши домены"
         ),
     )

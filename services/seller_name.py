@@ -29,11 +29,53 @@ def _strip_accents(text: str) -> str:
     return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
 
 
+# ö → o, ä → a и т.д. (для local-part и ValidEmail)
+_LATIN_FOLD = str.maketrans(
+    {
+        "ö": "o",
+        "Ö": "O",
+        "ä": "a",
+        "Ä": "A",
+        "ü": "u",
+        "Ü": "U",
+        "ë": "e",
+        "Ë": "E",
+        "é": "e",
+        "è": "e",
+        "ê": "e",
+        "á": "a",
+        "à": "a",
+        "â": "a",
+        "í": "i",
+        "ì": "i",
+        "î": "i",
+        "ó": "o",
+        "ò": "o",
+        "ô": "o",
+        "ú": "u",
+        "ù": "u",
+        "û": "u",
+        "ñ": "n",
+        "ç": "c",
+        "ø": "o",
+        "Ø": "O",
+        "å": "a",
+        "Å": "A",
+        "æ": "ae",
+        "Æ": "AE",
+        "œ": "oe",
+        "Œ": "OE",
+        "ß": "ss",
+        "ẞ": "SS",
+    }
+)
+
+
 def normalize_seller_name(raw: str) -> str:
     if not raw:
         return ""
     s = " ".join(str(raw).strip().split())
-    s = s.replace("ß", "ss").replace("ẞ", "SS")
+    s = s.translate(_LATIN_FOLD)
     s = _strip_accents(s)
     return s.replace("'", "'").replace("`", "'")
 
@@ -70,8 +112,8 @@ def pick_name_tokens(name: str, *, min_len: int = MIN_NAME_TOKEN_LEN) -> list[st
     return out
 
 
-def _is_handle_token(h: str, *, min_len: int = MIN_NAME_TOKEN_LEN) -> bool:
-    """Ник вида alinafor20: латиница+цифры, >= min_len, есть хотя бы одна буква."""
+def _is_handle_token(h: str, *, min_len: int = 3) -> bool:
+    """Ник вида Semiuel2421 / alinafor20: латиница+цифры."""
     if len(h) < min_len or len(h) > 64:
         return False
     if not h.isalnum():
@@ -79,10 +121,9 @@ def _is_handle_token(h: str, *, min_len: int = MIN_NAME_TOKEN_LEN) -> bool:
     return any(c.isalpha() for c in h)
 
 
-def pick_handle_locals(name: str, *, min_len: int = MIN_NAME_TOKEN_LEN) -> list[str]:
+def pick_handle_locals(name: str, *, min_len: int = 3) -> list[str]:
     """
-    Никнеймы из профиля: alinafor20, coolguy99 и т.п.
-    — одно слово в имени или часть с цифрами (не короче min_len).
+    Никнеймы: Semiuel2421, alinafor20 — одно слово или часть с цифрами.
     """
     s = normalize_seller_name(name)
     if not s:
@@ -107,7 +148,7 @@ def pick_handle_locals(name: str, *, min_len: int = MIN_NAME_TOKEN_LEN) -> list[
 
 def seller_name_eligible_for_validation(name: str, *, min_token_len: int = MIN_NAME_TOKEN_LEN) -> bool:
     """Имя подходит для имя@домен: слово ≥4 букв, пара слов ≥2 букв, или ник."""
-    if pick_handle_locals(name, min_len=min_token_len):
+    if pick_handle_locals(name):
         return True
     if pick_name_tokens(name, min_len=min_token_len):
         return True
