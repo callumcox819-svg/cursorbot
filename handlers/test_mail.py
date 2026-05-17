@@ -118,9 +118,15 @@ async def test_mail_send(message: Message, state: FSMContext):
                 )
             if ok:
                 await status.edit_text(
-                    f"✅ Тестовое письмо отправлено на: {to_email}\n"
-                    f"Тема: {subject}\n"
-                    f"От: {acc_email}"
+                    "✅ <b>SMTP принял письмо</b> (сервер отправителя не вернул ошибку)\n\n"
+                    f"Кому: <code>{to_email}</code>\n"
+                    f"От: <code>{acc_email}</code>\n"
+                    f"Тема: {subject}\n\n"
+                    "<i>Это ещё не гарантия, что письмо во «Входящих» у получателя.</i>\n"
+                    "Проверьте у отправителя папку <b>«Отправленные»</b> — если письма там нет, "
+                    "рассылка реально не ушла.\n"
+                    "Если в «Отправленных» есть, а у получателя нет — фильтр Gmail/прокси/репутация ящика.",
+                    parse_mode="HTML",
                 )
                 async with async_session() as session2:
                     raw_link = await pick_random_raw_link(session2)
