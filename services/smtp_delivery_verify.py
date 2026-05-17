@@ -24,6 +24,22 @@ def _decode_hdr(val: str | bytes | None) -> str:
     return str(val)
 
 
+def _imap_mailbox_arg(name: str) -> str:
+    """Gmail Sent: «[Gmail]/Sent Mail» — без кавычек IMAP отвечает BAD Could not parse command."""
+    box = (name or "").strip()
+    if not box:
+        return "INBOX"
+    if any(c in box for c in (' ', '\t', '"', "\\", "[", "]", "/")):
+        escaped = box.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return box
+
+
+def _imap_select_mailbox(M: imaplib.IMAP4_SSL, mailbox: str):
+    arg = _imap_mailbox_arg(mailbox)
+    return M.select(arg)
+
+
 def _find_sent_mailbox(M: imaplib.IMAP4_SSL) -> Optional[str]:
     typ, data = M.list()
     if typ != "OK" or not data:
@@ -89,7 +105,7 @@ def verify_message_in_sent_sync(
         if not sent_box:
             return False, "Не найдена папка «Отправленные» по IMAP"
 
-        typ, _ = M.select(sent_box)
+        typ, _ = _imap_select_mailbox(M, sent_box)
         if typ != "OK":
             return False, f"Не удалось открыть {sent_box}"
 

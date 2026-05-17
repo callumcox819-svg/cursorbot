@@ -27,7 +27,7 @@ async def send_email_via_smtp(
     if not user_id:
         return False, "PROXY_ERROR|no_user|user_id required for SMTP send"
     async with Session() as session:
-        ok, err = await send_email_via_account_with_proxy(
+        ok, err, _msgid = await send_email_via_account_with_proxy(
             session, user_id, acc, to_email, subject, body, sender_name=sender_name
         )
     return ok, err

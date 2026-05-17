@@ -352,7 +352,7 @@ async def _bg_incoming_smtp(
 
     async def _job() -> None:
         try:
-            ok, err = await asyncio.wait_for(coro_fn(), timeout=_INCOMING_SMTP_TIMEOUT + 10)
+            ok, err, _msgid = await asyncio.wait_for(coro_fn(), timeout=_INCOMING_SMTP_TIMEOUT + 10)
         except asyncio.TimeoutError:
             ok, err = False, "Timeout: SMTP отправка заняла слишком долго"
         except Exception as e:
@@ -399,7 +399,7 @@ async def _bg_message_smtp(
 
     async def _job() -> None:
         try:
-            ok, err = await asyncio.wait_for(coro_fn(), timeout=_INCOMING_SMTP_TIMEOUT + 10)
+            ok, err, _msgid = await asyncio.wait_for(coro_fn(), timeout=_INCOMING_SMTP_TIMEOUT + 10)
         except asyncio.TimeoutError:
             ok, err = False, "Timeout: SMTP отправка заняла слишком долго"
         except Exception as e:

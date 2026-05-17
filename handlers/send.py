@@ -453,7 +453,7 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     to_addr = (tgt.email or "").strip()
 
                     async with smtp_sem:
-                        ok, err = await asyncio.wait_for(
+                        ok, err, _msgid = await asyncio.wait_for(
                             send_email_via_account_with_proxy(
                                 session,
                                 db_user_id,

@@ -149,7 +149,7 @@ async def _bg_cust_smtp(callback: CallbackQuery, coro_fn) -> bool:
 
     async def _job() -> None:
         try:
-            ok, err = await asyncio.wait_for(coro_fn(), timeout=_SMTP_TIMEOUT + 10)
+            ok, err, _msgid = await asyncio.wait_for(coro_fn(), timeout=_SMTP_TIMEOUT + 10)
         except asyncio.TimeoutError:
             ok, err = False, "Timeout SMTP"
         except Exception as e:

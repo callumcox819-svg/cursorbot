@@ -154,13 +154,23 @@ async def test_mail_send(message: Message, state: FSMContext):
                         parse_mode="HTML",
                     )
                 else:
+                    vm = (verify_msg or "").lower()
+                    if vm.startswith("imap:") or "could not parse" in vm:
+                        hint = (
+                            "SMTP принял письмо, но проверка «Отправленных» по IMAP не удалась.\n"
+                            "Проверьте у отправителя папку «Отправленные» вручную."
+                        )
+                    else:
+                        hint = (
+                            "SMTP не вернул ошибку, но в «Отправленных» у отправителя письма нет.\n"
+                            "Проверьте SOCKS5-прокси или попробуйте другой."
+                        )
                     await status.edit_text(
-                        "❌ <b>Отправка не подтверждена</b>\n\n"
-                        "SMTP не вернул ошибку, но в «Отправленных» у "
-                        f"<code>{acc_email}</code> письма нет — через прокси оно, скорее всего, "
-                        "не дошло до почтового ящика.\n\n"
-                        f"<i>{verify_msg}</i>\n\n"
-                        "Проверьте SOCKS5-прокси (🌐 Прокси → проверка) и попробуйте другой прокси.",
+                        "⚠️ <b>Отправка не подтверждена в «Отправленных»</b>\n\n"
+                        f"Кому: <code>{to_email}</code>\n"
+                        f"От: <code>{acc_email}</code>\n\n"
+                        f"{hint}\n\n"
+                        f"<i>{verify_msg}</i>",
                         parse_mode="HTML",
                     )
                     return
