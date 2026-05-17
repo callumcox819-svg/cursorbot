@@ -414,11 +414,11 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     ok, err = await _send_one_with_timeout(acc, tgt)
                     if ok:
                         state.sent_count += 1
-                        state.last_error = ""
                         await _purge_target(session, db_user_id, tgt.id)
                     else:
                         state.failed_count += 1
-                        state.last_error = err
+                        state.last_error = err or "UNKNOWN"
+                        state.last_failed_to = (tgt.email or "").strip()
                         if "RECIPIENT_DEAD" in err or "5.1.1" in err:
                             await _purge_target(session, db_user_id, tgt.id)
 
@@ -431,7 +431,8 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                             await _purge_target(session, db_user_id, t.id)
                         else:
                             state.failed_count += 1
-                            state.last_error = err
+                            state.last_error = err or "UNKNOWN"
+                            state.last_failed_to = (t.email or "").strip()
                             if "RECIPIENT_DEAD" in err or "5.1.1" in err:
                                 await _purge_target(session, db_user_id, t.id)
 

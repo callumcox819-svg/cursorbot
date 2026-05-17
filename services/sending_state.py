@@ -17,6 +17,7 @@ class SendingState:
 
     last_status: str = "-"  # NORMAL / FAST
     last_error: str = "-"
+    last_failed_to: str = ""  # email получателя последней ошибки
 
     # --- метрики аккаунтов для статуса ---
     accounts_total: int = 0

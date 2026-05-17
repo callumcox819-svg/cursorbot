@@ -16,6 +16,34 @@ from services.sending_state import get_sending_state, SendingState
 router = Router()
 logger = logging.getLogger(__name__)
 
+_ERROR_HINTS = {
+    "PROXY_ERROR": "Прокси / таймаут SMTP (проверьте SOCKS5 в «Прокси»)",
+    "ACCOUNT_INVALID_CREDENTIALS": "Неверный пароль почты (нужен пароль приложения)",
+    "ACCOUNT_WEB_LOGIN_REQUIRED": "Gmail просит войти в браузере — разблокируйте аккаунт",
+    "ACCOUNT_RATE_LIMIT": "Лимит отправки Gmail — сделайте паузу или смените аккаунт",
+    "ACCOUNT_BLOCKED": "Почтовый аккаунт заблокирован для отправки",
+    "RECIPIENT_DEAD": "Адрес не существует (удалён из очереди)",
+    "RECIPIENT_REFUSED": "Сервер отклонил письмо на этот адрес",
+    "TG_ERROR": "Сбой Telegram (сеть бота)",
+    "NO_ACCOUNTS": "Нет активных аккаунтов",
+}
+
+
+def _humanize_send_error(raw: str) -> str:
+    """Короткое описание ошибки рассылки для /stat."""
+    s = (raw or "").strip()
+    if not s or s == "-":
+        return ""
+
+    kind = s.split("|", 1)[0].split(":", 1)[0].strip().upper()
+    hint = _ERROR_HINTS.get(kind, "")
+    detail = s.replace("\n", " ").strip()
+    if len(detail) > 220:
+        detail = detail[:220] + "…"
+    if hint:
+        return f"{hint}\n<code>{detail}</code>"
+    return f"<code>{detail}</code>"
+
 
 def tg_answer_safe(obj: Message | CallbackQuery, text: str, **kwargs):
     """Безопасный ответ (Message -> answer, CallbackQuery -> message.answer)."""
@@ -47,6 +75,7 @@ def render_status_text(
         acc_t = st.get("accounts_total")
         acc_a = st.get("accounts_active")
         last_err = (st.get("last_error") or "").strip()
+        last_to = (st.get("last_failed_to") or "").strip()
     elif st:
         running = bool(getattr(st, "is_running", False) or getattr(st, "running", False))
         sent = int(getattr(st, "sent_count", 0) or getattr(st, "sent", 0) or 0)
@@ -55,12 +84,14 @@ def render_status_text(
         acc_t = getattr(st, "accounts_total", None)
         acc_a = getattr(st, "accounts_active", None)
         last_err = (getattr(st, "last_error", "") or "").strip()
+        last_to = (getattr(st, "last_failed_to", "") or "").strip()
     else:
         running = False
         sent = failed = 0
         mode = "-"
         acc_t = acc_a = None
         last_err = ""
+        last_to = ""
 
     # приоритет: свежие значения из БД
     if accounts_total is not None:
@@ -83,11 +114,15 @@ def render_status_text(
         run_line = "Сейчас рассылка не запущена."
 
     last_err_line = ""
-    if last_err and last_err not in ("-", ""):
-        compact = last_err.replace("\n", " ").strip()
-        if len(compact) > 160:
-            compact = compact[:160] + "…"
-        last_err_line = f"\nПоследняя ошибка: <code>{compact}</code>"
+    if int(failed) > 0:
+        if last_err and last_err not in ("-", ""):
+            who = f" → <code>{last_to}</code>" if last_to else ""
+            last_err_line = f"\n\n<b>Последняя ошибка</b>{who}\n{_humanize_send_error(last_err)}"
+        else:
+            last_err_line = (
+                "\n\n<i>Были ошибки, но текст последней уже не в памяти — "
+                "после следующей ошибки снова появится здесь.</i>"
+            )
 
     progress_line = ""
     if running and pending_now > 0:
