@@ -9,11 +9,10 @@ from models import EmailAccount, Proxy
 from proxy_manager import ProxySMTPContext, choose_proxy_for_user
 from services.sender import (
     is_definite_proxy_failure,
-    is_proxy_error_marker,
-    is_smtp_timeout_error,
     normalize_send_error,
     send_batch_via_account,
     send_email_via_account,
+    should_retry_send_with_other_proxy,
 )
 from services.proxy_manager import ProxyManager
 
@@ -26,10 +25,17 @@ async def choose_required_proxy(
     *,
     exclude_ids: set[int] | None = None,
 ) -> Tuple[Optional[Proxy], Optional[str]]:
+    """
+    (proxy, None) — ок.
+    (None, NO_ACTIVE_PROXY) — в БД нет ни одного активного SOCKS5.
+    (None, None) — все доступные прокси уже пробовали в этом send (не «мёртвые»).
+    """
     proxy = await choose_proxy_for_user(session, int(user_id), exclude_ids=exclude_ids)
-    if not proxy:
-        return None, NO_ACTIVE_PROXY
-    return proxy, None
+    if proxy:
+        return proxy, None
+    if exclude_ids:
+        return None, None
+    return None, NO_ACTIVE_PROXY
 
 
 async def send_email_via_account_with_proxy(
@@ -45,13 +51,14 @@ async def send_email_via_account_with_proxy(
     last_err: str | None = None
     tried_ids: set[int] = set()
 
-    for _attempt in range(3):
-        proxy, err = await choose_required_proxy(session, user_id, exclude_ids=tried_ids)
-        if err:
-            return False, err
-        pid = int(proxy.id)
-        if pid in tried_ids:
+    while True:
+        proxy, pick_err = await choose_required_proxy(session, user_id, exclude_ids=tried_ids)
+        if pick_err:
+            return False, pick_err
+        if not proxy:
             break
+
+        pid = int(proxy.id)
         tried_ids.add(pid)
 
         async with ProxySMTPContext(proxy):
@@ -68,33 +75,21 @@ async def send_email_via_account_with_proxy(
             return True, err
 
         last_err = err
-        if is_smtp_timeout_error(err):
-            try:
-                await ProxyManager.note_proxy_failure(
-                    session, pid, (err or "")[:500], deactivate=False
-                )
-            except Exception:
-                pass
-            continue
-        if is_definite_proxy_failure(err):
-            try:
-                await ProxyManager.note_proxy_failure(
-                    session, pid, (err or "")[:500], deactivate=True
-                )
-            except Exception:
-                pass
-            continue
-        elif is_proxy_error_marker(err):
-            try:
-                await ProxyManager.note_proxy_failure(
-                    session, pid, (err or "")[:500], deactivate=False
-                )
-            except Exception:
-                pass
-            continue
-        return False, err
+        if not should_retry_send_with_other_proxy(err):
+            return False, err
 
-    return False, last_err
+        deactivate = is_definite_proxy_failure(err)
+        try:
+            await ProxyManager.note_proxy_failure(
+                session, pid, (err or "")[:500], deactivate=deactivate
+            )
+        except Exception:
+            pass
+        continue
+
+    if last_err:
+        return False, last_err
+    return False, NO_ACTIVE_PROXY
 
 
 async def send_batch_via_account_with_proxy(

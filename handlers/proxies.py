@@ -379,11 +379,16 @@ def parse_proxy_block(text: str) -> Optional[dict]:
 #  Меню
 # ======================
 
+def _proxy_is_active(p: Proxy) -> bool:
+    """Как в choose_proxy_for_user: NULL = активен (legacy)."""
+    return p.is_active is True or p.is_active is None
+
+
 def proxies_menu(proxies: List[Proxy]) -> InlineKeyboardMarkup:
     rows = []
 
     for p in proxies:
-        status = "🟢" if p.is_active else "🔴"
+        status = "🟢" if _proxy_is_active(p) else "🔴"
         ptype = (p.type or "socks5").lower()
         text = f"{status} {ptype} {p.host}:{p.port}"
 
@@ -423,8 +428,8 @@ async def render_proxy_menu(message_or_cb, telegram_id: int):
     text = (
         "🧩 <b>Твои прокси</b>\n\n"
         f"Всего: {len(proxies)}\n"
-        f"Рабочих (SOCKS5+SMTP): {sum(1 for p in proxies if p.is_active)}\n"
-        f"Плохих: {sum(1 for p in proxies if not p.is_active)}\n"
+        f"Рабочих (SOCKS5+SMTP): {sum(1 for p in proxies if _proxy_is_active(p))}\n"
+        f"Плохих: {sum(1 for p in proxies if not _proxy_is_active(p))}\n"
         f"<i>Только SOCKS5 · проверка: туннель + smtp.gmail.com:587</i>"
     )
 

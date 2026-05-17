@@ -185,6 +185,18 @@ _SMTP_TIMEOUT_PATTERNS = [
     r"temporarily unavailable",
 ]
 
+_TRANSIENT_CONNECTION_PATTERNS = [
+    r"ssleoferror",
+    r"unexpected_eof_while_reading",
+    r"eof occurred in violation of protocol",
+    r"connection reset",
+    r"broken pipe",
+    r"connection unexpectedly closed",
+    r"connection aborted",
+    r"errno 104",
+    r"errno 54",
+]
+
 _INVALID_CRED_PATTERNS = [
     r"authentication failed",
     r"invalid login",
@@ -261,6 +273,19 @@ def _is_smtp_timeout_text(text: str) -> bool:
     return False
 
 
+def is_transient_connection_error(err: str | None) -> bool:
+    """Обрыв TLS/сокета — часто другой прокси помогает; это не «прокси мёртв»."""
+    s = (err or "").strip()
+    if not s:
+        return False
+    t = s.lower()
+    if any(re.search(p, t) for p in _TRANSIENT_CONNECTION_PATTERNS):
+        return True
+    if "ssl" in t and ("eof" in t or "unexpected" in t):
+        return True
+    return False
+
+
 def is_smtp_timeout_error(err: str | None) -> bool:
     s = normalize_send_error(err)
     kind = s.split("|", 1)[0].split(":", 1)[0].strip().upper()
@@ -333,6 +358,28 @@ def normalize_send_error(err: str | None) -> str:
 def is_proxy_error_marker(err: str | None) -> bool:
     s = normalize_send_error(err)
     return s.split("|", 1)[0].split(":", 1)[0].strip().upper() == "PROXY_ERROR"
+
+
+def should_retry_send_with_other_proxy(err: str | None) -> bool:
+    """Нужен другой SOCKS5 (не смена пароля почты и не hard bounce)."""
+    s = normalize_send_error(err or "")
+    kind = s.split("|", 1)[0].split(":", 1)[0].strip().upper()
+    if kind in {
+        "ACCOUNT_INVALID_CREDENTIALS",
+        "ACCOUNT_WEB_LOGIN_REQUIRED",
+        "ACCOUNT_RATE_LIMIT",
+        "ACCOUNT_BLOCKED",
+        "RECIPIENT_DEAD",
+        "RECIPIENT_REFUSED",
+    }:
+        return False
+    if "no_active_proxy" in s.lower() or "no_proxy_context" in s.lower():
+        return False
+    if is_smtp_timeout_error(err) or is_transient_connection_error(err):
+        return True
+    if is_definite_proxy_failure(err) or is_proxy_error_marker(err):
+        return True
+    return False
 
 
 def _is_invalid_creds(code: Optional[str], text: str) -> bool:
