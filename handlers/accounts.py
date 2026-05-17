@@ -20,7 +20,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import select
 
-from database import Session
+from database import Session, db_session
 from models import User, EmailAccount
 from keyboards.main_menu import main_menu_kb
 from keyboards.settings_menu import settings_menu
@@ -327,7 +327,7 @@ def accounts_menu_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def render_accounts_menu(message_or_cb, telegram_id: int, page: int = 1, status_filter: str = "all") -> None:
-    async with Session() as session:
+    async with db_session() as session:
         user = await get_user(session, telegram_id)
         if not user:
             user = User(telegram_id=telegram_id)
@@ -383,7 +383,6 @@ async def render_accounts_menu(message_or_cb, telegram_id: int, page: int = 1, s
 @router.callback_query(F.data == "settings_accounts")
 async def open_accounts_from_settings(callback: CallbackQuery) -> None:
     await render_accounts_menu(callback, callback.from_user.id, page=1, status_filter="all")
-    await callback.answer()
 
 @router.callback_query(F.data.startswith("acc_page:"))
 async def acc_page(callback: CallbackQuery) -> None:

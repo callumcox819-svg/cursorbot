@@ -8,7 +8,7 @@ from aiogram.types import Message, CallbackQuery
 
 from sqlalchemy import select, func
 
-from database import async_session
+from database import db_session
 from models import OfferEmail, Offer, EmailAccount, IncomingMail
 from services.users import get_or_create_user
 from services.sending_state import get_sending_state, SendingState
@@ -148,7 +148,7 @@ def render_status_text(
 
 async def _collect_db_stats(tg_user_id: int) -> tuple[int, int, int, int]:
     """(offers_total, pending_emails, accounts_total, accounts_active)"""
-    async with async_session() as session:
+    async with db_session() as session:
         db_user = await get_or_create_user(session, tg_user_id)
         db_user_id = db_user.id
 

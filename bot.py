@@ -81,17 +81,18 @@ def _sort_routers(routers: List[Tuple[str, Router]]) -> List[Tuple[str, Router]]
     return sorted(routers, key=key)
 
 
-def _bind_settings_dispatcher_handlers(dp: Dispatcher) -> None:
+def _bind_priority_dispatcher_handlers(dp: Dispatcher) -> None:
     """
-    Главное меню и inline «Настройки» на корне Dispatcher — первыми в очереди,
-    без зависимости от порядка include_router (обход «/start есть — кнопки мёртвые»).
+    Главное reply-меню и inline «Настройки» на корне Dispatcher — первыми в очереди.
     """
+    from aiogram.filters import Command
     from aiogram.types import Message
 
-    from handlers.accounts import open_accounts_from_settings
+    from handlers.accounts import open_accounts_from_settings, quick_gmail_from_main_menu
     from handlers.api_keys import goo_show_key, goo_show_profile
     from handlers.first_sms import firstsms_open
     from handlers.proxies import open_proxies
+    from handlers.send import send_cmd
     from handlers.settings import (
         _force_settings_menu,
         match_settings_menu_text,
@@ -103,6 +104,8 @@ def _bind_settings_dispatcher_handlers(dp: Dispatcher) -> None:
         settings_timings,
         spoof_name_menu,
     )
+    from handlers.stopsend import cmd_stopsend
+    from handlers.status import cmd_statussend
     from handlers.templates import presets_menu
 
     async def _dp_settings_message(message: Message, state: FSMContext) -> None:
@@ -112,6 +115,20 @@ def _bind_settings_dispatcher_handlers(dp: Dispatcher) -> None:
     dp.message.register(
         _dp_settings_message,
         F.func(lambda m: match_settings_menu_text(getattr(m, "text", None))),
+    )
+
+    dp.message.register(send_cmd, Command("send"))
+    dp.message.register(send_cmd, F.text == "▶️ Запустить рассылку")
+    dp.message.register(cmd_stopsend, Command("stop", "stopsend"))
+    dp.message.register(
+        cmd_stopsend,
+        F.text.in_({"⏹ Остановить рассылку", "/stop", "/stopsend"}),
+    )
+    dp.message.register(cmd_statussend, Command("stat", "status", "statussend"))
+    dp.message.register(cmd_statussend, F.text == "📊 Статус рассылки")
+    dp.message.register(
+        quick_gmail_from_main_menu,
+        F.text.in_({"⚡ Быстрое добавление", "⚡ Быстрое добавление (Gmail)"}),
     )
 
     _deprecated = frozenset({"settings_menu", "goo:settings", "goo_settings", "settings_main"})
@@ -134,7 +151,7 @@ def _bind_settings_dispatcher_handlers(dp: Dispatcher) -> None:
         dp.callback_query.register(cb, flt)
 
     logger.info(
-        "Привязано к Dispatcher: 1 message (⚙️ Настройки) + %d callback настроек",
+        "Привязано к Dispatcher: reply-меню (send/stop/stat/настройки/быстрое) + %d callback настроек",
         len(bindings),
     )
 
@@ -243,11 +260,15 @@ async def main() -> None:
     dp.errors.register(_on_error)
 
     from middlewares.bot_access import BotAccessMiddleware
+    from middlewares.callback_ack import CallbackAckMiddleware
+    from middlewares.update_log import UpdateLogMiddleware
 
+    dp.update.outer_middleware(UpdateLogMiddleware())
     dp.message.middleware(BotAccessMiddleware())
     dp.callback_query.middleware(BotAccessMiddleware())
+    dp.callback_query.middleware(CallbackAckMiddleware())
 
-    _bind_settings_dispatcher_handlers(dp)
+    _bind_priority_dispatcher_handlers(dp)
 
     for mod_name, r in _load_all_routers("handlers"):
         dp.include_router(r)

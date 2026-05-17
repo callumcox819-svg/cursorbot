@@ -16,7 +16,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 from sqlalchemy import select
 
-from database import Session
+from database import Session, db_session
 from models import EmailAccount
 from services.users import get_or_create_user
 from services.sender import send_email_via_account
@@ -494,7 +494,7 @@ async def presets_menu(call: CallbackQuery, state: FSMContext) -> None:
         _menu_chat_id=call.message.chat.id,
         _menu_msg_id=call.message.message_id,
     )
-    async with Session() as session:
+    async with db_session() as session:
         tg_id = await _user_tg_id(session, call.from_user.id)
     items = await load_templates(tg_id)
     pairs = _template_named_pairs(items)
@@ -509,7 +509,6 @@ async def presets_menu(call: CallbackQuery, state: FSMContext) -> None:
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
-    await call.answer()
 
 
 @router.callback_query(F.data == "tmpl_delall")

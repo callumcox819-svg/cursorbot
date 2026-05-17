@@ -221,7 +221,7 @@ async def settings_open(message: Message, state: FSMContext) -> None:
 async def spoof_name_menu(callback: CallbackQuery, state: FSMContext) -> None:
     """Меню установки имени (смены ника) для HTML, привязанное к выбранному сервису профиля."""
     await state.clear()
-    async with Session() as session:
+    async with db_session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
         service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
         if not service:
@@ -418,10 +418,10 @@ async def settings_timings(callback: CallbackQuery, state: FSMContext) -> None:
     """Show timings menu (no immediate input)."""
     from services.settings import load_timing
 
-    async with Session() as session:
-        timing = await load_timing(session, callback.from_user.id)
-
     await state.clear()
+
+    async with db_session() as session:
+        timing = await load_timing(session, callback.from_user.id)
 
     await callback.message.edit_text(
         "⏱ <b>Тайминги рассылки</b>\n\n"
@@ -437,7 +437,6 @@ async def settings_timings(callback: CallbackQuery, state: FSMContext) -> None:
         ),
         parse_mode="HTML",
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data == "timings_edit")
@@ -755,7 +754,7 @@ async def ref_toggle(callback: CallbackQuery):
     if not db_key:
         return await callback.answer()
 
-    async with Session() as session:
+    async with db_session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
         cur = await get_user_setting(session, user, db_key)
         cur_s = str(cur or "").strip().lower()
@@ -763,7 +762,6 @@ async def ref_toggle(callback: CallbackQuery):
         new_b = not cur_b
         await set_user_setting(session, user, db_key, "1" if new_b else "0")
 
-    await callback_answer_safe(callback, "Готово ✅")
     kb = await _settings_menu_kb_for_user(callback.from_user.id)
     await _cq_edit_text(callback, "Настройки", reply_markup=kb)
 
@@ -1030,7 +1028,7 @@ DOMAIN_PRIORITY_KEY = "domain_priority"
 @router.callback_query(F.data == "priority_menu")
 async def priority_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    async with Session() as session:
+    async with db_session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
         raw = await get_user_setting(session, user, DOMAIN_PRIORITY_KEY)
         try:
@@ -1057,7 +1055,6 @@ async def priority_menu(callback: CallbackQuery, state: FSMContext):
         reply_markup=kb,
         parse_mode="HTML",
     ))
-    await callback.answer()
 
 @router.callback_query(F.data == "priority_edit")
 async def priority_edit(callback: CallbackQuery, state: FSMContext):
