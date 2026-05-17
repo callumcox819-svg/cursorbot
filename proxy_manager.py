@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import random
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from sqlalchemy import select, or_
@@ -12,7 +13,41 @@ from models import Proxy, UserSetting
 
 logger = logging.getLogger(__name__)
 
-_PROXY_LOCK = asyncio.Lock()
+
+class _ReentrantAsyncLock:
+    """Один event loop: рассылка держит lock в Session и снова в ProxySMTPContext."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task | None = None
+        self._depth = 0
+
+    async def acquire(self) -> None:
+        task = asyncio.current_task()
+        if task is not None and self._owner is task:
+            self._depth += 1
+            return
+        await self._lock.acquire()
+        self._owner = task
+        self._depth = 1
+
+    def release(self) -> None:
+        if self._depth > 1:
+            self._depth -= 1
+            return
+        self._owner = None
+        self._depth = 0
+        self._lock.release()
+
+    async def __aenter__(self) -> "_ReentrantAsyncLock":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+
+_PROXY_LOCK = _ReentrantAsyncLock()
 # round-robin по активным прокси (на user_id из БД)
 _RR_INDEX: dict[int, int] = {}
 
@@ -193,6 +228,21 @@ def test_smtp_tunnel_sync(proxy: Proxy, *, timeout: int = 20) -> tuple[bool, str
         return False, f"{type(e).__name__}: {e}"
     finally:
         reset_smtplib_proxy()
+
+
+@asynccontextmanager
+async def database_socket_guard():
+    """
+    Перед PostgreSQL/asyncpg: сбросить глобальный PySocks-патч.
+    Иначе ConnectionError: unexpected connection_lost() при рассылке.
+    """
+    await _PROXY_LOCK.acquire()
+    reset_smtplib_proxy()
+    try:
+        yield
+    finally:
+        reset_smtplib_proxy()
+        _PROXY_LOCK.release()
 
 
 def reset_smtplib_proxy() -> None:

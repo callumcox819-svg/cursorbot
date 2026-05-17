@@ -416,7 +416,7 @@ def _imap_fetch_new_sync_raw(
     """Fetch new mails from INBOX and (for GMX only) from Spam/Junk.
 
     - INBOX: uses UID > last_uid (first run returns empty and sets last_uid=max_uid).
-    - GMX Spam/Junk: fetches UNSEEN only, marks them as \Seen to avoid repeats,
+    - GMX Spam/Junk: fetches UNSEEN only, marks them as \\Seen to avoid repeats,
       and prefixes uid as 'S:<uid>' so the async layer can filter/handle separately.
     """
     M = None
@@ -903,6 +903,32 @@ async def _process_mails_for_account(
     max_per_account: int,
     last_uid: Optional[int],
 ) -> int:
+    from proxy_manager import database_socket_guard
+
+    async with database_socket_guard():
+        return await _process_mails_for_account_impl(
+            bot,
+            acc_id=acc_id,
+            tg_id=tg_id,
+            user_id=user_id,
+            account_email=account_email,
+            mails=mails,
+            max_per_account=max_per_account,
+            last_uid=last_uid,
+        )
+
+
+async def _process_mails_for_account_impl(
+    bot: Bot,
+    *,
+    acc_id: int,
+    tg_id: int,
+    user_id: int,
+    account_email: str,
+    mails: List[Tuple[str, str, str, str, str, str]],
+    max_per_account: int,
+    last_uid: Optional[int],
+) -> int:
     forwarded = 0
 
     inbox_label: str | None = None
@@ -1256,18 +1282,21 @@ _EVENT_QUEUES: Dict[int, asyncio.Queue] = {}
 
 
 async def _refresh_accounts_map() -> list[tuple[EmailAccount, int]]:
-    async with Session() as session:
-        accounts = (await session.execute(
-            sa_select(EmailAccount).where(
-                sa_or(
-                    EmailAccount.status.is_(None),
-                    EmailAccount.status.in_(["active", "enabled", "proxy_error", "smtp_blocked"]),
-                )
-            )
-        )).scalars().all()
+    from proxy_manager import database_socket_guard
 
-        users = (await session.execute(sa_select(User))).scalars().all()
-        users_by_id = {u.id: u.telegram_id for u in users}
+    async with database_socket_guard():
+        async with Session() as session:
+            accounts = (await session.execute(
+                sa_select(EmailAccount).where(
+                    sa_or(
+                        EmailAccount.status.is_(None),
+                        EmailAccount.status.in_(["active", "enabled", "proxy_error", "smtp_blocked"]),
+                    )
+                )
+            )).scalars().all()
+
+            users = (await session.execute(sa_select(User))).scalars().all()
+            users_by_id = {u.id: u.telegram_id for u in users}
 
     out: list[tuple[EmailAccount, int]] = []
     for a in accounts:
