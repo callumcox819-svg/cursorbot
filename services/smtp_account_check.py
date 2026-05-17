@@ -23,6 +23,39 @@ from services.smtp_block_control import is_smtp_account_block_error
 
 logger = logging.getLogger(__name__)
 
+_NO_ACCESS_KINDS = frozenset(
+    {"ACCOUNT_INVALID_CREDENTIALS", "ACCOUNT_WEB_LOGIN_REQUIRED"}
+)
+_NO_ACCESS_PHRASES = (
+    "username and password not accepted",
+    "invalid credentials",
+    "authentication unsuccessful",
+    "web login required",
+    "please log in via your web browser",
+    "application-specific password required",
+    "less secure app",
+)
+
+
+def is_account_no_access_error(err: str | None) -> bool:
+    """Нет доступа к ящику (неверный пароль, web login и т.п.) — не путать с прокси."""
+    norm = normalize_send_error(err or "")
+    kind = norm.split("|", 1)[0].split(":", 1)[0].strip().upper()
+    if kind in _NO_ACCESS_KINDS:
+        return True
+    t = norm.lower()
+    if "proxy" in t or "socks" in t or kind == "PROXY_ERROR":
+        return False
+    if any(p in t for p in _NO_ACCESS_PHRASES):
+        return True
+    if kind.startswith("ACCOUNT_INVALID") or kind.startswith("ACCOUNT_WEB"):
+        return True
+    return False
+
+
+def is_account_no_access_status(st: str | None) -> bool:
+    return (st or "").strip().lower() == "bad"
+
 
 def _err_from_docmd(code: int, resp: bytes | str) -> str:
     if isinstance(resp, bytes):

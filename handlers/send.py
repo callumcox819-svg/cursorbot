@@ -35,6 +35,7 @@ from services.sender import (
     is_smtp_timeout_error,
 )
 from services.smtp_block_control import mark_account_smtp_blocked
+from services.smtp_account_check import is_account_no_access_error
 from keyboards.main_menu import main_menu_kb
 
 from services.sending_state import SendingState
@@ -372,6 +373,15 @@ async def _handle_send_failure(
         bot=bot,
         chat_id=chat_id,
     ):
+        return True
+
+    if is_account_no_access_error(err):
+        try:
+            await session.delete(acc)
+            await session.commit()
+            logger.warning("Deleted account (no access): %s", acc.email)
+        except Exception:
+            await session.rollback()
         return True
 
     purge = False

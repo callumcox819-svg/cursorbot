@@ -507,12 +507,15 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
     )
 
     async def _job() -> None:
-        from services.smtp_account_check import check_smtp_account_with_proxy
+        from services.smtp_account_check import (
+            check_smtp_account_with_proxy,
+            is_account_no_access_status,
+        )
         from services.smtp_block_control import short_block_reason
 
         ok_n = 0
         blocked_n = 0
-        bad_n = 0
+        deleted_n = 0
         skip_n = 0
         lines: List[str] = []
         total = len(accounts)
@@ -544,6 +547,18 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
                     lines.append(f"⏭ <code>{_e(acc.email)}</code> — прокси/таймаут")
                     continue
 
+                if is_account_no_access_status(st):
+                    deleted_n += 1
+                    em = row.email or ""
+                    reason = short_block_reason(err)
+                    await session.delete(row)
+                    await session.commit()
+                    lines.append(
+                        f"🗑 <code>{_e(em)}</code> — удалён (нет доступа)\n"
+                        f"   <i>{_e(reason)}</i>"
+                    )
+                    continue
+
                 prev = (row.status or "").strip().lower()
                 row.status = st
                 row.last_error = (err or "")[:1000] if err else None
@@ -563,7 +578,6 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
                         f"   <i>{_e(reason)}</i>"
                     )
                 else:
-                    bad_n += 1
                     lines.append(
                         f"🔴 <code>{_e(acc.email)}</code> — {_e(short_block_reason(err))}"
                     )
@@ -572,7 +586,7 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
             "✅ <b>Проверка SMTP завершена</b>\n\n"
             f"🟢 активны: <b>{ok_n}</b>\n"
             f"🟡 лимит/блок (smtp_blocked): <b>{blocked_n}</b>\n"
-            f"🔴 ошибка/пароль: <b>{bad_n}</b>\n"
+            f"🗑 удалено (нет доступа): <b>{deleted_n}</b>\n"
             f"⏭ без смены статуса (прокси): <b>{skip_n}</b>\n\n"
             + _trim_details(lines, limit=25)
         )
