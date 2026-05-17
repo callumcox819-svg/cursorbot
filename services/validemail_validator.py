@@ -151,6 +151,38 @@ def _len_for_limits(local_part: str) -> int:
     return len((local_part or "").replace(".", ""))
 
 
+def _is_api_failure(_ok: bool, raw: object) -> bool:
+    """Сбой API/сети. Ответ «email не существует» — не ошибка."""
+    if not isinstance(raw, dict):
+        return True
+    if raw.get("error") is not None:
+        es = str(raw.get("error") or "").strip().lower()
+        if es in ("", "empty", "no api key"):
+            return False
+        return True
+    for key in (
+        "IsValid",
+        "isValid",
+        "State",
+        "state",
+        "Score",
+        "score",
+        "Reason",
+        "reason",
+        "is_valid",
+        "valid",
+        "status",
+        "result",
+        "isDeliverable",
+        "is_deliverable",
+        "deliverable",
+        "smtp_check",
+    ):
+        if key in raw:
+            return False
+    return False
+
+
 # -------------------------
 # NEW API helpers (/validate)
 # -------------------------
@@ -407,9 +439,9 @@ async def _validate_offers_old(
             overall_done += len(batch_emails)
 
             combos_valid = 0
-            for e, ok, _raw in results:
+            for e, ok, raw in results:
                 if not ok:
-                    if stats is not None:
+                    if stats is not None and _is_api_failure(ok, raw):
                         stats["api_errors"] = int(stats.get("api_errors") or 0) + 1
                     continue
                 combos_valid += 1
