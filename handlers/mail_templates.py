@@ -16,7 +16,8 @@ from models import EmailAccount, User
 from services.incoming_mail_worker import FULL_META
 from services.smtp_proxy_send import send_email_via_account_with_proxy
 from handlers.templates import load_templates, TemplateItem
-from handlers.incoming_mail import _bg_incoming_smtp, _reply_notify_from_state
+from handlers.incoming_mail import _bg_incoming_smtp, _reply_notify_build_async
+from services.users import get_or_create_user
 from models import IncomingMail
 
 router = Router()
@@ -220,11 +221,22 @@ async def mail_tmpl_send(callback: CallbackQuery, state: FSMContext):
             )
 
     data = await state.get_data()
-    notify = _reply_notify_from_state(
-        data,
+    db_user_id: int | None = None
+    try:
+        async with Session() as session:
+            u = await get_or_create_user(session, int(tg_id))
+            db_user_id = int(u.id)
+    except Exception:
+        pass
+    notify = await _reply_notify_build_async(
+        acc_id=acc_id,
+        uid=str(uid),
+        meta=meta or {},
+        state_data=data,
         body_text=body,
         is_preset=True,
         extra_cleanup=[callback.message.message_id],
+        user_id=db_user_id,
     )
     await state.clear()
     if not await _bg_incoming_smtp(callback, tg_id, _send, notify=notify):

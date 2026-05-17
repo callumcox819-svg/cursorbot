@@ -134,28 +134,134 @@ def _reply_notify_from_state(
     is_preset: bool = False,
     is_html: bool = False,
     extra_cleanup: list[int] | None = None,
+    meta: dict | None = None,
+    acc_id: int | None = None,
+    uid: str | None = None,
 ) -> ReplyNotifyCtx | None:
-    anchor = data.get("anchor_message_id")
+    return _reply_notify_build(
+        acc_id=int(acc_id or data.get("acc_id") or 0),
+        uid=str(uid or data.get("uid") or ""),
+        meta=meta or {},
+        state_data=data,
+        body_text=body_text,
+        is_preset=is_preset,
+        is_html=is_html,
+        extra_cleanup=extra_cleanup,
+    )
+
+
+def _reply_notify_build(
+    *,
+    acc_id: int,
+    uid: str,
+    meta: dict,
+    state_data: dict,
+    body_text: str,
+    is_preset: bool = False,
+    is_html: bool = False,
+    extra_cleanup: list[int] | None = None,
+) -> ReplyNotifyCtx | None:
+    """Собрать уведомление об ответе: FSM + FULL_META (переживает рестарт/деплой)."""
+    anchor = state_data.get("anchor_message_id") or meta.get("tg_card_message_id")
+    if not anchor and acc_id and uid:
+        anchor = (FULL_META.get((int(acc_id), str(uid))) or {}).get("tg_card_message_id")
     if not anchor:
         return None
+
+    to_email = (
+        state_data.get("to_email")
+        or meta.get("from_email")
+        or (FULL_META.get((int(acc_id), str(uid))) or {}).get("from_email")
+        or ""
+    )
+    account_email = (
+        state_data.get("account_email")
+        or meta.get("account_email")
+        or (FULL_META.get((int(acc_id), str(uid))) or {}).get("account_email")
+        or ""
+    )
+
     cleanup: list[int] = []
-    ui = data.get("ui_message_id")
+    ui = state_data.get("ui_message_id")
     if ui:
         cleanup.append(int(ui))
     if extra_cleanup:
         for mid in extra_cleanup:
             if mid and int(mid) not in cleanup:
                 cleanup.append(int(mid))
+
     return ReplyNotifyCtx(
         anchor_message_id=int(anchor),
-        to_email=str(data.get("to_email") or ""),
-        account_email=str(data.get("account_email") or ""),
-        incoming_from=str(data.get("to_email") or ""),
+        to_email=_canon_email(str(to_email)),
+        account_email=_canon_email(str(account_email)),
+        incoming_from=_canon_email(str(to_email)),
         body_text=body_text,
         is_preset=is_preset,
         is_html=is_html,
         cleanup_message_ids=cleanup,
     )
+
+
+async def _reply_notify_build_async(
+    *,
+    acc_id: int,
+    uid: str,
+    meta: dict,
+    state_data: dict,
+    body_text: str,
+    is_preset: bool = False,
+    is_html: bool = False,
+    extra_cleanup: list[int] | None = None,
+    user_id: int | None = None,
+) -> ReplyNotifyCtx | None:
+    """Как _reply_notify_build + fallback на ConversationLink.tg_message_id."""
+    ctx = _reply_notify_build(
+        acc_id=acc_id,
+        uid=uid,
+        meta=meta,
+        state_data=state_data,
+        body_text=body_text,
+        is_preset=is_preset,
+        is_html=is_html,
+        extra_cleanup=extra_cleanup,
+    )
+    if ctx:
+        return ctx
+
+    inbox = _canon_email(str(meta.get("account_email") or state_data.get("account_email") or ""))
+    contact = _canon_email(str(meta.get("from_email") or state_data.get("to_email") or ""))
+    if not user_id or not inbox or not contact:
+        return None
+
+    try:
+        async with Session() as session:
+            conv = await _load_convlink_for_reply(session, user_id=int(user_id), inbox_email=inbox, contact_email=contact)
+        if conv and getattr(conv, "tg_message_id", None):
+            return ReplyNotifyCtx(
+                anchor_message_id=int(conv.tg_message_id),
+                to_email=contact,
+                account_email=inbox,
+                incoming_from=contact,
+                body_text=body_text,
+                is_preset=is_preset,
+                is_html=is_html,
+                cleanup_message_ids=list(extra_cleanup or []),
+            )
+    except Exception:
+        pass
+    return None
+
+
+async def _load_convlink_for_reply(session, *, user_id: int, inbox_email: str, contact_email: str):
+    return (
+        await session.execute(
+            sa_select(ConversationLink)
+            .where(ConversationLink.user_id == int(user_id))
+            .where(func.lower(ConversationLink.account_email) == inbox_email.lower())
+            .where(func.lower(ConversationLink.from_email) == contact_email.lower())
+            .limit(1)
+        )
+    ).scalars().first()
 
 
 async def _bg_incoming_smtp(
@@ -1446,6 +1552,17 @@ async def cb_mail_reply(callback: CallbackQuery, state: FSMContext):
     except Exception:
         pass
 
+    fm = dict(FULL_META.get((acc_id, uid)) or meta)
+    fm.update(
+        {
+            "from_email": to_email,
+            "subject": subject,
+            "account_email": account_email,
+            "tg_card_message_id": int(callback.message.message_id),
+        }
+    )
+    FULL_META[(acc_id, uid)] = fm
+
     await state.set_state(_MailReplyState.waiting_choice)
     ui = await callback.message.answer(
         REPLY_CHOICE_TEXT,
@@ -1549,7 +1666,7 @@ async def cb_mail_reply_mode(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("mail_reply_preset:"))
 async def cb_mail_reply_preset_send(callback: CallbackQuery, state: FSMContext):
     try:
-        _, acc_id, uid, tid = (callback.data or "").split(":", 3)
+        _, acc_id, mail_uid, tid = (callback.data or "").split(":", 3)
         acc_id = int(acc_id)
         tid = int(tid)
     except Exception:
@@ -1561,11 +1678,13 @@ async def cb_mail_reply_preset_send(callback: CallbackQuery, state: FSMContext):
     if not to_email:
         return await callback.answer("Не вижу email отправителя", show_alert=True)
 
-    uid = int(callback.from_user.id)
+    tg_id = int(callback.from_user.id)
     preset_body = ""
 
+    db_user_id: int | None = None
     async with Session() as session:
-        user = await get_or_create_user(session, uid)
+        user = await get_or_create_user(session, tg_id)
+        db_user_id = int(user.id)
         tmpl_pre = (
             await session.execute(
                 sa_select(QuickTemplate)
@@ -1578,7 +1697,7 @@ async def cb_mail_reply_preset_send(callback: CallbackQuery, state: FSMContext):
 
     async def _send() -> tuple[bool, str | None]:
         async with Session() as session:
-            user = await get_or_create_user(session, uid)
+            user = await get_or_create_user(session, tg_id)
             tmpl = (
                 await session.execute(
                     sa_select(QuickTemplate)
@@ -1603,14 +1722,19 @@ async def cb_mail_reply_preset_send(callback: CallbackQuery, state: FSMContext):
                 tmpl.body or "",
             )
 
-    notify = _reply_notify_from_state(
-        data,
+    meta_fm = FULL_META.get((acc_id, mail_uid)) or {}
+    notify = await _reply_notify_build_async(
+        acc_id=acc_id,
+        uid=str(mail_uid),
+        meta=meta_fm,
+        state_data=data,
         body_text=preset_body,
         is_preset=True,
         extra_cleanup=[callback.message.message_id],
+        user_id=db_user_id,
     )
     await state.clear()
-    if not await _bg_incoming_smtp(callback, uid, _send, notify=notify):
+    if not await _bg_incoming_smtp(callback, tg_id, _send, notify=notify):
         return
 
 
@@ -1799,11 +1923,23 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
                 sender_name=sender_name,
             )
 
-    notify = _reply_notify_from_state(
-        data,
+    meta_fm = FULL_META.get((acc_id, uid)) or {}
+    db_user_id: int | None = None
+    try:
+        async with Session() as session:
+            u = await get_or_create_user(session, tg_id)
+            db_user_id = int(u.id)
+    except Exception:
+        pass
+    notify = await _reply_notify_build_async(
+        acc_id=acc_id,
+        uid=uid,
+        meta=meta_fm,
+        state_data=data,
         body_text=f"HTML ({html_kind_label})",
         is_html=True,
         extra_cleanup=[callback.message.message_id],
+        user_id=db_user_id,
     )
     await state.clear()
     if not await _bg_incoming_smtp(callback, tg_id, _send, notify=notify):
@@ -1848,7 +1984,19 @@ async def mail_reply_text(message: Message, state: FSMContext):
                 text,
             )
 
-    notify = _reply_notify_from_state(data, body_text=body_for_notify)
+    meta_fm = FULL_META.get((acc_id, uid)) or {}
+    db_user_id: int | None = None
+    async with Session() as session:
+        user = await get_or_create_user(session, tg_id)
+        db_user_id = int(user.id)
+    notify = await _reply_notify_build_async(
+        acc_id=acc_id,
+        uid=uid,
+        meta=meta_fm,
+        state_data=data,
+        body_text=body_for_notify,
+        user_id=db_user_id,
+    )
     await state.clear()
     if await _bg_message_smtp(message, tg_id, _send, notify=notify):
         try:
@@ -1952,7 +2100,20 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
                 sender_name=sender_name,
             )
 
-    notify = _reply_notify_from_state(data, body_text=body_for_notify, is_html=True)
+    meta_fm = FULL_META.get((acc_id, uid)) or {}
+    db_user_id: int | None = None
+    async with Session() as session:
+        user = await get_or_create_user(session, tg_id)
+        db_user_id = int(user.id)
+    notify = await _reply_notify_build_async(
+        acc_id=acc_id,
+        uid=uid,
+        meta=meta_fm,
+        state_data=data,
+        body_text=body_for_notify,
+        is_html=True,
+        user_id=db_user_id,
+    )
     await state.clear()
     await _bg_message_smtp(message, tg_id, _send, notify=notify)
 

@@ -1179,6 +1179,12 @@ async def _process_mails_for_account(
                     reply_to_message_id=reply_to_id,
                 )
 
+            # Карточка письма в TG — anchor для ответов «Написать ещё» (не только FSM).
+            try:
+                FULL_META[(acc_id, uid_key)]["tg_card_message_id"] = int(m.message_id)
+            except Exception:
+                pass
+
             # Если это первое сообщение в диалоге — пинуем и сохраняем anchor message_id.
             try:
                 if reply_to_id is None:
