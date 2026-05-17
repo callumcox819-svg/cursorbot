@@ -221,16 +221,13 @@ async def settings_open(message: Message, state: FSMContext) -> None:
     await open_settings_menu(message, state)
 
 
-@router.callback_query(F.data == "spoof_name_menu")
-async def spoof_name_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    """Меню установки имени (смены ника) для HTML, привязанное к выбранному сервису профиля."""
-    await state.clear()
+async def _spoof_name_menu_payload(tg_user_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    """Текст и клавиатура меню HTML-имени. None — сервис не выбран."""
     async with db_session() as session:
-        user = await get_or_create_user(session, callback.from_user.id)
+        user = await get_or_create_user(session, tg_user_id)
         service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
         if not service:
-            return await callback.answer("Сначала выберите сервис в профиле", show_alert=True)
-
+            return None
         key = _html_nick_key_for_service(service)
         cur = (await get_user_setting(session, user, key) or "").strip()
         html_subj = (await get_user_setting(session, user, HTML_THEME_KEY) or "").strip() or "— не задано —"
@@ -242,9 +239,9 @@ async def spoof_name_menu(callback: CallbackQuery, state: FSMContext) -> None:
         f"Сервис: <b>{label}</b>\n"
         f"Имя отправителя (при 🟢 Спуфинг): <b>{cur_line}</b>\n\n"
         f"Используется только при отправке <b>HTML</b>.\n"
-        f"Рассылка — отдельно: имя из «📧 E-mail», тема <code>OFFER</code>."
+        f"Рассылка — отдельно: имя из «📧 E-mail», тема <code>OFFER</code>.\n\n"
+        f"📌 <b>Тема для HTML:</b> <code>{html_subj}</code>"
     )
-
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"✅ Установить имя ({label})", callback_data="spoof_name_set")],
@@ -252,8 +249,39 @@ async def spoof_name_menu(callback: CallbackQuery, state: FSMContext) -> None:
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open")],
         ]
     )
-    text += f"\n\n📌 <b>Тема для HTML:</b> <code>{html_subj}</code>"
-    await _safe_send(callback.message.edit_text, text, reply_markup=kb, parse_mode="HTML")
+    return text, kb
+
+
+async def _show_spoof_name_menu_message(message: Message, *, prompt_chat_id: int | None, prompt_msg_id: int | None) -> None:
+    payload = await _spoof_name_menu_payload(message.from_user.id)
+    if not payload:
+        await message.answer("Сначала выберите сервис в 👤 Профиль → 🧭 Выбор сервиса.")
+        return
+    text, kb = payload
+    if prompt_chat_id and prompt_msg_id:
+        try:
+            await message.bot.edit_message_text(
+                text,
+                chat_id=prompt_chat_id,
+                message_id=prompt_msg_id,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return
+        except TelegramBadRequest:
+            pass
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "spoof_name_menu")
+async def spoof_name_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    """Меню установки имени (смены ника) для HTML, привязанное к выбранному сервису профиля."""
+    await state.clear()
+    payload = await _spoof_name_menu_payload(callback.from_user.id)
+    if not payload:
+        return await callback.answer("Сначала выберите сервис в профиле", show_alert=True)
+    text, kb = payload
+    await _cq_edit_text(callback, text, reply_markup=kb)
     await callback.answer()
 
 
@@ -265,11 +293,17 @@ async def spoof_name_set(callback: CallbackQuery, state: FSMContext) -> None:
         if not service:
             return await callback.answer("Сначала выберите сервис в профиле", show_alert=True)
     await state.set_state(SpoofNameState.waiting_name)
-    await state.update_data(service=service)
-    await _safe_send(
-        callback.message.edit_text,
+    await state.update_data(
+        service=service,
+        spoof_prompt_chat_id=callback.message.chat.id if callback.message else None,
+        spoof_prompt_msg_id=callback.message.message_id if callback.message else None,
+    )
+    await _cq_edit_text(
+        callback,
         "Введите имя для спуфинга (смены ника) для HTML:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚫 Отмена", callback_data="spoof_name_menu")]]),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🚫 Отмена", callback_data="spoof_name_menu")]]
+        ),
     )
     await callback.answer()
 
@@ -281,14 +315,21 @@ async def spoof_name_save(message: Message, state: FSMContext) -> None:
     name = (message.text or "").strip()
     if not name:
         return await message.answer("Введите имя текстом.")
-    async with Session() as session:
+    async with db_session() as session:
         user = await get_or_create_user(session, message.from_user.id)
         key = _html_nick_key_for_service(service)
         await set_user_setting(session, user, key, name)
+
+    prompt_chat_id = data.get("spoof_prompt_chat_id")
+    prompt_msg_id = data.get("spoof_prompt_msg_id")
     await state.clear()
-    # Переоткрываем меню, чтобы сразу было видно текущее значение
-    fake_cb = type("obj", (), {"from_user": message.from_user, "message": message, "answer": (lambda *a, **k: None)})()
-    await spoof_name_menu(fake_cb, state)
+
+    await message.answer("✅ Имя добавлено")
+    await _show_spoof_name_menu_message(
+        message,
+        prompt_chat_id=int(prompt_chat_id) if prompt_chat_id else None,
+        prompt_msg_id=int(prompt_msg_id) if prompt_msg_id else None,
+    )
 
 
 @router.callback_query(F.data == "settings_open")
