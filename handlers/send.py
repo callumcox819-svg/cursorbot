@@ -5,7 +5,7 @@ import logging
 import random
 from typing import List, Optional, Tuple
 
-from aiogram import Router, F
+from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.exceptions import TelegramNetworkError
@@ -34,8 +34,6 @@ from services.sending_state import get_state as _get_sending_state
 from services.sending_state import set_state as _set_sending_state
 from services.settings import load_timing
 from services.proxy_manager import choose_proxy_for_user
-from services.proxy_verify import refresh_proxies_status
-
 router = Router(name="send")
 logger = logging.getLogger(__name__)
 
@@ -214,20 +212,22 @@ async def send_cmd(message: Message):
 
 async def start_sending(message: Message, fast: bool = False):
     tg_user_id = message.from_user.id
-    await tg_answer_safe(message, "🚀 Запускаю рассылку…")
+    chat_id = message.chat.id
+    bot = message.bot
 
     async with async_session() as session:
         db_user = await get_or_create_user(session, tg_user_id)
         timing = await load_timing(session, tg_user_id)
 
-        # ✅ Fast режим должен реально включаться от кнопки "Fast режим" в настройках.
-        # В меню это user_setting "fast_send", а send.py исторически читает timings_json.fast_mode.
-        fast_send_toggle = str(await get_user_setting(session, db_user, "fast_send") or "").strip().lower() in {"1", "true", "yes", "on"}
+        fast_send_toggle = str(await get_user_setting(session, db_user, "fast_send") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         mode_fast = bool(timing.get("fast_mode", False)) or fast_send_toggle or fast
 
         db_user_id = db_user.id
-        sender_name = getattr(db_user, "sender_name", None)
-
         accounts = await _get_active_accounts(session, db_user_id)
 
         accounts_total_db = (
@@ -239,7 +239,7 @@ async def start_sending(message: Message, fast: bool = False):
         if not accounts:
             await tg_answer_safe(
                 message,
-                "❌ Валидных почт для рассылки нет.\nДобавьте и активируйте хотя бы один аккаунт в «Настройки → Аккаунты».",
+                "❌ Нет активных аккаунтов.\nДобавьте почту в «Настройки → Аккаунты».",
                 reply_markup=main_menu_kb(tg_user_id),
             )
             return
@@ -247,7 +247,7 @@ async def start_sending(message: Message, fast: bool = False):
         if total_targets <= 0:
             await tg_answer_safe(
                 message,
-                "❌ Email для рассылки не найдены (очередь пуста).",
+                "❌ Очередь пуста — нет email в БД после валидации.",
                 reply_markup=main_menu_kb(tg_user_id),
             )
             return
@@ -268,38 +268,10 @@ async def start_sending(message: Message, fast: bool = False):
         if proxies_total <= 0:
             await tg_answer_safe(
                 message,
-                "❌ Нужен хотя бы один рабочий <b>SOCKS5</b> прокси.\n"
-                "HTTP не поддерживается. Добавьте socks5://… в «Прокси».",
+                "❌ Нет SOCKS5 прокси. Добавьте socks5://… в «Прокси».",
                 reply_markup=main_menu_kb(tg_user_id),
             )
             return
-
-        # Авто-проверка перед стартом: обновляем is_active, прокси не удаляем.
-        try:
-            ok_n, fail_n, _total = await refresh_proxies_status(
-                session, db_user_id, concurrency=10, timeout=12
-            )
-            if fail_n and ok_n:
-                await tg_answer_safe(
-                    message,
-                    f"⚠️ Проверка прокси: рабочих {ok_n}, неактивных {fail_n}.",
-                )
-            elif ok_n and not fail_n:
-                await tg_answer_safe(message, "✅ Все прокси прошли проверку.")
-        except Exception:
-            logger.exception("proxy pre-check before send failed")
-
-        proxy_in_use = await choose_proxy_for_user(session, db_user_id)
-        if not proxy_in_use:
-            await tg_answer_safe(
-                message,
-                "❌ Нет рабочих SOCKS5 после проверки (SOCKS5 + SMTP).\n"
-                "Зайдите в «Прокси» → «Проверить прокси» или добавьте socks5://…",
-                reply_markup=main_menu_kb(tg_user_id),
-            )
-            return
-
-        smtp_sem = asyncio.Semaphore(SMTP_CONCURRENCY_WITH_PROXY)
 
         state = SendingState(
             user_id=tg_user_id,
@@ -317,178 +289,180 @@ async def start_sending(message: Message, fast: bool = False):
 
     await tg_answer_safe(
         message,
-        f"✅ Рассылка запущена ({'FAST' if mode_fast else 'NORMAL'}).",
+        f"✅ Рассылка запущена ({'FAST' if mode_fast else 'NORMAL'}).\n"
+        f"В очереди: <b>{total_targets}</b> email",
         reply_markup=main_menu_kb(tg_user_id),
+        parse_mode="HTML",
     )
 
-    async def _sending_loop():
-        nonlocal state
+    asyncio.create_task(
+        _sending_loop(bot=bot, chat_id=chat_id, tg_user_id=tg_user_id, mode_fast=mode_fast)
+    )
 
-        async with async_session() as session:
-            user = await get_or_create_user(session, tg_user_id)
-            db_user_id = user.id
-            sender_name = getattr(user, "sender_name", None)
 
-            accounts = await _get_active_accounts(session, db_user_id)
-            if not accounts:
-                state.is_running = False
-                state.last_error = "NO_ACCOUNTS|no_accounts|No active accounts"
-                set_sending_state(tg_user_id, state=state)
-                return
+async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int, mode_fast: bool) -> None:
+    state = get_sending_state(tg_user_id) or SendingState(user_id=tg_user_id)
+    smtp_sem = asyncio.Semaphore(SMTP_CONCURRENCY_WITH_PROXY)
 
-            timing = await load_timing(session, tg_user_id)
-            min_delay = float(timing.get("min_delay", 1.5))
-            max_delay = float(timing.get("max_delay", 3.0))
-            batch_size = int(timing.get("batch_size", 1))
-            # ✅ Fast режим: поддерживаем и timings_json.fast_mode, и переключатель fast_send.
+    async with async_session() as session:
+        user = await get_or_create_user(session, tg_user_id)
+        db_user_id = user.id
+        sender_name = getattr(user, "sender_name", None)
+
+        accounts = await _get_active_accounts(session, db_user_id)
+        if not accounts:
+            state.is_running = False
+            state.last_error = "NO_ACCOUNTS|no_accounts|No active accounts"
+            set_sending_state(tg_user_id, state=state)
             try:
-                fast_send_toggle = str(await get_user_setting(session, user, "fast_send") or "").strip().lower() in {"1", "true", "yes", "on"}
+                await bot.send_message(chat_id, "❌ Рассылка остановлена: нет активных аккаунтов.")
             except Exception:
-                fast_send_toggle = False
-            fast_mode = bool(timing.get("fast_mode", False)) or fast_send_toggle
+                pass
+            return
 
-            if fast_mode:
-                # ✅ ТЗ: Fast режим должен быть реально быстрым.
-                # Не меняем общую логику рассылки, только уменьшаем задержки и увеличиваем размер пачки.
-                min_delay = 0.0
-                max_delay = 0.0
-                batch_size = max(batch_size, 5)
-
+        proxy_check = await choose_proxy_for_user(session, db_user_id)
+        if not proxy_check:
+            state.is_running = False
+            state.last_error = "PROXY_ERROR|no_active_proxy|No active proxy"
+            set_sending_state(tg_user_id, state=state)
             try:
-                proxies_total = (
-                    await session.execute(select(func.count(Proxy.id)).where(Proxy.user_id == db_user_id))
-                ).scalar() or 0
+                await bot.send_message(
+                    chat_id,
+                    "❌ Рассылка остановлена: нет рабочего SOCKS5.\n"
+                    "«Прокси» → проверьте или добавьте socks5://…",
+                )
+            except Exception:
+                pass
+            return
 
-                if proxies_total <= 0:
+        timing = await load_timing(session, tg_user_id)
+        min_delay = float(timing.get("min_delay", 1.5))
+        max_delay = float(timing.get("max_delay", 3.0))
+        batch_size = int(timing.get("batch_size", 1))
+        fast_mode = mode_fast
+
+        if fast_mode:
+            min_delay = 0.0
+            max_delay = 0.0
+            batch_size = max(batch_size, 5)
+
+        try:
+
+            async def _send_one_with_timeout(acc: EmailAccount, tgt: OfferEmail) -> Tuple[bool, str]:
+                try:
+                    subject, body = await _build_message_for_target(session, tg_user_id, tgt)
+                    to_addr = (tgt.email or "").strip()
+
+                    async with smtp_sem:
+                        ok, err = await asyncio.wait_for(
+                            send_email_via_account_with_proxy(
+                                session,
+                                db_user_id,
+                                acc,
+                                to_addr,
+                                subject,
+                                body,
+                                sender_name=sender_name,
+                            ),
+                            timeout=SEND_ONE_TIMEOUT,
+                        )
+                    return bool(ok), (err or "")
+
+                except asyncio.TimeoutError:
+                    return False, "PROXY_ERROR|timeout|SMTP timeout (send_one)"
+                except Exception as e:
+                    return False, str(e)
+
+            async def _send_batch_with_timeout(acc: EmailAccount, batch: List[OfferEmail]) -> List[Tuple[bool, str]]:
+                try:
+                    items: list[tuple[str, str, str]] = []
+                    for t in batch:
+                        subj, body = await _build_message_for_target(session, tg_user_id, t)
+                        items.append(((t.email or "").strip(), subj, body))
+
+                    async with smtp_sem:
+                        res = await asyncio.wait_for(
+                            send_batch_via_account_with_proxy(
+                                session,
+                                db_user_id,
+                                acc,
+                                items,
+                                sender_name=sender_name,
+                            ),
+                            timeout=SEND_BATCH_TIMEOUT,
+                        )
+
+                    out: List[Tuple[bool, str]] = []
+                    for ok, err in res:
+                        out.append((bool(ok), (err or "")))
+                    return out
+
+                except asyncio.TimeoutError:
+                    return [(False, "PROXY_ERROR|timeout|SMTP timeout (send_batch)") for _ in batch]
+                except Exception as e:
+                    return [(False, str(e)) for _ in batch]
+
+            acc_idx = 0
+
+            while True:
+                state = get_sending_state(tg_user_id) or state
+                if state.is_stopping:
                     state.is_running = False
-                    state.last_error = "PROXY_ERROR|no_proxy|No proxies configured"
                     set_sending_state(tg_user_id, state=state)
-                    return
+                    break
 
-                proxy_check = await choose_proxy_for_user(session, db_user_id)
-                if not proxy_check:
+                remaining = await _get_targets_count(session, db_user_id)
+                if remaining <= 0:
                     state.is_running = False
-                    state.last_error = "PROXY_ERROR|no_active_proxy|No active proxy"
+                    state.last_status = "DONE"
                     set_sending_state(tg_user_id, state=state)
-                    return
+                    break
 
-                async def _send_one_with_timeout(acc: EmailAccount, tgt: OfferEmail) -> Tuple[bool, str]:
-                    try:
-                        subject, body = await _build_message_for_target(session, tg_user_id, tgt)
-                        to_addr = (tgt.email or "").strip()
+                targets = await _get_targets(session, db_user_id)
+                if not targets:
+                    state.is_running = False
+                    state.last_status = "DONE"
+                    set_sending_state(tg_user_id, state=state)
+                    break
 
-                        async with smtp_sem:
-                            ok, err = await asyncio.wait_for(
-                                send_email_via_account_with_proxy(
-                                    session,
-                                    db_user_id,
-                                    acc,
-                                    to_addr,
-                                    subject,
-                                    body,
-                                    sender_name=sender_name,
-                                ),
-                                timeout=SEND_ONE_TIMEOUT,
-                            )
-                        return bool(ok), (err or "")
+                acc = accounts[acc_idx % len(accounts)]
+                acc_idx += 1
 
-                    except asyncio.TimeoutError:
-                        return False, "PROXY_ERROR|timeout|SMTP timeout (send_one)"
-                    except Exception as e:
-                        return False, str(e)
+                if batch_size <= 1:
+                    tgt = targets[0]
+                    ok, err = await _send_one_with_timeout(acc, tgt)
+                    if ok:
+                        state.sent_count += 1
+                        state.last_error = ""
+                        await _purge_target(session, db_user_id, tgt.id)
+                    else:
+                        state.failed_count += 1
+                        state.last_error = err
+                        if "RECIPIENT_DEAD" in err or "5.1.1" in err:
+                            await _purge_target(session, db_user_id, tgt.id)
 
-                async def _send_batch_with_timeout(acc: EmailAccount, batch: List[OfferEmail]) -> List[Tuple[bool, str]]:
-                    try:
-                        items: list[tuple[str, str, str]] = []
-                        for t in batch:
-                            subj, body = await _build_message_for_target(session, tg_user_id, t)
-                            items.append(((t.email or "").strip(), subj, body))
-
-                        async with smtp_sem:
-                            res = await asyncio.wait_for(
-                                send_batch_via_account_with_proxy(
-                                    session,
-                                    db_user_id,
-                                    acc,
-                                    items,
-                                    sender_name=sender_name,
-                                ),
-                                timeout=SEND_BATCH_TIMEOUT,
-                            )
-
-                        out: List[Tuple[bool, str]] = []
-                        for ok, err in res:
-                            out.append((bool(ok), (err or "")))
-                        return out
-
-                    except asyncio.TimeoutError:
-                        return [(False, "PROXY_ERROR|timeout|SMTP timeout (send_batch)") for _ in batch]
-                    except Exception as e:
-                        return [(False, str(e)) for _ in batch]
-
-                acc_idx = 0
-
-                while True:
-                    state = get_sending_state(tg_user_id) or state
-                    if state.is_stopping:
-                        state.is_running = False
-                        set_sending_state(tg_user_id, state=state)
-                        break
-
-                    remaining = await _get_targets_count(session, db_user_id)
-                    if remaining <= 0:
-                        state.is_running = False
-                        state.last_status = "DONE"
-                        set_sending_state(tg_user_id, state=state)
-                        break
-
-                    targets = await _get_targets(session, db_user_id)
-                    if not targets:
-                        state.is_running = False
-                        state.last_status = "DONE"
-                        set_sending_state(tg_user_id, state=state)
-                        break
-
-                    acc = accounts[acc_idx % len(accounts)]
-                    acc_idx += 1
-
-                    if batch_size <= 1:
-                        tgt = targets[0]
-                        ok, err = await _send_one_with_timeout(acc, tgt)
+                else:
+                    batch = targets[:batch_size]
+                    results = await _send_batch_with_timeout(acc, batch)
+                    for t, (ok, err) in zip(batch, results):
                         if ok:
                             state.sent_count += 1
-                            state.last_error = ""
-                            await _purge_target(session, db_user_id, tgt.id)
+                            await _purge_target(session, db_user_id, t.id)
                         else:
                             state.failed_count += 1
                             state.last_error = err
-                            # если получатель "мертвый" — убираем из очереди, чтобы не стопорить
                             if "RECIPIENT_DEAD" in err or "5.1.1" in err:
-                                await _purge_target(session, db_user_id, tgt.id)
-
-                    else:
-                        batch = targets[:batch_size]
-                        results = await _send_batch_with_timeout(acc, batch)
-                        for t, (ok, err) in zip(batch, results):
-                            if ok:
-                                state.sent_count += 1
                                 await _purge_target(session, db_user_id, t.id)
-                            else:
-                                state.failed_count += 1
-                                state.last_error = err
-                                if "RECIPIENT_DEAD" in err or "5.1.1" in err:
-                                    await _purge_target(session, db_user_id, t.id)
 
-                    set_sending_state(tg_user_id, state=state)
-                    await asyncio.sleep(random.uniform(min_delay, max_delay))
-
-            except TelegramNetworkError:
-                state.is_running = False
-                state.last_error = "TG_ERROR|network|Telegram network error"
                 set_sending_state(tg_user_id, state=state)
-            except Exception as e:
-                state.is_running = False
-                state.last_error = f"ERROR|exception|{e}"
-                set_sending_state(tg_user_id, state=state)
+                await asyncio.sleep(random.uniform(min_delay, max_delay))
 
-    asyncio.create_task(_sending_loop())
+        except TelegramNetworkError:
+            state.is_running = False
+            state.last_error = "TG_ERROR|network|Telegram network error"
+            set_sending_state(tg_user_id, state=state)
+        except Exception as e:
+            state.is_running = False
+            state.last_error = f"ERROR|exception|{e}"
+            set_sending_state(tg_user_id, state=state)
+            logger.exception("sending loop failed for user %s", tg_user_id)

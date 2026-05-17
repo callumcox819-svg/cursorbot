@@ -31,19 +31,12 @@ def tg_answer_safe(obj: Message | CallbackQuery, text: str, **kwargs):
 def render_status_text(
     st: SendingState | dict | None,
     *,
+    offers_total: int | None = None,
     pending_now: int | None = None,
     accounts_total: int | None = None,
     accounts_active: int | None = None,
 ) -> str:
-    """Красивый статус рассылки.
-
-    Требования:
-    - показать отправлено и сколько сейчас в БД для отправки
-    - показать активные аккаунты (active/total)
-    """
-    if not st:
-        return "📊 Статус рассылки\n\nСейчас рассылка не запущена."
-
+    """Статус рассылки + данные в БД (всегда, даже если рассылка не запущена)."""
     # st может быть dict (на всякий)
     if isinstance(st, dict):
         # максимально мягко
@@ -54,7 +47,7 @@ def render_status_text(
         acc_t = st.get("accounts_total")
         acc_a = st.get("accounts_active")
         last_err = (st.get("last_error") or "").strip()
-    else:
+    elif st:
         running = bool(getattr(st, "is_running", False) or getattr(st, "running", False))
         sent = int(getattr(st, "sent_count", 0) or getattr(st, "sent", 0) or 0)
         failed = int(getattr(st, "failed_count", 0) or getattr(st, "errors", 0) or 0)
@@ -62,6 +55,12 @@ def render_status_text(
         acc_t = getattr(st, "accounts_total", None)
         acc_a = getattr(st, "accounts_active", None)
         last_err = (getattr(st, "last_error", "") or "").strip()
+    else:
+        running = False
+        sent = failed = 0
+        mode = "-"
+        acc_t = acc_a = None
+        last_err = ""
 
     # приоритет: свежие значения из БД
     if accounts_total is not None:
@@ -76,36 +75,50 @@ def render_status_text(
     if pending_now is None:
         pending_now = int(getattr(st, "total_targets", 0) or getattr(st, "total", 0) or 0)
     pending_now = int(pending_now)
+    offers_total = int(offers_total or 0)
 
-    status_line = "🟢 Рассылка запущена" if running else "🟡 Рассылка остановлена"
+    if running:
+        run_line = "🟢 Рассылка запущена"
+    else:
+        run_line = "Сейчас рассылка не запущена."
 
-    # показать последнюю ошибку, если есть
     last_err_line = ""
-    if last_err and last_err != "-":
-        # чтобы не раздувать сообщение
+    if last_err and last_err not in ("-", ""):
         compact = last_err.replace("\n", " ").strip()
         if len(compact) > 160:
             compact = compact[:160] + "…"
         last_err_line = f"\nПоследняя ошибка: <code>{compact}</code>"
 
+    progress_line = ""
+    if running and pending_now > 0:
+        progress_line = f"\nПрогресс: <b>{sent}/{pending_now}</b>"
+
     return (
-        "📊 Статус рассылки\n\n"
-        f"{status_line}\n"
+        "📊 <b>Статус рассылки</b>\n\n"
+        f"{run_line}\n"
         f"Режим: <b>{mode}</b>\n"
         f"Отправлено: <b>{sent}</b>\n"
-        f"В очереди: <b>{pending_now}</b>\n"
-        f"Прогресс: <b>{sent}/{pending_now}</b>\n"
-        f"Аккаунты: <b>{acc_a}/{acc_t}</b>\n"
-        f"Ошибок: <b>{failed}</b>"
-        f"{last_err_line}"
+        f"Ошибок отправки: <b>{failed}</b>"
+        f"{progress_line}"
+        f"{last_err_line}\n\n"
+        "<b>В базе данных</b>\n"
+        f"📄 Объявлений: <b>{offers_total}</b>\n"
+        f"📧 Email в очереди: <b>{pending_now}</b>\n"
+        f"📮 Аккаунты: <b>{acc_a}/{acc_t}</b> активных"
     )
 
 
-async def _collect_db_stats(tg_user_id: int) -> tuple[int, int, int]:
-    """(pending_now, accounts_total, accounts_active)"""
+async def _collect_db_stats(tg_user_id: int) -> tuple[int, int, int, int]:
+    """(offers_total, pending_emails, accounts_total, accounts_active)"""
     async with async_session() as session:
         db_user = await get_or_create_user(session, tg_user_id)
         db_user_id = db_user.id
+
+        offers_total = (
+            await session.execute(
+                select(func.count(Offer.id)).where(Offer.user_id == db_user_id)
+            )
+        ).scalar() or 0
 
         pending_now = (
             await session.execute(
@@ -131,7 +144,12 @@ async def _collect_db_stats(tg_user_id: int) -> tuple[int, int, int]:
             )
         ).scalar() or 0
 
-        return int(pending_now), int(accounts_total), int(accounts_active)
+        return (
+            int(offers_total),
+            int(pending_now),
+            int(accounts_total),
+            int(accounts_active),
+        )
 
 
 @router.message(Command("stat", "status", "statussend"))
@@ -140,13 +158,15 @@ async def cmd_statussend(message: Message) -> None:
     tg_user_id = message.from_user.id
     st = get_sending_state(tg_user_id)
 
-    pending_now, acc_total, acc_active = await _collect_db_stats(tg_user_id)
+    offers_total, pending_now, acc_total, acc_active = await _collect_db_stats(tg_user_id)
 
     await message.answer(
         render_status_text(
             st,
+            offers_total=offers_total,
             pending_now=pending_now,
             accounts_total=acc_total,
             accounts_active=acc_active,
-        )
+        ),
+        parse_mode="HTML",
     )
