@@ -10,6 +10,7 @@ import re
 import select as pyselect
 import threading
 import time
+from contextlib import asynccontextmanager
 from email.header import decode_header
 from email.utils import parseaddr
 from typing import Optional, List, Tuple, Dict, Any
@@ -46,6 +47,17 @@ _EOF_LOG_COOLDOWN_SEC = 120.0
 
 FULL_BODIES: Dict[tuple[int, str], str] = {}
 FULL_META: Dict[tuple[int, str], Dict[str, Any]] = {}
+
+
+@asynccontextmanager
+async def _imap_db_session():
+    """Короткий доступ к Postgres со сбросом SOCKS-патча (не держим lock на всю обработку письма)."""
+    from proxy_manager import database_socket_guard
+
+    async with database_socket_guard():
+        async with Session() as session:
+            yield session
+
 
 def _now() -> float:
     return time.time()
@@ -189,7 +201,7 @@ async def _db_commit_retry(session, attempts: int = 3) -> None:
 
 async def _set_last_seen_uid(acc_id: int, uid: int) -> None:
     try:
-        async with Session() as session:
+        async with _imap_db_session() as session:
             acc = (
                 await session.execute(
                     sa_select(EmailAccount).where(EmailAccount.id == int(acc_id)).limit(1)
@@ -217,7 +229,7 @@ async def _upsert_convlink(
         return
 
     try:
-        async with Session() as session:
+        async with _imap_db_session() as session:
             row = (await session.execute(
                 sa_select(ConversationLink).where(
                     ConversationLink.user_id == int(user_id),
@@ -260,7 +272,7 @@ async def _load_convlink(
     if not inbox or not contact:
         return None
     try:
-        async with Session() as session:
+        async with _imap_db_session() as session:
             row = (await session.execute(
                 sa_select(ConversationLink).where(
                     ConversationLink.user_id == int(user_id),
@@ -903,19 +915,16 @@ async def _process_mails_for_account(
     max_per_account: int,
     last_uid: Optional[int],
 ) -> int:
-    from proxy_manager import database_socket_guard
-
-    async with database_socket_guard():
-        return await _process_mails_for_account_impl(
-            bot,
-            acc_id=acc_id,
-            tg_id=tg_id,
-            user_id=user_id,
-            account_email=account_email,
-            mails=mails,
-            max_per_account=max_per_account,
-            last_uid=last_uid,
-        )
+    return await _process_mails_for_account_impl(
+        bot,
+        acc_id=acc_id,
+        tg_id=tg_id,
+        user_id=user_id,
+        account_email=account_email,
+        mails=mails,
+        max_per_account=max_per_account,
+        last_uid=last_uid,
+    )
 
 
 async def _process_mails_for_account_impl(
@@ -933,7 +942,7 @@ async def _process_mails_for_account_impl(
 
     inbox_label: str | None = None
     try:
-        async with Session() as _s0:
+        async with _imap_db_session() as _s0:
             u0 = (
                 await _s0.execute(sa_select(User).where(User.id == int(user_id)).limit(1))
             ).scalars().first()
@@ -970,7 +979,7 @@ async def _process_mails_for_account_impl(
             if len(subj_norm) < 4:
                 continue
             try:
-                async with Session() as _s:
+                async with _imap_db_session() as _s:
                     hit = (await _s.execute(sa_select(Offer.id).where(Offer.title.ilike(f"%{subj_norm}%")).limit(1))).scalar()
                 if not hit:
                     continue
@@ -1012,7 +1021,7 @@ async def _process_mails_for_account_impl(
             resolved_offer_email_id: int | None = None
             mail_db_id: int | None = None
             try:
-                async with Session() as session:
+                async with _imap_db_session() as session:
                     resolved_offer_id, resolved_offer_email_id = await _resolve_offer_for_incoming(
                         session,
                         user_id=user_id,
@@ -1064,7 +1073,7 @@ async def _process_mails_for_account_impl(
             # ✅ если ссылки нет — берём из Offer.link (валидированные данные в БД)
             if (not ad_url) and resolved_offer_id:
                 try:
-                    async with Session() as session:
+                    async with _imap_db_session() as session:
                         off_link = (
                             await session.execute(
                                 sa_select(Offer.link)
@@ -1116,7 +1125,7 @@ async def _process_mails_for_account_impl(
             # чтобы их можно было смотреть по кнопке ℹ️ Инфо и использовать дальше.
             if mail_db_id:
                 try:
-                    async with Session() as session:
+                    async with _imap_db_session() as session:
                         mail_row = (
                             await session.execute(
                                 sa_select(IncomingMail).where(IncomingMail.id == int(mail_db_id)).limit(1)
@@ -1137,7 +1146,7 @@ async def _process_mails_for_account_impl(
             photo_url = None
             offer_price: str | None = None
             try:
-                async with Session() as _s:
+                async with _imap_db_session() as _s:
                     offer_id, service_label, product_title, photo_url, offer_price = await mail_card_offer_meta(
                         _s,
                         user_id=int(user_id),
@@ -1153,7 +1162,7 @@ async def _process_mails_for_account_impl(
                 try:
                     is_first = False
                     try:
-                        async with Session() as _s2:
+                        async with _imap_db_session() as _s2:
                             cnt = (
                                 await _s2.execute(
                                     sa_select(func.count(IncomingMail.id))
@@ -1249,7 +1258,7 @@ async def _process_mails_for_account_impl(
             bounce_err = (body_clean or subject or "").strip()
             if smtp_block_bounce and account_email:
                 try:
-                    async with Session() as session:
+                    async with _imap_db_session() as session:
                         acc = (
                             await session.execute(
                                 sa_select(EmailAccount).where(EmailAccount.id == int(acc_id)).limit(1)
@@ -1283,21 +1292,18 @@ _EVENT_QUEUES: Dict[int, asyncio.Queue] = {}
 
 
 async def _refresh_accounts_map() -> list[tuple[EmailAccount, int]]:
-    from proxy_manager import database_socket_guard
-
-    async with database_socket_guard():
-        async with Session() as session:
-            accounts = (await session.execute(
-                sa_select(EmailAccount).where(
-                    sa_or(
-                        EmailAccount.status.is_(None),
-                        EmailAccount.status.in_(["active", "enabled", "proxy_error", "smtp_blocked"]),
-                    )
+    async with _imap_db_session() as session:
+        accounts = (await session.execute(
+            sa_select(EmailAccount).where(
+                sa_or(
+                    EmailAccount.status.is_(None),
+                    EmailAccount.status.in_(["active", "enabled", "proxy_error", "smtp_blocked"]),
                 )
-            )).scalars().all()
+            )
+        )).scalars().all()
 
-            users = (await session.execute(sa_select(User))).scalars().all()
-            users_by_id = {u.id: u.telegram_id for u in users}
+        users = (await session.execute(sa_select(User))).scalars().all()
+        users_by_id = {u.id: u.telegram_id for u in users}
 
     out: list[tuple[EmailAccount, int]] = []
     for a in accounts:

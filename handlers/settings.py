@@ -68,16 +68,28 @@ SETTINGS_MENU_TEXT = "Настройки"
 def match_settings_menu_text(text: str | None) -> bool:
     """Кнопка «⚙️ Настройки» с главной клавиатуры (устойчиво к вариантам emoji)."""
     t = (text or "").strip().casefold().replace("\ufe0f", "")
-    return "настройки" in t
+    if not t:
+        return False
+    if "настройки" in t:
+        return True
+    return t in {"settings", "setting", "⚙️ настройки"}
 
 
 async def open_settings_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(
-        SETTINGS_MENU_TEXT,
-        reply_markup=await _settings_menu_kb_for_user(message.from_user.id),
-        parse_mode="HTML",
-    )
+    try:
+        kb = await _settings_menu_kb_for_user(message.from_user.id)
+        await message.answer(
+            SETTINGS_MENU_TEXT,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("open_settings_menu failed tg=%s", message.from_user.id)
+        await message.answer(
+            "❌ Не удалось открыть настройки (ошибка БД). Попробуйте через 5 сек или /start.",
+            parse_mode="HTML",
+        )
 
 
 # =========================
@@ -183,7 +195,8 @@ async def _settings_menu_kb_for_user(tg_user_id: int) -> InlineKeyboardMarkup:
     return settings_menu_kb(flags)
 
 
-@router.message(F.func(lambda m: match_settings_menu_text(getattr(m, "text", None))))
+@router.message(F.text.func(lambda t: match_settings_menu_text(t)))
+@router.message(F.text.in_({"⚙️ Настройки", "Настройки"}))
 async def settings_open(message: Message, state: FSMContext) -> None:
     await open_settings_menu(message, state)
 

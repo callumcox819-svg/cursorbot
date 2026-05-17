@@ -48,6 +48,7 @@ class _ReentrantAsyncLock:
 
 
 _PROXY_LOCK = _ReentrantAsyncLock()
+_DB_SOCKET_LOCK = _ReentrantAsyncLock()
 # round-robin по активным прокси (на user_id из БД)
 _RR_INDEX: dict[int, int] = {}
 
@@ -236,15 +237,15 @@ def test_smtp_tunnel_sync(proxy: Proxy, *, timeout: int = 20) -> tuple[bool, str
 async def database_socket_guard():
     """
     Перед PostgreSQL/asyncpg: сбросить глобальный PySocks-патч.
-    Иначе ConnectionError: unexpected connection_lost() при рассылке.
+    Отдельный lock от SMTP — иначе IMAP/БД блокируют рассылку и кнопки меню.
     """
-    await _PROXY_LOCK.acquire()
+    await _DB_SOCKET_LOCK.acquire()
     reset_smtplib_proxy()
     try:
         yield
     finally:
         reset_smtplib_proxy()
-        _PROXY_LOCK.release()
+        _DB_SOCKET_LOCK.release()
 
 
 def reset_smtplib_proxy() -> None:

@@ -36,8 +36,9 @@ _engine_kwargs: dict = {"echo": False, "pool_pre_ping": True}
 if DATABASE_URL.startswith("sqlite"):
     _engine_kwargs["connect_args"] = {"timeout": 60}
 elif DATABASE_URL.startswith("postgresql"):
-    _engine_kwargs["pool_size"] = int(os.getenv("DB_POOL_SIZE", "5"))
-    _engine_kwargs["max_overflow"] = int(os.getenv("DB_MAX_OVERFLOW", "10"))
+    _engine_kwargs["pool_size"] = int(os.getenv("DB_POOL_SIZE", "15"))
+    _engine_kwargs["max_overflow"] = int(os.getenv("DB_MAX_OVERFLOW", "25"))
+    _engine_kwargs["pool_timeout"] = int(os.getenv("DB_POOL_TIMEOUT", "30"))
 
 engine = create_async_engine(DATABASE_URL, **_engine_kwargs)
 

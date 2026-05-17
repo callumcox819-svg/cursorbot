@@ -11,21 +11,18 @@ router = Router()
 DEBUG_CATCHALL = os.getenv("DEBUG_CATCHALL", "").strip() == "1"
 
 
-@router.message()
-async def _catch_any_message(message: Message):
-    txt = message.text or ""
-    logging.info("[CATCHALL] message from=%s text=%r", getattr(message.from_user, "id", None), txt)
+if DEBUG_CATCHALL:
 
-    # ✅ По умолчанию НИЧЕГО не отправляем в чат
-    if not DEBUG_CATCHALL:
-        return
-
-    await message.answer(
-        "🧯 DEBUG: сообщение дошло до бота\n"
-        f"TEXT: {txt}\n"
-        f"REPR: {txt!r}\n"
-        f"FROM: {getattr(message.from_user, 'id', None)}"
-    )
+    @router.message()
+    async def _catch_any_message(message: Message):
+        txt = message.text or ""
+        logging.info("[CATCHALL] message from=%s text=%r", getattr(message.from_user, "id", None), txt)
+        await message.answer(
+            "🧯 DEBUG: сообщение дошло до бота\n"
+            f"TEXT: {txt}\n"
+            f"REPR: {txt!r}\n"
+            f"FROM: {getattr(message.from_user, 'id', None)}"
+        )
 
 
 @router.callback_query()
