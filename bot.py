@@ -228,7 +228,14 @@ async def _on_startup(bot: Bot) -> None:
     # IMAP по умолчанию ВЫКЛ — пока не задано ENABLE_INCOMING_MAIL=1 (не блокирует кнопки).
     if os.getenv("ENABLE_INCOMING_MAIL", "").strip() not in {"1", "true", "yes", "on"}:
         logger.warning(
-            "IMAP worker ВЫКЛЮЧЕН. Чтобы включить входящую почту: Railway → ENABLE_INCOMING_MAIL=1"
+            "IMAP worker ВЫКЛЮЧЕН. Чтобы включить входящую почту: Railway → ENABLE_INCOMING_MAIL=1 "
+            "или отдельный сервис python imap_worker.py"
+        )
+        return
+
+    if os.getenv("IMAP_DEDICATED_WORKER", "").strip() in {"1", "true", "yes", "on"}:
+        logger.info(
+            "IMAP в bot.py отключён (IMAP_DEDICATED_WORKER=1) — входящая почта на отдельном сервисе imap_worker"
         )
         return
 

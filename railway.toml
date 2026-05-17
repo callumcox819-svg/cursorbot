@@ -1,8 +1,16 @@
-# Один экземпляр бота — иначе Telegram polling дублирует ответы.
+# Сервис «bot»: numReplicas = 1 (два polling на одном BOT_TOKEN = конфликт).
 [deploy]
 numReplicas = 1
 
-# В Variables сервиса бота:
+# Сервис «bot»:
 #   DATABASE_URL = ${{Postgres.DATABASE_URL}}
 #   BOT_TOKEN = ...
+#   IMAP_DEDICATED_WORKER=1   — если IMAP на отдельном сервисе (см. ниже)
+#
+# Второй сервис в том же проекте Railway (тот же GitHub-репо):
+#   Start command: python imap_worker.py
+#   ENABLE_INCOMING_MAIL=1
+#   MAX_IMAP_CONCURRENT=12   (100+ ящиков)
+#   INCOMING_MAIL_POLL_SECONDS=20
+#   те же DATABASE_URL и BOT_TOKEN (polling не запускается — конфликта нет)
 # Подробно: RAILWAY_DATABASE.txt
