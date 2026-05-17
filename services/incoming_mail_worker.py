@@ -55,6 +55,15 @@ def _e(s: str) -> str:
     return html.escape(s or "")
 
 
+def _normalize_subject(subject: str) -> str:
+    """Тема для сопоставления с оффером (GMX spam и т.п.)."""
+    s = (subject or "").strip().lower()
+    for prefix in ("re:", "fwd:", "fw:", "aw:", "wg:"):
+        while s.startswith(prefix):
+            s = s[len(prefix) :].strip()
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def _canon_email(email: str) -> str:
     e = (email or "").strip().lower()
     if "@" not in e:
@@ -835,6 +844,7 @@ async def build_mail_card_from_mail(
     if conv and (conv.generated_link or "").strip():
         generated_link = (conv.generated_link or "").strip()
     link_id = link_id_from_generated_url(generated_link)
+    body_full = (getattr(mail, "body", None) or "").strip()
 
     chunks = render_mail_text_chunks(
         account_email=str(getattr(mail, "account_email", "") or ""),
