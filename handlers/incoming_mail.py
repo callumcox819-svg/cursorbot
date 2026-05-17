@@ -13,7 +13,7 @@ from aiogram.fsm.state import StatesGroup, State
 from sqlalchemy import select as sa_select, func, select
 
 from database import Session
-from models import EmailAccount, ConversationLink, Offer, OfferEmail, IncomingMail, UserSetting
+from models import EmailAccount, ConversationLink, Offer, OfferEmail, IncomingMail, User, UserSetting
 
 from services.users import get_or_create_user
 from services.user_settings import get_user_setting
@@ -1463,27 +1463,14 @@ async def _offer_title_for_email(session: Session, user_id: int, to_email: str) 
     return ""
 
 
-async def _load_html_template_for_user(session: Session, user_id: int, filename: str) -> str:
-    # we are CH-only, but keep fallback to root templates
-    from pathlib import Path
+async def _load_html_template_for_user(session: Session, user: User, filename: str) -> tuple[str, str | None]:
+    """HTML только из data/HTMLch/<сервис>/ (без fallback на общую папку)."""
+    from services.html_templates import load_html_for_user
 
-    service = (
-        await session.execute(
-            sa_select(UserSetting.value)
-            .where(UserSetting.user_id == int(user_id))
-            .where(UserSetting.key == GAG_SERVICE_KEY)
-        )
-    ).scalar_one_or_none()
-    service = gag_service_for_html_dir(str(service or "").strip() or None)
-
-    base = Path("data") / "HTMLch"
-    p = base / service / filename if service else base / filename
-    if not p.exists():
-        p = base / filename
-    try:
-        return p.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return ""
+    html, _subdir, err = await load_html_for_user(
+        session, user, gag_service_key=GAG_SERVICE_KEY, filename=filename
+    )
+    return html, err
 
 
 def _apply_link(html_text: str, link: str) -> str:
@@ -1534,6 +1521,24 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
     mail_uid = uid
     tg_id = int(callback.from_user.id)
 
+    async with Session() as session:
+        user_pre = await get_or_create_user(session, tg_id)
+        service_raw = (await get_user_setting(session, user_pre, GAG_SERVICE_KEY) or "").strip()
+        if not is_valid_gag_service(service_raw):
+            return await callback.answer(
+                "Сначала выберите сервис в 👤 Профиль → 🧭 Выбор сервиса",
+                show_alert=True,
+            )
+        from services.html_templates import html_template_path, service_label_for_path
+
+        sub = gag_service_for_html_dir(service_raw)
+        if not html_template_path(service_raw, filename):
+            label = service_label_for_path(sub or "")
+            return await callback.answer(
+                f"Нет шаблона {filename} для {label}",
+                show_alert=True,
+            )
+
     async def _send() -> tuple[bool, str | None]:
         async with Session() as session:
             user = await get_or_create_user(session, tg_id)
@@ -1562,9 +1567,9 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
                 )
             ).scalar_one_or_none()
 
-            raw_html = await _load_html_template_for_user(session, int(user.id), filename)
-            if not raw_html:
-                return False, "HTML шаблон не найден"
+            raw_html, tpl_err = await _load_html_template_for_user(session, user, filename)
+            if tpl_err or not raw_html:
+                return False, tpl_err or "HTML шаблон не найден"
 
             from services.placeholders import apply_placeholders
 

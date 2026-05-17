@@ -17,7 +17,12 @@ from models import EmailAccount, Offer, OfferEmail, UserSetting, IncomingMail
 from services.smtp_proxy_send import send_email_via_account_with_proxy
 from services.users import get_or_create_user
 from services.user_settings import get_user_setting
-from services.gag_keys import gag_service_for_html_dir
+from services.gag_keys import gag_service_for_html_dir, is_valid_gag_service
+from services.html_templates import (
+    list_html_templates_for_service,
+    load_html_for_user,
+    service_label_for_path,
+)
 from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 
 router = Router()
@@ -28,16 +33,6 @@ logger = logging.getLogger(__name__)
 HTML_DIR = Path("data/html")
 HTML_CH_DIR = Path("data/HTMLch")
 GAG_SERVICE_KEY = "gag_service"
-
-
-async def _get_html_dir(session: Session, tg_user_id: int) -> Path:
-    user = await get_or_create_user(session, tg_user_id)
-    service = gag_service_for_html_dir(await get_user_setting(session, user, GAG_SERVICE_KEY))
-    if service:
-        sub = HTML_CH_DIR / service
-        if sub.exists():
-            return sub
-    return HTML_CH_DIR if HTML_CH_DIR.exists() else HTML_DIR
 
 
 HTML_NICK_KEY = "html_nick"
@@ -107,13 +102,24 @@ async def cust_open(callback: CallbackQuery):
         if not meta:
             return await callback.answer("Письмо устарело", show_alert=True)
 
-        html_dir = await _get_html_dir(session, callback.from_user.id)
-        files = sorted([p.name for p in html_dir.glob("*.html")])
+        user = await get_or_create_user(session, callback.from_user.id)
+        raw_svc = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
+        if not is_valid_gag_service(raw_svc):
+            return await callback.answer(
+                "Сначала выберите сервис: 👤 Профиль → 🧭 Выбор сервиса",
+                show_alert=True,
+            )
+        files = list_html_templates_for_service(raw_svc)
         if not files:
-            return await callback.answer("Нет HTML-шаблонов", show_alert=True)
+            sub = gag_service_for_html_dir(raw_svc) or "?"
+            return await callback.answer(
+                f"Нет HTML в папке {sub}/",
+                show_alert=True,
+            )
+        svc_label = service_label_for_path(gag_service_for_html_dir(raw_svc) or "")
 
     await callback.message.answer(
-        "🧩 <b>CUSTOME</b>\n\nВыбери HTML-шаблон — я отправлю ответ на почту отправителя этого письма.",
+        f"🧩 <b>CUSTOME</b> · {svc_label}\n\nВыбери HTML-шаблон — ответ уйдёт на почту отправителя письма.",
         reply_markup=_html_list_kb(files, acc_id, uid),
         parse_mode="HTML",
     )
@@ -210,13 +216,11 @@ async def cust_send_imap(callback: CallbackQuery):
                     .where(UserSetting.key == HTML_SIGNATURE_KEY)
                 )
             ).scalar_one_or_none()
-            html_dir = await _get_html_dir(session, tg_id)
-            file_path = html_dir / filename_copy
-            if not file_path.exists():
-                file_path = HTML_DIR / filename_copy
-            if not file_path.exists():
-                return False, "HTML шаблон не найден"
-            raw_html = file_path.read_text(encoding="utf-8", errors="ignore")
+            raw_html, _sub, tpl_err = await load_html_for_user(
+                session, user, gag_service_key=GAG_SERVICE_KEY, filename=filename_copy
+            )
+            if tpl_err or not raw_html:
+                return False, tpl_err or "HTML шаблон не найден"
             account_email = (meta.get("account_email") or account.email or "").strip().lower()
             mail_gen_link = None
             try:
@@ -332,13 +336,11 @@ async def cust_send_html(callback: CallbackQuery):
             except Exception:
                 pass
             subject = await get_html_reply_subject(session, user, fallback=_normalize_subject(meta))
-            html_dir = await _get_html_dir(session, tg_id)
-            file_path = html_dir / filename_copy
-            if not file_path.exists():
-                file_path = HTML_DIR / filename_copy
-            if not file_path.exists():
-                return False, "HTML шаблон не найден"
-            raw_html = file_path.read_text(encoding="utf-8", errors="ignore")
+            raw_html, _sub, tpl_err = await load_html_for_user(
+                session, user, gag_service_key=GAG_SERVICE_KEY, filename=filename_copy
+            )
+            if tpl_err or not raw_html:
+                return False, tpl_err or "HTML шаблон не найден"
             to_email = (offer_email.email or "").strip().lower()
             link = await resolve_gag_link_for_reply(
                 session,
