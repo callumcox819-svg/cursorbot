@@ -48,6 +48,12 @@ SMTP_TIMEOUT_SEC = 12
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_header_line(value: str) -> str:
+    """Заголовки SMTP не допускают переносы строк."""
+    s = (value or "").replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def _looks_like_html(body: str) -> bool:
     b = (body or "").lower()
     return "<html" in b or "<body" in b or "</" in b
@@ -99,7 +105,7 @@ def _build_message(
     sender_name: Optional[str] = None,
     is_html: Optional[bool] = None,
 ):
-    subj = subject or ""
+    subj = _sanitize_header_line(subject or "")
     b = body or ""
 
     # Some call sites explicitly request HTML sending (legacy compatibility).
