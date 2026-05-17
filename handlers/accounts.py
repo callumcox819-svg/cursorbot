@@ -285,7 +285,13 @@ def accounts_menu_kb(
 
     # Список аккаунтов
     for acc in accounts_page:
-        emoji = "🟢" if acc.status == "active" else "🔴"
+        st = (acc.status or "").strip().lower()
+        if st == "active":
+            emoji = "🟢"
+        elif st == "smtp_blocked":
+            emoji = "🟡"
+        else:
+            emoji = "🔴"
         text = f"{emoji} {acc.email}"
 
         email_btn = InlineKeyboardButton(

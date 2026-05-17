@@ -34,6 +34,7 @@ from services.sender import (
     is_proxy_error_marker,
     is_smtp_timeout_error,
 )
+from services.smtp_block_control import mark_account_smtp_blocked
 from keyboards.main_menu import main_menu_kb
 
 from services.sending_state import SendingState
@@ -353,11 +354,25 @@ async def _handle_send_failure(
     tgt: OfferEmail,
     err: str,
     fail_streak: dict[int, int],
-) -> None:
+    acc: EmailAccount,
+    bot: Bot | None = None,
+    chat_id: int | None = None,
+) -> bool:
+    """Возвращает True, если ящик снят с SMTP (smtp_blocked) — убрать из ротации."""
     err = normalize_send_error(err)
     state.failed_count += 1
     state.last_error = err or "UNKNOWN"
     state.last_failed_to = (tgt.email or "").strip()
+
+    if await mark_account_smtp_blocked(
+        session,
+        acc,
+        err,
+        db_user_id=db_user_id,
+        bot=bot,
+        chat_id=chat_id,
+    ):
+        return True
 
     purge = False
     if "RECIPIENT_DEAD" in err or "5.1.1" in err:
@@ -375,6 +390,7 @@ async def _handle_send_failure(
     if purge:
         await _purge_target(session, db_user_id, int(tgt.id))
         fail_streak.pop(int(tgt.id), None)
+    return False
 
 
 async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
@@ -516,14 +532,23 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                         fail_streak.pop(int(tgt.id), None)
                         await _purge_target(session, db_user_id, tgt.id)
                     else:
-                        await _handle_send_failure(
+                        if await _handle_send_failure(
                             session=session,
                             db_user_id=db_user_id,
                             state=state,
                             tgt=tgt,
                             err=err or "UNKNOWN",
                             fail_streak=fail_streak,
-                        )
+                            acc=acc,
+                            bot=bot,
+                            chat_id=chat_id,
+                        ):
+                            accounts[:] = [a for a in accounts if int(a.id) != int(acc.id)]
+                            if not accounts:
+                                state.is_running = False
+                                state.last_status = "STOPPED"
+                                set_sending_state(tg_user_id, state=state)
+                                break
 
                 else:
                     batch = targets[:batch_size]
@@ -534,14 +559,23 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                             fail_streak.pop(int(t.id), None)
                             await _purge_target(session, db_user_id, t.id)
                         else:
-                            await _handle_send_failure(
+                            if await _handle_send_failure(
                                 session=session,
                                 db_user_id=db_user_id,
                                 state=state,
                                 tgt=t,
                                 err=err or "UNKNOWN",
                                 fail_streak=fail_streak,
-                            )
+                                acc=acc,
+                                bot=bot,
+                                chat_id=chat_id,
+                            ):
+                                accounts[:] = [a for a in accounts if int(a.id) != int(acc.id)]
+                                if not accounts:
+                                    state.is_running = False
+                                    state.last_status = "STOPPED"
+                                    set_sending_state(tg_user_id, state=state)
+                                    break
 
                 set_sending_state(tg_user_id, state=state)
                 await asyncio.sleep(random.uniform(min_delay, max_delay))

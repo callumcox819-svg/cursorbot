@@ -978,6 +978,15 @@ async def _process_mails_for_account_impl(
                 logger.exception("Failed to check offer title for GMX spam")
                 continue
         smtp_block_bounce = _is_smtp_block_bounce(from_email, subject, body)
+        if not smtp_block_bounce:
+            try:
+                from services.smtp_block_control import is_smtp_account_block_error
+
+                smtp_block_bounce = is_smtp_account_block_error(
+                    f"{subject or ''}\n{body or ''}"
+                )
+            except Exception:
+                pass
 
         if (not is_spam_box) and _looks_like_spam(from_email, from_name, subject, body):
             continue
@@ -1237,6 +1246,7 @@ async def _process_mails_for_account_impl(
 
             # ✅ Если пришёл DSN/блокировка (Message blocked) — помечаем аккаунт как неактивный
             # и (при включённом контроле блокировок) пишем уведомление.
+            bounce_err = (body_clean or subject or "").strip()
             if smtp_block_bounce and account_email:
                 try:
                     async with Session() as session:
@@ -1246,25 +1256,16 @@ async def _process_mails_for_account_impl(
                             )
                         ).scalars().first()
                         if acc:
-                            acc.status = "smtp_blocked"
-                            # коротко сохраняем причину
-                            acc.last_error = (body_clean[:1000] if body_clean else (subject or ""))
-                            await _db_commit_retry(session)
+                            from services.smtp_block_control import mark_account_smtp_blocked
 
-                        # настройка: block_control
-                        u = (await session.execute(sa_select(User).where(User.id == int(user_id)).limit(1))).scalars().first()
-                        block_control = False
-                        if u:
-                            block_control = _truthy(await get_user_setting(session, u, "block_control"))
-
-                    # сообщение-статус (как на скрине)
-                    status_msg = f"<b>{account_email}</b>: неактивен для отправок 🔴"
-                    m2 = await bot.send_message(chat_id=tg_id, text=status_msg, parse_mode="HTML")
-                    await _try_pin(bot, tg_id, m2.message_id)
-
-                    if block_control:
-                        warn = f"Возникла ошибка - поток для {account_email} остановлен⚡️"
-                        await bot.send_message(chat_id=tg_id, text=warn)
+                            await mark_account_smtp_blocked(
+                                session,
+                                acc,
+                                bounce_err or "SMTP block bounce",
+                                db_user_id=int(user_id),
+                                bot=bot,
+                                chat_id=int(tg_id),
+                            )
                 except Exception:
                     logger.exception("Failed to mark smtp_blocked for %s", account_email)
 

@@ -12,6 +12,7 @@ from database import async_session
 from models import EmailAccount, Offer, OfferEmail, User
 from sqlalchemy import select, func
 from services.smtp_proxy_send import send_email_via_account_with_proxy
+from services.smtp_block_control import is_smtp_account_block_error, mark_account_smtp_blocked
 from handlers.templates import pick_random_smart_preset
 from handlers.first_sms import pick_random_first_sms
 from utils.bg_jobs import is_running as bg_is_running, start as bg_start
@@ -137,7 +138,18 @@ async def test_mail_send(message: Message, state: FSMContext):
                         session2.add(OfferEmail(offer_id=test_offer.id, email=to_email))
                         await session2.commit()
             else:
-                await status.edit_text(f"❌ Ошибка отправки (От: {acc_email}): {err}")
+                err_s = err or "unknown"
+                if is_smtp_account_block_error(err_s):
+                    async with async_session() as session_blk:
+                        await mark_account_smtp_blocked(
+                            session_blk,
+                            account,
+                            err_s,
+                            db_user_id=user_id,
+                            bot=message.bot,
+                            chat_id=int(message.chat.id),
+                        )
+                await status.edit_text(f"❌ Ошибка отправки (От: {acc_email}): {err_s}")
         except Exception as e:
             await status.edit_text(f"❌ Ошибка отправки (От: {acc_email}): {e}")
 
