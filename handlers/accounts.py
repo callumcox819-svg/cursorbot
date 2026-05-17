@@ -500,15 +500,17 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
     if not accounts:
         return await callback.answer("Нет аккаунтов для проверки.", show_alert=True)
 
+    workers = max(1, min(10, int(os.getenv("ACCOUNTS_SMTP_CHECK_CONCURRENCY", "5"))))
     await callback.answer("Запускаю проверку SMTP…")
     status_msg = await callback.message.answer(
-        f"⏳ <b>Проверка SMTP</b>\n\n0/{len(accounts)}",
+        f"⏳ <b>Проверка SMTP</b>\n\n0/{len(accounts)}\n"
+        f"Параллельно: <b>{workers}</b> потоков",
         parse_mode="HTML",
     )
 
     async def _job() -> None:
         from services.smtp_account_check import (
-            check_smtp_account_with_proxy,
+            check_smtp_accounts_parallel,
             is_account_no_access_status,
         )
         from services.smtp_block_control import short_block_reason
@@ -519,6 +521,23 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
         skip_n = 0
         lines: List[str] = []
         total = len(accounts)
+        last_progress_edit = 0.0
+
+        async def _on_progress(done: int, tot: int, email: str | None) -> None:
+            nonlocal last_progress_edit
+            now = asyncio.get_running_loop().time()
+            if done < tot and (now - last_progress_edit) < 0.45:
+                return
+            last_progress_edit = now
+            em = f"<code>{_e(email)}</code>\n" if email else ""
+            try:
+                await status_msg.edit_text(
+                    f"⏳ <b>Проверка SMTP</b>\n\n{done}/{tot}\n"
+                    f"Параллельно: <b>{workers}</b> потоков\n{em}",
+                    parse_mode="HTML",
+                )
+            except TelegramBadRequest:
+                pass
 
         async with Session() as session:
             user = await get_user(session, tg_id)
@@ -527,24 +546,24 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
                 return
             db_uid = int(user.id)
 
-            for i, acc in enumerate(accounts, start=1):
-                try:
-                    await status_msg.edit_text(
-                        f"⏳ <b>Проверка SMTP</b>\n\n{i}/{total}\n"
-                        f"<code>{_e(acc.email)}</code>",
-                        parse_mode="HTML",
-                    )
-                except TelegramBadRequest:
-                    pass
+            results = await check_smtp_accounts_parallel(
+                session,
+                db_uid,
+                accounts,
+                workers=workers,
+                on_progress=_on_progress,
+            )
 
-                st, err = await check_smtp_account_with_proxy(session, db_uid, acc)
-                row = await session.get(EmailAccount, int(acc.id))
+            for res in results:
+                row = await session.get(EmailAccount, int(res.account_id))
                 if not row:
                     continue
 
+                st, err = res.status, res.error
+
                 if st is None:
                     skip_n += 1
-                    lines.append(f"⏭ <code>{_e(acc.email)}</code> — прокси/таймаут")
+                    lines.append(f"⏭ <code>{_e(res.email)}</code> — прокси/таймаут")
                     continue
 
                 if is_account_no_access_status(st):
@@ -567,19 +586,19 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
                 if st == "active":
                     ok_n += 1
                     if prev != "active":
-                        lines.append(f"🟢 <code>{_e(acc.email)}</code> — снова активен (SMTP)")
+                        lines.append(f"🟢 <code>{_e(res.email)}</code> — снова активен (SMTP)")
                     else:
-                        lines.append(f"🟢 <code>{_e(acc.email)}</code> — SMTP OK")
+                        lines.append(f"🟢 <code>{_e(res.email)}</code> — SMTP OK")
                 elif st == "smtp_blocked":
                     blocked_n += 1
                     reason = short_block_reason(err)
                     lines.append(
-                        f"🟡 <code>{_e(acc.email)}</code> — лимит/блок SMTP\n"
+                        f"🟡 <code>{_e(res.email)}</code> — лимит/блок SMTP\n"
                         f"   <i>{_e(reason)}</i>"
                     )
                 else:
                     lines.append(
-                        f"🔴 <code>{_e(acc.email)}</code> — {_e(short_block_reason(err))}"
+                        f"🔴 <code>{_e(res.email)}</code> — {_e(short_block_reason(err))}"
                     )
 
         summary = (
