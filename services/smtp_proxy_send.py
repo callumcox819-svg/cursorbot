@@ -10,6 +10,7 @@ from proxy_manager import ProxySMTPContext, choose_proxy_for_user
 from services.sender import (
     is_definite_proxy_failure,
     is_proxy_error_marker,
+    is_smtp_timeout_error,
     normalize_send_error,
     send_batch_via_account,
     send_email_via_account,
@@ -19,8 +20,13 @@ from services.proxy_manager import ProxyManager
 NO_ACTIVE_PROXY = "PROXY_ERROR|no_active_proxy|No active proxy configured"
 
 
-async def choose_required_proxy(session: AsyncSession, user_id: int) -> Tuple[Optional[Proxy], Optional[str]]:
-    proxy = await choose_proxy_for_user(session, int(user_id))
+async def choose_required_proxy(
+    session: AsyncSession,
+    user_id: int,
+    *,
+    exclude_ids: set[int] | None = None,
+) -> Tuple[Optional[Proxy], Optional[str]]:
+    proxy = await choose_proxy_for_user(session, int(user_id), exclude_ids=exclude_ids)
     if not proxy:
         return None, NO_ACTIVE_PROXY
     return proxy, None
@@ -40,7 +46,7 @@ async def send_email_via_account_with_proxy(
     tried_ids: set[int] = set()
 
     for _attempt in range(3):
-        proxy, err = await choose_required_proxy(session, user_id)
+        proxy, err = await choose_required_proxy(session, user_id, exclude_ids=tried_ids)
         if err:
             return False, err
         pid = int(proxy.id)
@@ -62,6 +68,14 @@ async def send_email_via_account_with_proxy(
             return True, err
 
         last_err = err
+        if is_smtp_timeout_error(err):
+            try:
+                await ProxyManager.note_proxy_failure(
+                    session, pid, (err or "")[:500], deactivate=False
+                )
+            except Exception:
+                pass
+            continue
         if is_definite_proxy_failure(err):
             try:
                 await ProxyManager.note_proxy_failure(
@@ -69,6 +83,7 @@ async def send_email_via_account_with_proxy(
                 )
             except Exception:
                 pass
+            continue
         elif is_proxy_error_marker(err):
             try:
                 await ProxyManager.note_proxy_failure(

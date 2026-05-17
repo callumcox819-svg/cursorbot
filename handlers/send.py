@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 from typing import List, Optional, Tuple
 
@@ -27,7 +28,12 @@ from services.user_settings import get_user_setting
 from services.placeholders import apply_placeholders
 
 from handlers.status import render_status_text, tg_answer_safe
-from services.sender import normalize_send_error, is_proxy_error_marker
+from services.sender import (
+    SMTP_TIMEOUT_SEC,
+    normalize_send_error,
+    is_proxy_error_marker,
+    is_smtp_timeout_error,
+)
 from keyboards.main_menu import main_menu_kb
 
 from services.sending_state import SendingState
@@ -73,8 +79,9 @@ def set_sending_state(user_id: int, state: Optional[SendingState] = None, **kwar
 SMTP_CONCURRENCY_WITH_PROXY = 1
 SMTP_CONCURRENCY_NO_PROXY = 1
 
-SEND_ONE_TIMEOUT = 25
-SEND_BATCH_TIMEOUT = 60
+# До 3 прокси × SMTP_TIMEOUT_SEC + запас (иначе ложный PROXY_ERROR|timeout).
+SEND_ONE_TIMEOUT = max(60, int(os.getenv("SEND_ONE_TIMEOUT", str(SMTP_TIMEOUT_SEC * 3 + 25))))
+SEND_BATCH_TIMEOUT = max(90, int(os.getenv("SEND_BATCH_TIMEOUT", str(SMTP_TIMEOUT_SEC * 2 + 40))))
 MAX_PROXY_FAILS_PER_TARGET = 5
 
 # user settings keys (уже используются в проекте)
@@ -435,7 +442,9 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     return bool(ok), (err or "")
 
                 except asyncio.TimeoutError:
-                    return False, normalize_send_error("PROXY_ERROR|timeout|SMTP timeout (send_one)")
+                    return False, normalize_send_error(
+                        f"SMTP_TIMEOUT|timeout|SMTP send exceeded {SEND_ONE_TIMEOUT}s (send_one)"
+                    )
                 except Exception as e:
                     return False, normalize_send_error(str(e))
 
@@ -464,7 +473,9 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     return out
 
                 except asyncio.TimeoutError:
-                    err = normalize_send_error("PROXY_ERROR|timeout|SMTP timeout (send_batch)")
+                    err = normalize_send_error(
+                        f"SMTP_TIMEOUT|timeout|SMTP batch exceeded {SEND_BATCH_TIMEOUT}s (send_batch)"
+                    )
                     return [(False, err) for _ in batch]
                 except Exception as e:
                     err = normalize_send_error(str(e))

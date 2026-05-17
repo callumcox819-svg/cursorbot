@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 from typing import Optional
 
@@ -20,8 +21,8 @@ import smtplib as _smtplib
 
 _SMTP_SOCKET_ORIG = _smtplib.socket
 _SOCKET_GETADDRINFO_ORIG = None
-_SMTP_TEST_HOST = "smtp.gmail.com"
-_SMTP_TEST_PORT = 587
+_SMTP_TEST_HOST = (os.getenv("SMTP_TEST_HOST") or "smtp.gmail.com").strip()
+_SMTP_TEST_PORT = int(os.getenv("SMTP_TEST_PORT") or "587")
 
 SOCKS5_TYPES = frozenset({"socks5", "socks5h"})
 
@@ -31,7 +32,12 @@ def is_socks5_proxy(proxy: Proxy) -> bool:
     return t in SOCKS5_TYPES or t.startswith("socks5")
 
 
-async def choose_proxy_for_user(session, user_id: int) -> Optional[Proxy]:
+async def choose_proxy_for_user(
+    session,
+    user_id: int,
+    *,
+    exclude_ids: set[int] | None = None,
+) -> Optional[Proxy]:
     """
     Возвращает один активный SOCKS5 прокси пользователя.
     """
@@ -67,7 +73,14 @@ async def choose_proxy_for_user(session, user_id: int) -> Optional[Proxy]:
                 )
             ).scalars().all()
         )
-        items = [p for p in all_rows if _smtp_eligible(p) and (p.is_active is True or p.is_active is None)]
+        skip = exclude_ids or set()
+        items = [
+            p
+            for p in all_rows
+            if _smtp_eligible(p)
+            and (p.is_active is True or p.is_active is None)
+            and int(p.id) not in skip
+        ]
         if not items:
             logger.warning(
                 "no SMTP proxy for user_id=%s total=%s eligible=%s active_eligible=%s",

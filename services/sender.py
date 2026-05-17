@@ -44,7 +44,7 @@ MAILERS = [
     "Mutt",
 ]
 
-SMTP_TIMEOUT_SEC = max(12, min(30, int(os.getenv("SMTP_TIMEOUT_SEC", "25"))))
+SMTP_TIMEOUT_SEC = max(15, min(90, int(os.getenv("SMTP_TIMEOUT_SEC", "45"))))
 
 logger = logging.getLogger(__name__)
 
@@ -164,21 +164,25 @@ def _extract_code_text_from_exception(e: Exception) -> tuple[Optional[str], str]
     return code, (text or "").strip()
 
 
-_PROXY_PATTERNS = [
-    r"proxy",
-    r"tunnel",
-    r"connection.*reset",
-    r"timed out",
-    r"timeout",
-    r"temporary failure",
-    r"name or service not known",
-    r"getaddrinfo failed",
-    r"network is unreachable",
-    r"pysocks doesn't support ipv6",
-    r"doesn't support ipv6",
+# Только явные сбои SOCKS/прокси — НЕ голый SMTP timeout (часто лаг Gmail/прокси).
+_PROXY_PATTERNS_STRICT = [
     r"generalproxyerror",
     r"sockshttperror",
+    r"pysocks",
+    r"\bsocks5?\b",
+    r"proxy connection",
+    r"can'?t connect to proxy",
+    r"cannot connect to proxy",
     r"http proxy server did not return",
+    r"0x05",
+    r"doesn't support ipv6",
+    r"pysocks doesn't support ipv6",
+]
+
+_SMTP_TIMEOUT_PATTERNS = [
+    r"timed out",
+    r"timeout",
+    r"temporarily unavailable",
 ]
 
 _INVALID_CRED_PATTERNS = [
@@ -241,10 +245,32 @@ def _is_proxy_error(e: Exception, text: str) -> bool:
     mod = type(e).__module__ or ""
     if "socks" in mod.lower():
         return True
-    if any(re.search(p, t) for p in _PROXY_PATTERNS):
+    if any(re.search(p, t) for p in _PROXY_PATTERNS_STRICT):
         return True
-    # Gmail/лаг: disconnect/timeout без текста про SOCKS — не вина прокси
     return False
+
+
+def _is_smtp_timeout_text(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    if any(re.search(p, t) for p in _SMTP_TIMEOUT_PATTERNS):
+        if any(re.search(p, t) for p in _PROXY_PATTERNS_STRICT):
+            return False
+        return True
+    return False
+
+
+def is_smtp_timeout_error(err: str | None) -> bool:
+    s = normalize_send_error(err)
+    kind = s.split("|", 1)[0].split(":", 1)[0].strip().upper()
+    if kind == "SMTP_TIMEOUT":
+        return True
+    if kind == "PROXY_ERROR":
+        parts = s.split("|")
+        if len(parts) >= 2 and parts[1].strip().lower() == "timeout":
+            return True
+    return _is_smtp_timeout_text(s)
 
 
 def is_definite_proxy_failure(err: str | None) -> bool:
@@ -273,6 +299,7 @@ def is_definite_proxy_failure(err: str | None) -> bool:
 _KNOWN_ERROR_KINDS = frozenset(
     {
         "PROXY_ERROR",
+        "SMTP_TIMEOUT",
         "ACCOUNT_INVALID_CREDENTIALS",
         "ACCOUNT_WEB_LOGIN_REQUIRED",
         "ACCOUNT_RATE_LIMIT",
@@ -294,7 +321,9 @@ def normalize_send_error(err: str | None) -> str:
     if kind in _KNOWN_ERROR_KINDS:
         return s
     t = s.lower()
-    if any(re.search(p, t) for p in _PROXY_PATTERNS):
+    if _is_smtp_timeout_text(s):
+        return _marker("SMTP_TIMEOUT", "timeout", s)
+    if any(re.search(p, t) for p in _PROXY_PATTERNS_STRICT):
         return _marker("PROXY_ERROR", "socks", s)
     if _is_hard_bounce(None, t):
         return _marker("RECIPIENT_DEAD", None, s)
@@ -402,7 +431,9 @@ def _send_plain_sync(
         code, text = _extract_code_text_from_exception(e)
 
         if _is_proxy_error(e, text):
-            return False, _marker("PROXY_ERROR", code or "timeout", text or str(e))
+            return False, _marker("PROXY_ERROR", code or "socks", text or str(e))
+        if _is_smtp_timeout_text(text or str(e)):
+            return False, _marker("SMTP_TIMEOUT", code or "timeout", text or str(e))
 
         if _is_invalid_creds(code, text):
             return False, _marker("ACCOUNT_INVALID_CREDENTIALS", code, text)
@@ -472,7 +503,9 @@ def _send_batch_sync(
                     code, text = _extract_code_text_from_exception(e)
 
                     if _is_proxy_error(e, text):
-                        results.append((False, _marker("PROXY_ERROR", code or "timeout", text or str(e))))
+                        results.append((False, _marker("PROXY_ERROR", code or "socks", text or str(e))))
+                    elif _is_smtp_timeout_text(text or str(e)):
+                        results.append((False, _marker("SMTP_TIMEOUT", code or "timeout", text or str(e))))
                     elif _is_invalid_creds(code, text):
                         results.append((False, _marker("ACCOUNT_INVALID_CREDENTIALS", code, text)))
                     elif _is_web_login_required(text):

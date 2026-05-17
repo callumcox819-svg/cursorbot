@@ -17,7 +17,8 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 _ERROR_HINTS = {
-    "PROXY_ERROR": "Прокси / таймаут SMTP (проверьте SOCKS5 в «Прокси»)",
+    "PROXY_ERROR": "Ошибка SOCKS5-прокси (проверьте логин/порт в «Прокси»)",
+    "SMTP_TIMEOUT": "Таймаут SMTP через прокси — попробуйте другой прокси или увеличьте SMTP_TIMEOUT_SEC",
     "ACCOUNT_INVALID_CREDENTIALS": "Неверный пароль почты (нужен пароль приложения)",
     "ACCOUNT_WEB_LOGIN_REQUIRED": "Gmail просит войти в браузере — разблокируйте аккаунт",
     "ACCOUNT_RATE_LIMIT": "Лимит отправки Gmail — сделайте паузу или смените аккаунт",

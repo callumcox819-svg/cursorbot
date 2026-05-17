@@ -69,32 +69,28 @@ def _test_socks5_connect_sync(d: dict[str, Any], *, timeout: int = 12) -> Tuple[
     username = (d.get("username") or "").strip() or None
     password = (d.get("password") or "").strip() or None
 
-    targets = (("smtp.gmail.com", 587), ("httpbin.org", 80))
-    last_err = ""
-
-    for thost, tport in targets:
-        s = socks.socksocket()
+    # Только SMTP :587 — как рассылка. httpbin часто блокируют, не используем для статуса.
+    thost, tport = "smtp.gmail.com", 587
+    s = socks.socksocket()
+    try:
+        s.set_proxy(
+            socks.SOCKS5,
+            host,
+            port,
+            username=username,
+            password=password,
+            rdns=True,
+        )
+        s.settimeout(float(timeout))
+        s.connect((thost, int(tport)))
+        return True, f"SOCKS5 OK -> {thost}:{tport}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
         try:
-            s.set_proxy(
-                socks.SOCKS5,
-                host,
-                port,
-                username=username,
-                password=password,
-                rdns=True,
-            )
-            s.settimeout(float(timeout))
-            s.connect((thost, int(tport)))
-            return True, f"SOCKS5 OK -> {thost}:{tport}"
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-        finally:
-            try:
-                s.close()
-            except Exception:
-                pass
-
-    return False, last_err or "SOCKS5 connect failed"
+            s.close()
+        except Exception:
+            pass
 
 
 async def _test_socks5_handshake(proxy: Proxy | dict[str, Any], *, timeout: int = 12) -> Tuple[bool, str]:
@@ -121,8 +117,7 @@ async def test_smtp_tunnel(proxy: Proxy | dict[str, Any], *, timeout: int = 20) 
 
 async def test_proxy(proxy: Proxy | dict[str, Any], *, timeout: int = 20) -> Tuple[bool, str]:
     """
-    Только SOCKS5. Для рассылки решающий тест — SMTP :587 (как /send).
-    SOCKS5-handshake — дополнительная диагностика (PySocks, не aiohttp).
+    Только SOCKS5. Статус «рабочий» — только если SMTP :587 проходит (как /send).
     """
     d = proxy_to_dict(proxy)
     ptype = normalize_proxy_type(d.get("type"))
@@ -130,21 +125,16 @@ async def test_proxy(proxy: Proxy | dict[str, Any], *, timeout: int = 20) -> Tup
     if not is_socks5_type(ptype):
         return False, "Только SOCKS5. HTTP/HTTPS не поддерживаются для рассылки."
 
-    smtp_timeout = max(12, int(timeout))
-    socks_timeout = max(8, min(smtp_timeout, 15))
-
+    smtp_timeout = max(18, int(timeout))
     smtp_ok, smtp_info = await test_smtp_tunnel(proxy, timeout=smtp_timeout)
-    socks_ok, socks_info = await _test_socks5_handshake(proxy, timeout=socks_timeout)
-
-    # Рассылка идёт через PySocks→SMTP — если SMTP OK, прокси рабочий.
     if smtp_ok:
-        if socks_ok:
-            return True, f"{smtp_info} · {socks_info}"
         return True, smtp_info
 
+    socks_timeout = max(10, min(smtp_timeout, 18))
+    socks_ok, socks_info = await _test_socks5_handshake(proxy, timeout=socks_timeout)
     if socks_ok:
-        return False, f"SOCKS подключается, SMTP нет: {smtp_info}"
-    return False, f"SOCKS: {socks_info} · SMTP: {smtp_info}"
+        return False, f"Туннель до SMTP есть, но EHLO не прошёл: {smtp_info}"
+    return False, f"SMTP: {smtp_info} · туннель: {socks_info}"
 
 
 async def test_proxy_url(proxy_url: str, *, timeout: int = 20) -> Tuple[bool, str]:

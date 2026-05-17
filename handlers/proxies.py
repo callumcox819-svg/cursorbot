@@ -743,8 +743,8 @@ async def proxies_check_all(callback: CallbackQuery) -> None:
     try:
         await callback.message.edit_text(
             f"⏳ <b>Проверяю {len(proxies)} прокси…</b>\n\n"
-            "<i>SOCKS5 (httpbin) + SMTP smtp.gmail.com:587\n"
-            "Не нажимайте кнопку повторно — займёт до ~30 сек.</i>",
+            "<i>SOCKS5 → SMTP smtp.gmail.com:587 (как при рассылке)\n"
+            "Не нажимайте кнопку повторно — займёт до ~45 сек.</i>",
             parse_mode="HTML",
         )
     except TelegramBadRequest:
@@ -752,7 +752,7 @@ async def proxies_check_all(callback: CallbackQuery) -> None:
 
     async def _run_bulk_check() -> None:
         concurrency = max(1, min(3, int(os.getenv("PROXY_CHECK_CONCURRENCY", "2"))))
-        check_timeout = max(12, min(25, int(os.getenv("PROXY_CHECK_TIMEOUT", "22"))))
+        check_timeout = max(18, min(40, int(os.getenv("PROXY_CHECK_TIMEOUT", "30"))))
         ok_n = fail_n = 0
         try:
             async with Session() as session:
