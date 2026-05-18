@@ -115,6 +115,33 @@ async def test_smtp_tunnel(proxy: Proxy | dict[str, Any], *, timeout: int = 20) 
     return await test_smtp_tunnel_async(row, timeout=timeout)
 
 
+def classify_proxy_check_result(ok: bool, info: str) -> bool | None:
+    """
+    True = рабочий, False = точно мёртв (SOCKS), None = неизвестно (таймаут/сеть) — не красить в UI.
+    """
+    if ok:
+        return True
+    t = (info or "").lower()
+    if "timeout" in t or "timed out" in t or "заняла слишком" in t:
+        return None
+    definite_dead = (
+        "generalproxyerror",
+        "socks",
+        "authentication failed",
+        "0x05",
+        "network is unreachable",
+        "getaddrinfo failed",
+        "connection refused",
+        "host/port пуст",
+        "только socks5",
+    )
+    if any(x in t for x in definite_dead):
+        return False
+    if "туннель до smtp есть" in t:
+        return None
+    return None
+
+
 async def test_proxy(proxy: Proxy | dict[str, Any], *, timeout: int = 20) -> Tuple[bool, str]:
     """
     Только SOCKS5. Статус «рабочий» — только если SMTP :587 проходит (как /send).
@@ -197,8 +224,8 @@ async def refresh_proxies_status(
         row = await session.get(Proxy, int(p.id))
         if not row:
             continue
-        row.is_active = bool(ok)
-        row.last_error = None if ok else info
+        row.is_active = classify_proxy_check_result(ok, info)
+        row.last_error = None if ok else (info or "")[:500]
         if ok:
             ok_n += 1
         else:

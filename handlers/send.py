@@ -443,16 +443,20 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 pass
             return
 
-        proxy_check = await choose_proxy_for_user(session, db_user_id)
-        if not proxy_check:
+        from proxy_manager import is_socks5_proxy
+
+        all_proxies = (
+            await session.execute(select(Proxy).where(Proxy.user_id == int(db_user_id)))
+        ).scalars().all()
+        socks_n = sum(1 for p in all_proxies if is_socks5_proxy(p))
+        if socks_n <= 0:
             state.is_running = False
-            state.last_error = "PROXY_ERROR|no_active_proxy|No active proxy"
+            state.last_error = "PROXY_ERROR|no_active_proxy|No SOCKS5 configured"
             set_sending_state(tg_user_id, state=state)
             try:
                 await bot.send_message(
                     chat_id,
-                    "❌ Рассылка остановлена: нет рабочего SOCKS5.\n"
-                    "«Прокси» → проверьте или добавьте socks5://…",
+                    "❌ Рассылка остановлена: нет SOCKS5 в «Прокси».",
                 )
             except Exception:
                 pass

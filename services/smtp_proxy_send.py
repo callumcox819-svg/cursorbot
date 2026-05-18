@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models import EmailAccount, Proxy
 from proxy_manager import ProxySMTPContext, is_socks5_proxy
 from services.sender import (
-    is_definite_proxy_failure,
     is_smtp_timeout_error,
     normalize_send_error,
     send_batch_via_account,
@@ -59,12 +58,11 @@ async def choose_required_proxy(
 
 
 async def _list_active_socks5_proxies(session: AsyncSession, user_id: int) -> List[Proxy]:
-    active_cond = sa_or(Proxy.is_active.is_(True), Proxy.is_active.is_(None))
+    """Все SOCKS5 пользователя; «красные» в UI не исключаем из рассылки."""
     rows = (
         await session.execute(
             sa_select(Proxy)
             .where(Proxy.user_id == int(user_id))
-            .where(active_cond)
             .order_by(Proxy.id)
         )
     ).scalars().all()
@@ -77,6 +75,15 @@ async def _list_active_socks5_proxies(session: AsyncSession, user_id: int) -> Li
             if t and not t.startswith("socks"):
                 continue
         out.append(p)
+
+    def _pref_key(px: Proxy) -> int:
+        if px.is_active is True:
+            return 0
+        if px.is_active is None:
+            return 1
+        return 2
+
+    out.sort(key=_pref_key)
     return out
 
 
@@ -167,7 +174,7 @@ async def send_email_via_account_with_proxy(
                 session,
                 pid,
                 (err or "")[:500],
-                deactivate=is_definite_proxy_failure(err),
+                deactivate=False,
             )
         except Exception:
             pass
@@ -250,7 +257,7 @@ async def send_batch_via_account_with_proxy(
                 session,
                 pid,
                 (last_err or "batch fail")[:500],
-                deactivate=is_definite_proxy_failure(last_err or ""),
+                deactivate=False,
             )
         except Exception:
             pass

@@ -110,20 +110,15 @@ async def choose_proxy_for_user(
             ).scalars().all()
         )
         skip = exclude_ids or set()
-        items = [
-            p
-            for p in all_rows
-            if _smtp_eligible(p)
-            and (p.is_active is True or p.is_active is None)
-            and int(p.id) not in skip
-        ]
+        eligible = [p for p in all_rows if _smtp_eligible(p) and int(p.id) not in skip]
+        preferred = [p for p in eligible if p.is_active is not False]
+        items = preferred if preferred else eligible
         if not items:
             logger.warning(
-                "no SMTP proxy for user_id=%s total=%s eligible=%s active_eligible=%s",
+                "no SMTP proxy for user_id=%s total=%s eligible=%s",
                 user_id,
                 len(all_rows),
                 sum(1 for p in all_rows if _smtp_eligible(p)),
-                0,
             )
             return None
         if len(items) == 1:

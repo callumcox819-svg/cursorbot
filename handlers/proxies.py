@@ -21,7 +21,7 @@ from sqlalchemy import select
 
 from database import Session
 from models import User, Proxy
-from services.proxy_verify import test_proxy, refresh_proxies_status
+from services.proxy_verify import classify_proxy_check_result, test_proxy, refresh_proxies_status
 from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 
 router = Router()
@@ -379,16 +379,31 @@ def parse_proxy_block(text: str) -> Optional[dict]:
 #  Меню
 # ======================
 
-def _proxy_is_active(p: Proxy) -> bool:
-    """Как в choose_proxy_for_user: NULL = активен (legacy)."""
-    return p.is_active is True or p.is_active is None
+def _proxy_status_emoji(p: Proxy) -> str:
+    if p.is_active is True:
+        return "🟢"
+    if p.is_active is False:
+        return "🔴"
+    return "🟡"
+
+
+def _proxy_counts(proxies: List[Proxy]) -> tuple[int, int, int]:
+    ok = unk = bad = 0
+    for p in proxies:
+        if p.is_active is True:
+            ok += 1
+        elif p.is_active is False:
+            bad += 1
+        else:
+            unk += 1
+    return ok, unk, bad
 
 
 def proxies_menu(proxies: List[Proxy]) -> InlineKeyboardMarkup:
     rows = []
 
     for p in proxies:
-        status = "🟢" if _proxy_is_active(p) else "🔴"
+        status = _proxy_status_emoji(p)
         ptype = (p.type or "socks5").lower()
         text = f"{status} {ptype} {p.host}:{p.port}"
 
@@ -425,12 +440,14 @@ async def render_proxy_menu(message_or_cb, telegram_id: int):
             )
             proxies = list(result.scalars())
 
+    ok_n, unk_n, bad_n = _proxy_counts(proxies)
     text = (
         "🧩 <b>Твои прокси</b>\n\n"
         f"Всего: {len(proxies)}\n"
-        f"Рабочих (SOCKS5+SMTP): {sum(1 for p in proxies if _proxy_is_active(p))}\n"
-        f"Плохих: {sum(1 for p in proxies if not _proxy_is_active(p))}\n"
-        f"<i>Только SOCKS5 · проверка: туннель + smtp.gmail.com:587</i>"
+        f"🟢 проверены OK: {ok_n} · 🟡 не проверены: {unk_n} · 🔴 ошибка проверки: {bad_n}\n\n"
+        "<i>Рассылка использует все SOCKS5 (и 🟡, и 🔴). "
+        "Красный = не прошёл последний тест, не обязательно мёртв.</i>\n"
+        "<i>Проверка: туннель + smtp.gmail.com:587</i>"
     )
 
     kb = proxies_menu(proxies)
@@ -451,7 +468,31 @@ async def open_proxies(callback: CallbackQuery):
         await callback.answer()
     except TelegramBadRequest:
         pass
-    await render_proxy_menu(callback, callback.from_user.id)
+    telegram_id = callback.from_user.id
+    await render_proxy_menu(callback, telegram_id)
+
+    async with Session() as session:
+        user = (
+            await session.execute(select(User).where(User.telegram_id == telegram_id))
+        ).scalar_one_or_none()
+        if not user:
+            return
+        proxies = list(
+            (await session.execute(select(Proxy).where(Proxy.user_id == user.id))).scalars().all()
+        )
+    if not proxies:
+        return
+    _, _, bad_n = _proxy_counts(proxies)
+    if bad_n == len(proxies) and not _proxy_bulk_check_tasks.get(telegram_id):
+        try:
+            await callback.message.answer(
+                "ℹ️ Все прокси помечены 🔴 — запускаю автопроверку…",
+                parse_mode="HTML",
+            )
+        except TelegramBadRequest:
+            pass
+        fake_cb = callback
+        asyncio.create_task(_auto_check_all_proxies(fake_cb, telegram_id))
 
 
 # ======================
@@ -603,7 +644,7 @@ async def _proxy_add_work(
                 username=parsed.get("username"),
                 password=parsed.get("password"),
                 type="socks5",
-                is_active=ok,
+                is_active=classify_proxy_check_result(ok, info or ""),
                 last_error=None if ok else info,
             )
 
@@ -707,6 +748,38 @@ async def proxy_delete(callback: CallbackQuery):
 # ======================
 #  Ручной тест прокси
 # ======================
+
+async def _auto_check_all_proxies(callback: CallbackQuery, telegram_id: int) -> None:
+    """Фоновая проверка (в т.ч. при входе в меню, если все 🔴)."""
+    existing = _proxy_bulk_check_tasks.get(telegram_id)
+    if existing and not existing.done():
+        return
+
+    async def _run_bulk_check() -> None:
+        concurrency = max(1, min(3, int(os.getenv("PROXY_CHECK_CONCURRENCY", "2"))))
+        check_timeout = max(18, min(40, int(os.getenv("PROXY_CHECK_TIMEOUT", "30"))))
+        try:
+            async with Session() as session:
+                user = (
+                    await session.execute(select(User).where(User.telegram_id == telegram_id))
+                ).scalar_one_or_none()
+                if not user:
+                    return
+                await refresh_proxies_status(
+                    session,
+                    int(user.id),
+                    concurrency=concurrency,
+                    timeout=check_timeout,
+                )
+            await render_proxy_menu(callback, telegram_id)
+        except Exception:
+            logger.exception("auto proxy check failed for user %s", telegram_id)
+        finally:
+            _proxy_bulk_check_tasks.pop(telegram_id, None)
+
+    task = asyncio.create_task(_run_bulk_check())
+    _proxy_bulk_check_tasks[telegram_id] = task
+
 
 @router.callback_query(F.data == "proxies_check_all")
 async def proxies_check_all(callback: CallbackQuery) -> None:
@@ -841,7 +914,7 @@ async def proxy_test(callback: CallbackQuery):
         async with Session() as session2:
             proxy_db = await session2.get(Proxy, proxy_id)
             if proxy_db:
-                proxy_db.is_active = ok
+                proxy_db.is_active = classify_proxy_check_result(ok, info or "")
                 proxy_db.last_error = None if ok else info
                 await session2.commit()
 
