@@ -30,15 +30,39 @@ def offer_fingerprint(item: dict[str, Any]) -> str:
     return f"t:{title}|n:{name}"
 
 
+def _title_from_item_dict(item: dict[str, Any]) -> str:
+    """Название товара из VOID/парсера — разные ключи и вложенный void."""
+    if not isinstance(item, dict):
+        return ""
+    for key in (
+        "item_title",
+        "title",
+        "product_title",
+        "ad_title",
+        "offer_title",
+        "name_title",
+    ):
+        v = item.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    void = item.get("void")
+    if isinstance(void, dict):
+        t = _title_from_item_dict(void)
+        if t:
+            return t
+    return ""
+
+
 def fields_from_item(item: dict[str, Any]) -> dict[str, str]:
     return {
         "person_name": str(
             item.get("item_person_name")
             or item.get("person_name")
+            or item.get("seller_name")
             or item.get("name")
             or ""
         ).strip(),
-        "title": str(item.get("item_title") or item.get("title") or "").strip(),
+        "title": _title_from_item_dict(item),
         "price": str(item.get("item_price") or item.get("price") or "").strip(),
         "link": str(item.get("item_link") or item.get("link") or item.get("url") or "").strip(),
         "photo": str(
@@ -85,7 +109,10 @@ def offer_effective_title(offer: Offer | None) -> str:
     if t:
         return t
     raw = parse_offer_raw(getattr(offer, "raw_json", None))
-    return _first_raw_str(raw, ("item_title", "title"))
+    return _first_raw_str(
+        raw,
+        ("item_title", "title", "product_title", "ad_title", "offer_title"),
+    )
 
 
 async def find_offer_by_link(session, *, user_id: int, ad_url: str) -> Offer | None:

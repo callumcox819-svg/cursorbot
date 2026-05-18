@@ -160,7 +160,9 @@ async def _build_message_for_target(session: AsyncSession, tg_user_id: int, tgt:
 
     offer: Offer | None = getattr(tgt, "offer", None)
 
-    item_title = (getattr(offer, "title", "") or "").strip()
+    from services.offer_storage import offer_effective_title
+
+    item_title = offer_effective_title(offer)
     price = (getattr(offer, "price", "") or "").strip()
     link = (getattr(offer, "link", "") or "").strip()
     image_url = (getattr(offer, "photo", "") or "").strip()

@@ -199,8 +199,14 @@ def _normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             y["name"] = norm
             y["person_name"] = norm
 
-        # подстрахуем поля под наш pipeline
-        if "title" not in y and isinstance(x.get("item_title"), str):
+        # подстрахуем поля под наш pipeline (VOID: item_title / title / вложенный void)
+        from services.offer_storage import _title_from_item_dict
+
+        t = _title_from_item_dict(x)
+        if t:
+            y["item_title"] = t
+            y["title"] = t
+        elif "title" not in y and isinstance(x.get("item_title"), str):
             y["title"] = x["item_title"]
         if "link" not in y and isinstance(x.get("item_link"), str):
             y["link"] = x["item_link"]
