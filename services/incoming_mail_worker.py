@@ -823,6 +823,15 @@ async def _find_offer_if_unique_email(
     ).scalars().first()
 
 
+async def _pin_conversation_offer(session, conv, offer: Offer) -> None:
+    if not conv or not offer:
+        return
+    conv.pinned_offer_id = int(offer.id)
+    lk = (offer.link or "").strip()
+    if lk:
+        conv.ad_url = lk
+
+
 async def resolve_offer_for_mail_card(
     session,
     *,
@@ -835,21 +844,58 @@ async def resolve_offer_for_mail_card(
     from_name: str = "",
     body_text: str = "",
 ) -> Offer | None:
-    """Объявление для карточки/GAG: ad_url диалога → resolved_offer_id → скоринг письма → единственный email."""
+    """Карточка/GAG: тема письма → ссылка этого письма → pin/ЧС → resolved_offer_id → скоринг."""
+    from services.offer_matching import resolve_best_offer_by_subject
     from services.offer_storage import find_offer_by_link
+    from services.seller_blacklist import is_seller_blacklisted
 
-    url = (ad_url or "").strip()
-    if not url and (inbox_email or "").strip() and (from_email or "").strip():
+    strict = await is_seller_blacklisted(session, int(user_id), from_email)
+    conv = None
+    if (inbox_email or "").strip() and (from_email or "").strip():
         conv = await _load_convlink(
             user_id=int(user_id),
             inbox_email=_canon_email(inbox_email or ""),
             contact_email=_canon_email(from_email or ""),
         )
-        if conv and (conv.ad_url or "").strip():
-            url = (conv.ad_url or "").strip()
 
-    if url:
-        off = await find_offer_by_link(session, user_id=int(user_id), ad_url=url)
+    if strict and conv and getattr(conv, "pinned_offer_id", None):
+        off = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.id == int(conv.pinned_offer_id))
+                .where(Offer.user_id == int(user_id))
+                .limit(1)
+            )
+        ).scalars().first()
+        if off:
+            return off
+
+    # 1) Тема письма — главный сигнал при нескольких лотах у одного продавца
+    off_subj = await resolve_best_offer_by_subject(
+        session,
+        user_id=int(user_id),
+        from_email=from_email,
+        subject=subject,
+        from_name=from_name,
+        body_text=body_text,
+    )
+    if off_subj:
+        if strict and conv:
+            await _pin_conversation_offer(session, conv, off_subj)
+        return off_subj
+
+    mail_url = (ad_url or "").strip()
+    if mail_url:
+        off = await find_offer_by_link(session, user_id=int(user_id), ad_url=mail_url)
+        if off:
+            if strict and conv:
+                await _pin_conversation_offer(session, conv, off)
+            return off
+
+    if not strict and conv and (conv.ad_url or "").strip():
+        off = await find_offer_by_link(
+            session, user_id=int(user_id), ad_url=(conv.ad_url or "").strip()
+        )
         if off:
             return off
 
@@ -883,6 +929,8 @@ async def resolve_offer_for_mail_card(
             )
         ).scalars().first()
         if off:
+            if strict and conv:
+                await _pin_conversation_offer(session, conv, off)
             return off
 
     return await _find_offer_if_unique_email(session, user_id=int(user_id), from_email=from_email)
@@ -1132,14 +1180,38 @@ async def _process_mails_for_account_impl(
             mail_db_id: int | None = None
             try:
                 async with _imap_db_session() as session:
-                    resolved_offer_id, resolved_offer_email_id = await _resolve_offer_for_incoming(
-                        session,
-                        user_id=user_id,
-                        from_email=from_email_clean,
-                        subject=subject or "",
-                        from_name=from_name or "",
-                        body_text=body_clean or "",
+                    from services.offer_matching import (
+                        list_offers_for_seller_email,
+                        resolve_best_offer_by_subject,
                     )
+
+                    offers_for_seller = await list_offers_for_seller_email(
+                        session,
+                        user_id=int(user_id),
+                        from_email=from_email_clean,
+                    )
+                    off_subj = None
+                    if len(offers_for_seller) > 1:
+                        off_subj = await resolve_best_offer_by_subject(
+                            session,
+                            user_id=int(user_id),
+                            from_email=from_email_clean,
+                            subject=subject or "",
+                            from_name=from_name or "",
+                            body_text=body_clean or "",
+                        )
+                    if off_subj:
+                        resolved_offer_id = int(off_subj.id)
+                        resolved_offer_email_id = None
+                    else:
+                        resolved_offer_id, resolved_offer_email_id = await _resolve_offer_for_incoming(
+                            session,
+                            user_id=user_id,
+                            from_email=from_email_clean,
+                            subject=subject or "",
+                            from_name=from_name or "",
+                            body_text=body_clean or "",
+                        )
 
                     existing = (
                         await session.execute(

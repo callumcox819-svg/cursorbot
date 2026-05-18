@@ -349,6 +349,14 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
         if not domains:
             return await status_msg.edit_text("❌ У тебя нет доменов.")
 
+    async with Session() as session:
+        user_bl = await get_or_create_user(session, tg_id)
+        from services.seller_blacklist import list_seller_blacklist, load_seller_email_offer_map
+
+        bl_rows = await list_seller_blacklist(session, int(user_bl.id))
+        bl_emails = {str(r.seller_email or "").strip().lower() for r in bl_rows if r.seller_email}
+        email_map = await load_seller_email_offer_map(session, int(user_bl.id))
+
     cfg = ValidationConfig(
         validemail_api_keys=api_keys,
         validation_url=config.VALIDEMAIL_URL,
@@ -357,6 +365,8 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
         require_first_and_last=REQUIRE_FIRST_AND_LAST,
         max_len=40,
         min_len=MIN_NAME_TOKEN_LEN,
+        seller_blacklist_emails=bl_emails,
+        seller_email_links=email_map,
     )
 
     live_stats: dict = {"offers_total": total_offers}
@@ -430,8 +440,22 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
     validated_count = len(validated or [])
     eligible = int(live_stats.get("offers_eligible") or 0)
 
+    pending_bl = live_stats.get("pending_seller_bl") or set()
+
     async with Session() as session:
         user = await get_or_create_user(session, tg_id)
+
+        if pending_bl:
+            from services.seller_blacklist import add_seller_blacklist
+
+            for em in sorted(pending_bl):
+                await add_seller_blacklist(
+                    session,
+                    int(user.id),
+                    str(em),
+                    note="авто: тот же продавец, другой лот",
+                )
+            await session.commit()
 
         if REPLACE_OLD_FOR_USER:
             offer_ids = [

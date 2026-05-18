@@ -1348,9 +1348,24 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
         inbox_email = _canon_email(mail.account_email or "")
         contact_email = _canon_email(mail.from_email or "")
 
+        # Сначала оффер по теме письма (не «последний лот» продавца)
+        offer = await resolve_offer_for_mail_card(
+            session,
+            user_id=int(tg_user.id),
+            from_email=contact_email,
+            resolved_offer_id=getattr(mail, "resolved_offer_id", None),
+            ad_url=(getattr(mail, "ad_url", "") or "").strip() or None,
+            inbox_email=inbox_email,
+            subject=(getattr(mail, "subject", "") or ""),
+            from_name=(getattr(mail, "from_name", "") or ""),
+            body_text=(getattr(mail, "body", "") or ""),
+        )
+        if offer:
+            mail.resolved_offer_id = int(offer.id)
+
         # Resolve url (ad_url) строго из БД (по ТЗ: не ищем ссылку в теле письма)
         delays = [0.0, 0.6, 1.2, 2.0]
-        url = ""
+        url = (offer.link or "").strip() if offer else ""
         reasons: list[str] = []
 
         for d in delays:
@@ -1469,22 +1484,7 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
             await callback.answer()
             return
 
-        offer_id = None
-        mail_ad = (getattr(mail, "ad_url", "") or "").strip() or url
-        offer = await resolve_offer_for_mail_card(
-            session,
-            user_id=int(tg_user.id),
-            from_email=contact_email,
-            resolved_offer_id=getattr(mail, "resolved_offer_id", None),
-            ad_url=mail_ad,
-            inbox_email=inbox_email,
-            subject=(getattr(mail, "subject", "") or ""),
-            from_name=(getattr(mail, "from_name", "") or ""),
-            body_text=(getattr(mail, "body", "") or ""),
-        )
-        if offer:
-            mail.resolved_offer_id = int(offer.id)
-            offer_id = int(offer.id)
+        offer_id = int(offer.id) if offer else None
 
         offer_title = offer_effective_title(offer) or None
         offer_image = offer_effective_photo(offer) or None
@@ -1671,7 +1671,36 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
         if not owner_user_id:
             return await callback.answer("Аккаунт не найден в БД", show_alert=True)
 
-        url, reasons = await _get_ad_url_db_with_retries(session, owner_user_id=owner_user_id)
+        mail_pre = (
+            await session.execute(
+                sa_select(IncomingMail)
+                .where(IncomingMail.account_id == int(acc_id))
+                .where(IncomingMail.imap_uid == int(uid))
+                .where(IncomingMail.user_id == int(owner_user_id))
+                .limit(1)
+            )
+        ).scalars().first()
+
+        subj_pre = (getattr(mail_pre, "subject", "") or meta.get("subject") or "").strip()
+        offer_pre = await resolve_offer_for_mail_card(
+            session,
+            user_id=int(owner_user_id),
+            from_email=contact_email,
+            resolved_offer_id=getattr(mail_pre, "resolved_offer_id", None) if mail_pre else None,
+            ad_url=(getattr(mail_pre, "ad_url", "") or "").strip() if mail_pre else None,
+            inbox_email=inbox_email,
+            subject=subj_pre,
+            from_name=(getattr(mail_pre, "from_name", "") or meta.get("from_name") or "").strip(),
+            body_text=(getattr(mail_pre, "body", "") or "").strip() if mail_pre else "",
+        )
+        if offer_pre and mail_pre:
+            mail_pre.resolved_offer_id = int(offer_pre.id)
+
+        url = (offer_pre.link or "").strip() if offer_pre else ""
+        if not url:
+            url, reasons = await _get_ad_url_db_with_retries(session, owner_user_id=owner_user_id)
+        else:
+            reasons = []
 
         if not url:
             reason_text = "\n".join([f"• { _e(r) }" for r in (reasons or ["не удалось получить ссылку из БД"])])
@@ -1713,34 +1742,9 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
             await callback.message.answer("❌ Профиль GAG не заполнен. Открой 👤 Профиль → ➕ Создать профиль.")
             return await callback.answer()
 
-        offer_id = None
-        mail = (
-            await session.execute(
-                sa_select(IncomingMail)
-                .where(IncomingMail.account_id == int(acc_id))
-                .where(IncomingMail.imap_uid == int(uid))
-                .where(IncomingMail.user_id == int(owner_user_id))
-                .limit(1)
-            )
-        ).scalars().first()
-
-        offer = None
-        if mail:
-            mail_ad = (getattr(mail, "ad_url", "") or "").strip() or url
-            offer = await resolve_offer_for_mail_card(
-                session,
-                user_id=int(owner_user_id),
-                from_email=contact_email,
-                resolved_offer_id=getattr(mail, "resolved_offer_id", None),
-                ad_url=mail_ad,
-                inbox_email=inbox_email,
-                subject=(getattr(mail, "subject", "") or ""),
-                from_name=(getattr(mail, "from_name", "") or ""),
-                body_text=(getattr(mail, "body", "") or ""),
-            )
-            if offer:
-                mail.resolved_offer_id = int(offer.id)
-                offer_id = int(offer.id)
+        mail = mail_pre
+        offer = offer_pre
+        offer_id = int(offer.id) if offer else None
 
         offer_title = offer_effective_title(offer) or None
         offer_image = offer_effective_photo(offer) or None

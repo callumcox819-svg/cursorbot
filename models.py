@@ -59,6 +59,7 @@ class User(Base):
     offers = relationship("Offer", back_populates="user", cascade="all, delete-orphan")
     quick_templates = relationship("QuickTemplate", back_populates="user", cascade="all, delete-orphan")
     conversation_links = relationship("ConversationLink", back_populates="user", cascade="all, delete-orphan")
+    seller_blacklist = relationship("SellerBlacklist", back_populates="user", cascade="all, delete-orphan")
     lines = relationship("Line", back_populates="user", cascade="all, delete-orphan")
 
 
@@ -285,10 +286,29 @@ class ConversationLink(Base):
     # ✅ ТЗ: чтобы повторные письма от одного продавца крепились к первому сообщению в TG.
     # Храним message_id первого сообщения (pin/anchor).
     tg_message_id = Column(BigInteger, nullable=True)
+    # Для продавцов из ЧС: закреплённое объявление по диалогу (не путать разные лоты).
+    pinned_offer_id = Column(ForeignKey("offers.id", ondelete="SET NULL"), nullable=True, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="conversation_links")
+
+
+class SellerBlacklist(Base):
+    """Личный ЧС продавцов: для них матч только по теме письма + закрепление оффера."""
+
+    __tablename__ = "seller_blacklist"
+    __table_args__ = (
+        UniqueConstraint("user_id", "seller_email", name="uq_seller_blacklist_user_email"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    seller_email = Column(String, nullable=False, index=True)
+    note = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="seller_blacklist")
 
 
 # =========================

@@ -135,6 +135,16 @@ async def _ensure_offers_raw_json_column() -> None:
         await conn.execute(text("ALTER TABLE offers ADD COLUMN IF NOT EXISTS raw_json TEXT"))
 
 
+async def _ensure_conversation_links_pinned_offer_id_column() -> None:
+    if engine.dialect.name != "postgresql":
+        return
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("ALTER TABLE conversation_links ADD COLUMN IF NOT EXISTS pinned_offer_id INTEGER")
+        )
+
+
 async def _ensure_conversation_links_tg_message_id_column() -> None:
     """Автомиграция: добавляем conversation_links.tg_message_id если её нет.
 
@@ -195,3 +205,8 @@ async def init_db() -> None:
         await _ensure_offers_raw_json_column()
     except Exception as e:
         log.error("Failed offers.raw_json migration: %s", e)
+
+    try:
+        await _ensure_conversation_links_pinned_offer_id_column()
+    except Exception as e:
+        log.error("Failed conversation_links.pinned_offer_id migration: %s", e)

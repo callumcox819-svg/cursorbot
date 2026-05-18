@@ -51,6 +51,33 @@ def _canon_email(email: str) -> str:
     return f"{local}@{domain}"
 
 
+def canon_seller_email(email: str) -> str:
+    return _canon_email(email)
+
+
+_SUBJECT_STOP = frozenset(
+    {
+        "re",
+        "aw",
+        "fw",
+        "fwd",
+        "the",
+        "und",
+        "der",
+        "die",
+        "das",
+        "for",
+        "von",
+        "from",
+    }
+)
+
+
+def _subject_tokens(subj: str) -> list[str]:
+    parts = re.findall(r"[a-z0-9]{3,}", (subj or "").lower())
+    return [p for p in parts if p not in _SUBJECT_STOP]
+
+
 def score_offer(
     off: Offer,
     *,
@@ -260,3 +287,125 @@ async def resolve_offer_for_incoming(
     if best_offer_id is not None and best_score >= min_score:
         return best_offer_id, best_email_id
     return None, None
+
+
+def subject_match_score(subject: str, off: Offer) -> float:
+    """Сильный матч темы письма к названию оффера (для продавцов с несколькими лотами)."""
+    from services.offer_storage import offer_effective_title
+
+    subj = _norm_subject(subject)
+    if len(subj) < 6:
+        return 0.0
+    title = offer_effective_title(off).lower()
+    if not title:
+        return 0.0
+
+    score = 75.0 * _ratio(subj, title)
+    if subj.lower() in title or title in subj.lower():
+        score += 55.0
+
+    subj_l = subj.lower()
+    title_l = title.lower()
+    for tok in _subject_tokens(subj):
+        if tok in title_l:
+            score += 24.0
+
+    wants_set = any(w in subj_l for w in ("komplette", "complet", "complete", "set "))
+    if wants_set:
+        if any(w in title_l for w in ("komplette", "complet", "complete", "set")):
+            score += 45.0
+        if any(w in title_l for w in ("sticker", "valverde", "extra sticker")) and not any(
+            w in title_l for w in ("komplette", "complet", "set")
+        ):
+            score -= 50.0
+
+    return score
+
+
+async def list_offers_for_seller_email(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+) -> list[Offer]:
+    fe_raw = (from_email or "").strip().lower()
+    fe_can = _canon_email(fe_raw)
+    if not fe_can:
+        return []
+
+    conds = []
+    if fe_raw:
+        conds.append(func.lower(OfferEmail.email) == fe_raw)
+    if fe_can and "@" in fe_can:
+        conds.append(func.lower(OfferEmail.email) == fe_can)
+        local_can, domain_can = fe_can.split("@", 1)
+        if domain_can in ("gmail.com", "googlemail.com"):
+            conds.append(
+                func.replace(func.lower(OfferEmail.email), ".", "") == fe_can.replace(".", "")
+            )
+
+    if not conds:
+        return []
+
+    rows = (
+        await session.execute(
+            sa_select(Offer)
+            .join(OfferEmail, OfferEmail.offer_id == Offer.id)
+            .where(Offer.user_id == int(user_id))
+            .where(sa_or(*conds))
+            .order_by(Offer.id.desc())
+        )
+    ).scalars().all()
+
+    seen: set[int] = set()
+    out: list[Offer] = []
+    for off in rows:
+        oid = int(off.id)
+        if oid in seen:
+            continue
+        seen.add(oid)
+        out.append(off)
+    return out
+
+
+async def resolve_best_offer_by_subject(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+    subject: str,
+    from_name: str = "",
+    body_text: str = "",
+) -> Offer | None:
+    offers = await list_offers_for_seller_email(session, user_id=int(user_id), from_email=from_email)
+    if not offers:
+        return None
+
+    subj = _norm_subject(subject)
+    if len(subj) < 8 and len(_subject_tokens(subj)) < 2:
+        return None
+
+    best: Offer | None = None
+    best_sc = -1.0
+    multi = len(offers) > 1
+
+    for off in offers:
+        sc = subject_match_score(subject, off)
+        sc += (
+            score_offer(
+                off,
+                subject=subject,
+                from_name=from_name,
+                body_text=body_text,
+                email_hit=False,
+            )
+            * 0.3
+        )
+        if sc > best_sc:
+            best_sc = sc
+            best = off
+
+    min_sc = 58.0 if multi else 42.0
+    if best is not None and best_sc >= min_sc:
+        return best
+    return None
