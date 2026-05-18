@@ -194,10 +194,11 @@ async def _collect_db_stats(tg_user_id: int) -> tuple[int, int, int, int]:
 async def cmd_imap_diag(message: Message) -> None:
     """Проверка: жив ли IMAP-воркер и есть ли входящие в БД."""
     tg_user_id = message.from_user.id
+    wait_msg = await message.answer("⏳ Смотрю IMAP и входящие в БД…")
     from services.incoming_mail_worker import incoming_mail_diag_snapshot
 
     snap = incoming_mail_diag_snapshot()
-    async with async_session() as session:
+    async with db_session() as session:
         user = await get_or_create_user(session, tg_user_id)
         accs = (
             await session.execute(
@@ -238,7 +239,11 @@ async def cmd_imap_diag(message: Message) -> None:
         "\n<i>Тест: ответьте на письмо рассылки с телефона → через ~30 с должна прийти карточка в Telegram. "
         "Если в БД 0 входящих — смотрите INBOX/пароль приложения; ответы в Spam (Gmail) сейчас не читаются.</i>"
     )
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    text = "\n".join(lines)
+    try:
+        await wait_msg.edit_text(text, parse_mode="HTML")
+    except Exception:
+        await message.answer(text, parse_mode="HTML")
 
 
 @router.message(Command("stat", "status", "statussend"))
