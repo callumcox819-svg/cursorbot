@@ -229,6 +229,19 @@ async def cmd_imap_diag(message: Message) -> None:
     if not accs:
         lines.append("\n❌ Нет почтовых аккаунтов — IMAP не к чему подключаться.")
     else:
+        blocked_accs = [
+            a for a in accs if (a.status or "").strip().lower() == "smtp_blocked"
+        ]
+        if blocked_accs:
+            lines.append(
+                f"\n<b>🟡 SMTP заблокировано ({len(blocked_accs)})</b> — только IMAP, рассылка снята:"
+            )
+            for a in blocked_accs[:12]:
+                err = ((a.last_error or "").strip()[:80] or "Message blocked / лимит")
+                lines.append(f"• <code>{a.email}</code> — <i>{err}</i>")
+            if len(blocked_accs) > 12:
+                lines.append(f"… и ещё {len(blocked_accs) - 12}")
+
         lines.append("\n<b>Аккаунты:</b>")
         for a in accs[:15]:
             st = (a.status or "—").strip()
@@ -243,7 +256,8 @@ async def cmd_imap_diag(message: Message) -> None:
     lines.append(breakdown_html)
     lines.append(
         "\n<i>Тест: ответьте на письмо рассылки → ~30 с карточка в TG. "
-        "Gmail Spam не читаем. Письма в БД ≠ все показаны в Telegram.</i>"
+        "mailer-daemon (Message blocked) — карточка в TG + ящик smtp_blocked. "
+        "Gmail Spam не читаем.</i>"
     )
     text = "\n".join(lines)
     try:

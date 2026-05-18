@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models import ConversationLink, IncomingMail
 from services.incoming_mail_worker import (
     _is_google_system_mail,
+    _is_mailer_daemon_notice,
     _is_smtp_block_bounce,
 )
 
@@ -49,6 +50,8 @@ def classify_incoming_row(row: IncomingMail) -> str:
     body = row.body or ""
 
     if _is_smtp_block_bounce(fe, subj, body):
+        return "bounce"
+    if _is_mailer_daemon_notice(fe, subj):
         return "bounce"
     if _is_google_system_mail(fe, fn, subj):
         return "google"

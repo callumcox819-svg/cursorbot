@@ -126,6 +126,8 @@ def _is_google_system_mail(from_email: str, from_name: str, subject: str) -> boo
     f = (from_email or "").strip().lower()
     name = (from_name or "").strip().lower()
     subj = (subject or "").strip().lower()
+    if _is_mailer_daemon_notice(f, subject or ""):
+        return False
     if name == "google":
         return True
     if not f or "@" not in f:
@@ -159,7 +161,17 @@ def _extract_ad_link(text: str) -> str | None:
     return m.group(1).strip()
 
 
+def _is_mailer_daemon_notice(from_email: str, subject: str) -> bool:
+    """DSN / mailer-daemon — показываем в TG (не путать с noreply@google.com)."""
+    f = (from_email or "").strip().lower()
+    if "mailer-daemon" in f or "postmaster" in f:
+        return True
+    s = (subject or "").strip().lower()
+    return "delivery status notification" in s
+
+
 def _is_smtp_block_bounce(from_email: str, subject: str, body: str) -> bool:
+    """Gmail block / лимит — снимаем ящик с SMTP, оставляем IMAP."""
     s = (subject or "").lower()
     b = (body or "").lower()
     f = (from_email or "").lower()
@@ -1006,6 +1018,8 @@ async def _process_mails_for_account_impl(
             skip_telegram_notify = _is_google_system_mail(
                 from_email_clean, from_name or "", subject or ""
             )
+            if smtp_block_bounce or _is_mailer_daemon_notice(from_email_clean, subject or ""):
+                skip_telegram_notify = False
             inbox_email_clean = (account_email or "").strip().lower()
 
             FULL_BODIES[(acc_id, uid_key)] = body_clean
@@ -1195,6 +1209,11 @@ async def _process_mails_for_account_impl(
                 service_label=service_label,
                 product_title=product_title,
             )
+            if smtp_block_bounce and chunks:
+                chunks[0] += (
+                    "\n\n⚠️ <b>Почта переведена в неактивные для рассылки.</b> "
+                    "IMAP мониторинг оставлен включённым."
+                )
 
             kb = build_kb(acc_id, uid, mail_id=mail_db_id)
 
@@ -1274,6 +1293,7 @@ async def _process_mails_for_account_impl(
                                 db_user_id=int(user_id),
                                 bot=bot,
                                 chat_id=int(tg_id),
+                                force=True,
                             )
                 except Exception:
                     logger.exception("Failed to mark smtp_blocked for %s", account_email)

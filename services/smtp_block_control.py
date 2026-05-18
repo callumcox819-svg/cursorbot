@@ -40,6 +40,9 @@ def is_smtp_account_block_error(err: str | None) -> bool:
         "web login required",
         "username and password not accepted",
         "5.4.5",
+        "message blocked",
+        "delivery status notification (failure)",
+        "mailer-daemon",
     )
     return any(p in t for p in phrases)
 
@@ -90,12 +93,14 @@ async def mark_account_smtp_blocked(
     db_user_id: int,
     bot: Bot | None = None,
     chat_id: int | None = None,
+    force: bool = False,
 ) -> bool:
     """
     Пометить ящик smtp_blocked и (если включён контроль блокировок) уведомить в Telegram.
-    Возвращает True, если это ошибка уровня аккаунта (ящик снят с SMTP).
+    force=True — IMAP bounce (Message blocked), без проверки фраз SMTP-ошибки отправки.
+    Возвращает True, если ящик снят с SMTP.
     """
-    if not is_smtp_account_block_error(err):
+    if not force and not is_smtp_account_block_error(err):
         return False
 
     was_blocked = (account.status or "").strip().lower() == "smtp_blocked"
@@ -110,7 +115,8 @@ async def mark_account_smtp_blocked(
     if was_blocked:
         return True
 
-    if bot and chat_id and await block_control_enabled(session, db_user_id):
+    notify = force or await block_control_enabled(session, db_user_id)
+    if bot and chat_id and notify:
         await notify_smtp_stream_stopped_for_imap(
             bot,
             int(chat_id),
