@@ -99,13 +99,29 @@ class ProxyManager:
         error: str,
         *,
         deactivate: bool = False,
+        from_mailing: bool = False,
     ) -> None:
-        """Записать ошибку; отключать прокси только при явном сбое SOCKS (не SMTP timeout)."""
-        values: dict = {"last_error": (error or "")[:500]}
-        if deactivate:
+        """
+        Проверка/таймаут — только last_error, is_active не трогаем.
+        🔴 (is_active=False) — только from_mailing + deactivate (мёртвый SOCKS при /send).
+        """
+        err_txt = (error or "")[:500]
+        if from_mailing and deactivate:
+            err_txt = f"[mailing] {err_txt}"[:500]
+        values: dict = {"last_error": err_txt}
+        if from_mailing and deactivate:
             values["is_active"] = False
         await session.execute(
             update(Proxy).where(Proxy.id == proxy_id).values(**values)
+        )
+        await session.commit()
+
+    @staticmethod
+    async def note_proxy_success(session: AsyncSession, proxy_id: int) -> None:
+        await session.execute(
+            update(Proxy)
+            .where(Proxy.id == proxy_id)
+            .values(is_active=True, last_error=None)
         )
         await session.commit()
 

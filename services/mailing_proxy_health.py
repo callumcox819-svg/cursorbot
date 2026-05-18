@@ -35,7 +35,7 @@ class ProxyHealthSummary:
     def format_lines(self) -> str:
         return (
             f"SOCKS5: <b>{self.total}</b> · 🟢 SMTP OK: <b>{self.ok}</b> · "
-            f"🟡 неясно: <b>{self.unknown}</b> · 🔴 нет: <b>{self.bad}</b>"
+            f"🟡 неясно: <b>{self.unknown}</b> · 🔴 мёртв при рассылке: <b>{self.bad}</b>"
         )
 
 
@@ -80,7 +80,8 @@ def mailing_may_start(summary: ProxyHealthSummary) -> Tuple[bool, str]:
     return (
         False,
         summary.format_lines()
-        + "\n\n❌ Ни один прокси не прошёл SMTP :587. Замените прокси или нажмите «Проверить» позже.",
+        + "\n\n❌ Все прокси помечены 🔴 после сбоя туннеля при рассылке. "
+        "Замените их или дождитесь «Проверить прокси» (🟢).",
     )
 
 

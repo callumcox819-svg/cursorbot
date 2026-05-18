@@ -21,7 +21,12 @@ from sqlalchemy import select
 
 from database import Session
 from models import User, Proxy
-from services.proxy_verify import classify_proxy_check_result, test_proxy, refresh_proxies_status
+from services.proxy_verify import (
+    apply_proxy_check_to_row,
+    is_mailing_marked_dead,
+    test_proxy,
+    refresh_proxies_status,
+)
 from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 
 router = Router()
@@ -444,10 +449,10 @@ async def render_proxy_menu(message_or_cb, telegram_id: int):
     text = (
         "🧩 <b>Твои прокси</b>\n\n"
         f"Всего: {len(proxies)}\n"
-        f"🟢 проверены OK: {ok_n} · 🟡 не проверены: {unk_n} · 🔴 ошибка проверки: {bad_n}\n\n"
-        "<i>Рассылка использует все SOCKS5 (и 🟡, и 🔴). "
-        "Красный = не прошёл последний тест, не обязательно мёртв.</i>\n"
-        "<i>Проверка: туннель + smtp.gmail.com:587</i>"
+        f"🟢 SMTP OK: {ok_n} · 🟡 неясно/не проверен: {unk_n} · 🔴 мёртв при рассылке: {bad_n}\n\n"
+        "<i>Проверка: SMTP+STARTTLS (до 2 попыток). "
+        "🔴 только если туннель реально умер при /send — не из-за таймаута проверки.</i>\n"
+        "<i>Рассылка использует все SOCKS5, в т.ч. 🟡.</i>"
     )
 
     kb = proxies_menu(proxies)
@@ -644,9 +649,10 @@ async def _proxy_add_work(
                 username=parsed.get("username"),
                 password=parsed.get("password"),
                 type="socks5",
-                is_active=classify_proxy_check_result(ok, info or ""),
+                is_active=True if ok else None,
                 last_error=None if ok else info,
             )
+            apply_proxy_check_to_row(proxy, ok, info or "")
 
             try:
                 session.add(proxy)
@@ -701,6 +707,12 @@ async def proxy_info(callback: CallbackQuery):
         return
 
     err = proxy.last_error or "-"
+    if proxy.is_active is True:
+        st_line = "🟢 SMTP OK (проверка или рассылка)"
+    elif proxy.is_active is False and is_mailing_marked_dead(err):
+        st_line = "🔴 Мёртв при рассылке (SOCKS)"
+    else:
+        st_line = "🟡 Не проверен / проверка не прошла — в рассылке используется"
 
     text = (
         "🧩 <b>Прокси</b>\n\n"
@@ -709,7 +721,7 @@ async def proxy_info(callback: CallbackQuery):
         f"Type: <code>{proxy.type}</code>\n"
         f"Username: <code>{proxy.username}</code>\n"
         f"Password: <code>{proxy.password}</code>\n"
-        f"Статус: {'🟢 Рабочий' if proxy.is_active else '🔴 Ошибка'}\n"
+        f"Статус: {st_line}\n"
         f"Ошибка: <code>{err}</code>"
     )
 
@@ -914,14 +926,16 @@ async def proxy_test(callback: CallbackQuery):
         async with Session() as session2:
             proxy_db = await session2.get(Proxy, proxy_id)
             if proxy_db:
-                proxy_db.is_active = classify_proxy_check_result(ok, info or "")
-                proxy_db.last_error = None if ok else info
+                apply_proxy_check_to_row(proxy_db, ok, info or "")
                 await session2.commit()
 
         status_text = (
-            f"✅ Прокси работает\n<code>{info}</code>"
+            f"✅ SMTP+STARTTLS OK\n<code>{info}</code>"
             if ok
-            else f"❌ Прокси не работает\n<code>{info}</code>"
+            else (
+                f"⚠️ Проверка не прошла (прокси <b>не</b> отключён)\n<code>{info}</code>\n"
+                "<i>🔴 будет только если при рассылке туннель реально мёртв.</i>"
+            )
         )
         try:
             await callback.bot.send_message(

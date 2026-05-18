@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models import EmailAccount, Proxy
 from proxy_manager import ProxySMTPContext, is_socks5_proxy
 from services.sender import (
+    is_definite_proxy_failure,
     is_smtp_timeout_error,
     normalize_send_error,
     send_batch_via_account,
@@ -155,6 +156,10 @@ async def send_email_via_account_with_proxy(
         err = normalize_send_error(err)
         if ok:
             _LAST_OK_PROXY_ID[int(user_id)] = pid
+            try:
+                await ProxyManager.note_proxy_success(session, pid)
+            except Exception:
+                pass
             return True, err, msgid
 
         last_err = err
@@ -166,18 +171,20 @@ async def send_email_via_account_with_proxy(
             (err or "")[:200],
         )
 
-        if not should_retry_send_with_other_proxy(err):
-            return False, err, last_msgid
-
+        dead = is_definite_proxy_failure(err)
         try:
             await ProxyManager.note_proxy_failure(
                 session,
                 pid,
                 (err or "")[:500],
-                deactivate=False,
+                deactivate=dead,
+                from_mailing=True,
             )
         except Exception:
             pass
+
+        if not should_retry_send_with_other_proxy(err):
+            return False, err, last_msgid
 
     hint = (
         f"Ни один из {tried} SOCKS5 не достучался до Gmail SMTP "
@@ -244,23 +251,29 @@ async def send_batch_via_account_with_proxy(
 
         if any_ok:
             _LAST_OK_PROXY_ID[int(user_id)] = pid
+            try:
+                await ProxyManager.note_proxy_success(session, pid)
+            except Exception:
+                pass
 
         if not new_pending:
             return merged
 
         last_err = next((e for o, e in merged if not o and e), None)
-        if not should_retry_send_with_other_proxy(last_err):
-            return merged
-
+        dead = is_definite_proxy_failure(last_err)
         try:
             await ProxyManager.note_proxy_failure(
                 session,
                 pid,
                 (last_err or "batch fail")[:500],
-                deactivate=False,
+                deactivate=dead,
+                from_mailing=True,
             )
         except Exception:
             pass
+
+        if not should_retry_send_with_other_proxy(last_err):
+            return merged
 
         pending = new_pending
 

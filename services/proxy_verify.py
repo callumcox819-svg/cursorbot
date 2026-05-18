@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any, Tuple
 from urllib.parse import urlsplit
 
 from models import Proxy
 
 logger = logging.getLogger(__name__)
+
+MAILING_PROXY_DEAD_PREFIX = "[mailing]"
+
+PROXY_CHECK_RETRIES = max(1, min(4, int(os.getenv("PROXY_CHECK_RETRIES", "2"))))
+PROXY_CHECK_RETRY_PAUSE_SEC = max(
+    0.5, min(5.0, float(os.getenv("PROXY_CHECK_RETRY_PAUSE_SEC", "2")))
+)
 
 _SOCKS5_SCHEMES = frozenset({"socks5", "socks5h"})
 
@@ -117,51 +125,96 @@ async def test_smtp_tunnel(proxy: Proxy | dict[str, Any], *, timeout: int = 20) 
 
 def classify_proxy_check_result(ok: bool, info: str) -> bool | None:
     """
-    True = рабочий, False = точно мёртв (SOCKS), None = неизвестно (таймаут/сеть) — не красить в UI.
+    Результат ручной/фоновой проверки: True = OK, None = неясно/ошибка сети.
+    Никогда False — «мёртвый» (🔴) только после реальной ошибки туннеля при рассылке.
     """
     if ok:
         return True
-    t = (info or "").lower()
-    if "timeout" in t or "timed out" in t or "заняла слишком" in t:
-        return None
-    definite_dead = (
-        "generalproxyerror",
-        "socks",
-        "authentication failed",
-        "0x05",
-        "network is unreachable",
-        "getaddrinfo failed",
-        "connection refused",
-        "host/port пуст",
-        "только socks5",
-    )
-    if any(x in t for x in definite_dead):
-        return False
-    if "туннель до smtp есть" in t:
-        return None
     return None
 
 
-async def test_proxy(proxy: Proxy | dict[str, Any], *, timeout: int = 20) -> Tuple[bool, str]:
-    """
-    Только SOCKS5. Статус «рабочий» — только если SMTP :587 проходит (как /send).
-    """
+def is_mailing_marked_dead(last_error: str | None) -> bool:
+    return (last_error or "").strip().startswith(MAILING_PROXY_DEAD_PREFIX)
+
+
+def check_error_worth_retry(info: str) -> bool:
+    t = (info or "").lower()
+    return any(
+        x in t
+        for x in (
+            "timeout",
+            "timed out",
+            "заняла слишком",
+            "туннель до smtp",
+            "ehlo",
+            "connection reset",
+            "unexpectedly closed",
+            "temporarily",
+        )
+    )
+
+
+def apply_proxy_check_to_row(row: Proxy, ok: bool, info: str) -> None:
+    """Проверка не отключает прокси — только 🟢 или оставляем/🟡."""
+    classified = classify_proxy_check_result(ok, info)
+    if classified is True:
+        row.is_active = True
+        row.last_error = None
+        return
+    if row.is_active is not False:
+        row.is_active = None
+    row.last_error = (info or "")[:500] if not ok else None
+
+
+def heal_proxy_rows_from_stale_check_markers(proxies: list[Proxy]) -> None:
+    """Снять старые 🔴, выставленные проверкой до правила «только рассылка»."""
+    for row in proxies:
+        if row.is_active is False and not is_mailing_marked_dead(row.last_error):
+            row.is_active = None
+
+
+async def _test_proxy_once(proxy: Proxy | dict[str, Any], *, timeout: int = 20) -> Tuple[bool, str]:
+    """Одна попытка: SMTP+STARTTLS как при /send."""
     d = proxy_to_dict(proxy)
     ptype = normalize_proxy_type(d.get("type"))
 
     if not is_socks5_type(ptype):
         return False, "Только SOCKS5. HTTP/HTTPS не поддерживаются для рассылки."
 
-    smtp_timeout = max(18, int(timeout))
+    smtp_timeout = max(20, int(timeout))
     smtp_ok, smtp_info = await test_smtp_tunnel(proxy, timeout=smtp_timeout)
     if smtp_ok:
         return True, smtp_info
 
-    socks_timeout = max(10, min(smtp_timeout, 18))
+    socks_timeout = max(12, min(smtp_timeout, 20))
     socks_ok, socks_info = await _test_socks5_handshake(proxy, timeout=socks_timeout)
     if socks_ok:
-        return False, f"Туннель до SMTP есть, но EHLO не прошёл: {smtp_info}"
+        return False, f"Туннель до SMTP есть, но EHLO/STARTTLS не прошёл: {smtp_info}"
     return False, f"SMTP: {smtp_info} · туннель: {socks_info}"
+
+
+async def test_proxy(
+    proxy: Proxy | dict[str, Any], *, timeout: int = 20, retries: int | None = None
+) -> Tuple[bool, str]:
+    """Проверка с повторами — меньше ложных 🟡 из-за лага сети/Railway."""
+    attempts = max(1, int(retries if retries is not None else PROXY_CHECK_RETRIES))
+    last_info = ""
+    for attempt in range(1, attempts + 1):
+        ok, info = await _test_proxy_once(proxy, timeout=timeout)
+        if ok:
+            return True, info
+        last_info = info or ""
+        if attempt < attempts and check_error_worth_retry(last_info):
+            logger.info(
+                "proxy check retry %s/%s: %s",
+                attempt,
+                attempts,
+                last_info[:120],
+            )
+            await asyncio.sleep(PROXY_CHECK_RETRY_PAUSE_SEC)
+            continue
+        break
+    return False, last_info
 
 
 async def test_proxy_url(proxy_url: str, *, timeout: int = 20) -> Tuple[bool, str]:
@@ -224,12 +277,16 @@ async def refresh_proxies_status(
         row = await session.get(Proxy, int(p.id))
         if not row:
             continue
-        row.is_active = classify_proxy_check_result(ok, info)
-        row.last_error = None if ok else (info or "")[:500]
+        apply_proxy_check_to_row(row, ok, info or "")
         if ok:
             ok_n += 1
         else:
             fail_n += 1
+
+    all_rows = list(
+        (await session.execute(sa_select(Proxy).where(Proxy.user_id == int(user_id)))).scalars()
+    )
+    heal_proxy_rows_from_stale_check_markers(all_rows)
 
     await session.commit()
     return ok_n, fail_n, len(proxies)
