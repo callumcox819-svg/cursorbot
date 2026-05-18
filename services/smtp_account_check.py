@@ -70,7 +70,7 @@ def _err_from_docmd(code: int, resp: bytes | str) -> str:
     return f"{code} {text}".strip()
 
 
-def _is_transient_smtp_check_failure(err: str | None) -> bool:
+def is_transient_smtp_check_failure(err: str | None) -> bool:
     """Прокси/туннель/рукопожатие SMTP — не значит, что ящик мёртв."""
     t = f"{type(err).__name__ if isinstance(err, BaseException) else ''} {(err or '')}".lower()
     names = (
@@ -108,14 +108,14 @@ def _classify_status(err: str) -> Tuple[Optional[str], str]:
         return None, norm
     if "proxy" in norm.lower() or "timeout" in norm.lower():
         return None, norm
-    if _is_transient_smtp_check_failure(norm):
+    if is_transient_smtp_check_failure(norm):
         return None, norm
     return "error", norm
 
 
 def _classify_exception(e: Exception) -> Tuple[Optional[str], str]:
     code, text = _extract_code_text_from_exception(e)
-    if _is_transient_smtp_check_failure(str(e)) or _is_transient_smtp_check_failure(text):
+    if is_transient_smtp_check_failure(str(e)) or is_transient_smtp_check_failure(text):
         return None, _marker("PROXY_ERROR", code or "smtp_check", text or str(e))
     if _is_proxy_error(e, text):
         return None, _marker("PROXY_ERROR", code or "socks", text or str(e))
