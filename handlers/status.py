@@ -138,10 +138,10 @@ def render_status_text(
     total_run = total_st if total_st > 0 else (pending_now + sent + failed)
     processed = sent + failed
     if running:
-        if current_to and processed == 0 and failed == 0:
+        if current_to:
             progress_line = (
-                f"\n⏳ <b>Идёт отправка</b> (первое письмо, до ~6 мин)\n"
-                f"Кому: <code>{current_to}</code>"
+                f"\n⏳ Сейчас: <code>{current_to}</code>\n"
+                f"Прогресс: <b>{processed}/{total_run or '?'}</b> (✅ {sent} · ❌ {failed})"
             )
         elif total_run > 0:
             progress_line = (
@@ -155,7 +155,7 @@ def render_status_text(
         "📊 <b>Статус рассылки</b>\n\n"
         f"{run_line}\n"
         f"Режим: <b>{mode}</b>\n"
-        f"Отправлено (подтверждено): <b>{sent}</b>\n"
+        f"Отправлено: <b>{sent}</b>\n"
         f"Ошибок отправки: <b>{failed}</b>"
         f"{progress_line}"
         f"{last_err_line}\n\n"

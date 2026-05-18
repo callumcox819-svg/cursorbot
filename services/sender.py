@@ -443,7 +443,9 @@ def _send_plain_sync(
         return False, guard_err, None
 
     # Safe placeholder pass (does not require ctx/link; keeps existing behavior if none)
-    body = apply_placeholders(body)
+    # body уже с плейсхолдерами из send.py — повторный apply без ctx не трогаем.
+    if "{{" in (body or ""):
+        body = apply_placeholders(body)
     host, port = _smtp_host_port(getattr(account, "provider", "") or "", account.email)
     msg = _build_message(
         from_email=account.email,

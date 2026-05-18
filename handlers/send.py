@@ -22,7 +22,7 @@ from models import EmailAccount, OfferEmail, Offer, User, Proxy
 from services.mailing_send import (
     MAIL_VERIFY_SENT,
     mailing_send_overall_timeout_sec,
-    send_mailing_one_verified,
+    send_mailing_one,
 )
 from services.users import get_or_create_user
 from services.user_settings import get_user_setting
@@ -270,29 +270,6 @@ async def start_sending(message: Message):
             )
             return
 
-    from services.mailing_proxy_health import (
-        MAIL_PROXY_PREFLIGHT_TIMEOUT,
-        MAIL_PROXY_RECHECK_SEC,
-        preflight_proxies_for_mailing,
-    )
-
-    await tg_answer_safe(
-        message,
-        f"⏳ <b>Проверяю {len(socks_proxies)} прокси</b> (SOCKS5 → smtp.gmail.com:587)…\n"
-        f"<i>До ~{max(30, len(socks_proxies) * MAIL_PROXY_PREFLIGHT_TIMEOUT // 2)} с</i>",
-        parse_mode="HTML",
-    )
-
-    can_start, _summary, proxy_detail = await preflight_proxies_for_mailing(int(db_user_id))
-    if not can_start:
-        await tg_answer_safe(
-            message,
-            proxy_detail,
-            reply_markup=main_menu_kb(tg_user_id),
-            parse_mode="HTML",
-        )
-        return
-
     async with db_session() as session:
         state = SendingState(
             user_id=tg_user_id,
@@ -313,32 +290,19 @@ async def start_sending(message: Message):
     await set_mailing_active(tg_user_id, active=True)
 
     from services.mailing_send import MAIL_SEND_RETRIES, MAIL_VERIFY_SENT
+    from services.smtp_proxy_send import MAIL_SMTP_MAX_PROXIES, MAIL_SMTP_TIMEOUT_SEC
 
     await tg_answer_safe(
         message,
-        "✅ Рассылка запущена.\n"
-        f"В очереди: <b>{total_targets}</b> email\n"
-        f"{proxy_detail}\n"
-        f"Режим: <b>1 ящик → 1 пресет → 1 адрес</b> (ротация)\n"
-        f"Учёт в /stat: <b>{'Sent (IMAP)' if MAIL_VERIFY_SENT else 'SMTP 250'}</b> · "
-        f"до <b>{MAIL_SEND_RETRIES}</b> попыток на адрес\n"
-        f"<i>Прокси перепроверяются каждые {max(1, MAIL_PROXY_RECHECK_SEC // 60)} мин.</i>",
+        "✅ <b>Рассылка запущена</b>\n"
+        f"В очереди: <b>{total_targets}</b> · SOCKS5: <b>{len(socks_proxies)}</b>\n"
+        f"1 ящик → 1 письмо → пауза по таймингу\n"
+        f"Успех в /stat: <b>{'IMAP Sent' if MAIL_VERIFY_SENT else 'SMTP 250+NOOP'}</b> "
+        f"(как в обычном софте)\n"
+        f"Прокси: до <b>{MAIL_SMTP_MAX_PROXIES}</b> × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с · "
+        f"повторов <b>{MAIL_SEND_RETRIES}</b>",
         reply_markup=main_menu_kb(tg_user_id),
         parse_mode="HTML",
-    )
-
-    from services.mailing_proxy_health import mailing_proxy_watch_loop
-    from utils.bg_jobs import start as bg_start
-
-    bg_start(
-        tg_user_id,
-        "mailing_proxy_watch",
-        mailing_proxy_watch_loop(
-            tg_user_id=tg_user_id,
-            db_user_id=int(db_user_id),
-            bot=bot,
-            chat_id=chat_id,
-        ),
     )
 
     asyncio.create_task(
@@ -373,7 +337,7 @@ async def _notify_sending_finished(*, bot: Bot, chat_id: int, tg_user_id: int) -
 
     text = (
         f"{title}\n\n"
-        f"Подтверждено отправок: <b>{sent}</b>\n"
+        f"Отправлено (SMTP): <b>{sent}</b>\n"
         f"Ошибок отправки: <b>{failed}</b>\n"
         f"Email в очереди: <b>{pending}</b>\n\n"
         f"<i>Если ответов мало — проверьте прокси (SMTP+STARTTLS OK) и задержку 2–5 с.</i>"
@@ -542,7 +506,7 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     )
                     async with smtp_sem:
                         ok, err, _msgid = await asyncio.wait_for(
-                            send_mailing_one_verified(
+                            send_mailing_one(
                                 session,
                                 db_user_id,
                                 acc,

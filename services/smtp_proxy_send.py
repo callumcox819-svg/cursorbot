@@ -31,8 +31,8 @@ REPLY_SMTP_TIMEOUT_SEC = max(15, min(60, int(os.getenv("REPLY_SMTP_TIMEOUT_SEC",
 REPLY_SMTP_MAX_PROXIES = max(1, min(6, int(os.getenv("REPLY_SMTP_MAX_PROXIES", "2"))))
 
 # Рассылка /send: несколько SOCKS5, таймаут на каждую попытку.
-MAIL_SMTP_TIMEOUT_SEC = max(25, min(90, int(os.getenv("MAIL_SMTP_TIMEOUT_SEC", "55"))))
-MAIL_SMTP_MAX_PROXIES = max(1, min(8, int(os.getenv("MAIL_SMTP_MAX_PROXIES", "4"))))
+MAIL_SMTP_TIMEOUT_SEC = max(20, min(60, int(os.getenv("MAIL_SMTP_TIMEOUT_SEC", "35"))))
+MAIL_SMTP_MAX_PROXIES = max(1, min(6, int(os.getenv("MAIL_SMTP_MAX_PROXIES", "3"))))
 
 _LAST_OK_PROXY_ID: dict[int, int] = {}
 

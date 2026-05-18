@@ -1,4 +1,4 @@
-"""Рассылка /send: повторы SMTP и опциональная проверка IMAP Sent."""
+"""Рассылка /send: SMTP+NOOP как в обычном софте; IMAP Sent — только по флагу."""
 
 from __future__ import annotations
 
@@ -12,45 +12,40 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models import EmailAccount
 from services.sender import normalize_send_error, should_retry_send_with_other_proxy
 from services.smtp_delivery_verify import verify_message_in_sent
-from services.smtp_proxy_send import send_email_via_account_with_proxy
+from services.smtp_proxy_send import (
+    MAIL_SMTP_MAX_PROXIES,
+    MAIL_SMTP_TIMEOUT_SEC,
+    send_email_via_account_with_proxy,
+)
 
 logger = logging.getLogger(__name__)
 
-MAIL_VERIFY_SENT = os.getenv("MAIL_VERIFY_SENT", "1").strip().lower() in (
+# Как в типичном софте: успех = SMTP 250 + NOOP (в sender.py). IMAP — опционально.
+MAIL_VERIFY_SENT = os.getenv("MAIL_VERIFY_SENT", "0").strip().lower() in (
     "1",
     "true",
     "yes",
     "on",
 )
-MAIL_VERIFY_SENT_DELAY_SEC = max(2, min(12, int(os.getenv("MAIL_VERIFY_SENT_DELAY_SEC", "4"))))
-MAIL_SEND_RETRIES = max(1, min(5, int(os.getenv("MAIL_SEND_RETRIES", "3"))))
+MAIL_VERIFY_SENT_DELAY_SEC = max(2, min(8, int(os.getenv("MAIL_VERIFY_SENT_DELAY_SEC", "3"))))
+MAIL_SEND_RETRIES = max(1, min(3, int(os.getenv("MAIL_SEND_RETRIES", "2"))))
 MAIL_SEND_RETRY_PAUSE_SEC = max(
-    1.0, min(15.0, float(os.getenv("MAIL_SEND_RETRY_PAUSE_SEC", "3")))
+    1.0, min(8.0, float(os.getenv("MAIL_SEND_RETRY_PAUSE_SEC", "2")))
 )
 
 
 def mailing_send_overall_timeout_sec() -> int:
-    """Верхний предел wait_for на одно письмо (все попытки + IMAP)."""
-    from services.smtp_proxy_send import MAIL_SMTP_MAX_PROXIES, MAIL_SMTP_TIMEOUT_SEC
-
-    per_smtp = MAIL_SMTP_MAX_PROXIES * MAIL_SMTP_TIMEOUT_SEC + 25
-    extra = MAIL_SEND_RETRIES * (
-        (MAIL_VERIFY_SENT_DELAY_SEC + 8 if MAIL_VERIFY_SENT else 0)
-        + MAIL_SEND_RETRY_PAUSE_SEC
-    )
-    raw = int(os.getenv("SEND_ONE_TIMEOUT", str(per_smtp * MAIL_SEND_RETRIES + extra + 20)))
-    # Одно письмо не должно «висеть» в /stat без счётчиков дольше ~6 мин.
-    return max(90, min(360, raw))
+    """Лимит на одно письмо: прокси × таймаут × попытки (без 10-минутных зависаний)."""
+    per = MAIL_SMTP_MAX_PROXIES * MAIL_SMTP_TIMEOUT_SEC + 20
+    raw = per * MAIL_SEND_RETRIES + MAIL_SEND_RETRIES * MAIL_SEND_RETRY_PAUSE_SEC + 15
+    return max(60, min(240, int(os.getenv("SEND_ONE_TIMEOUT", str(int(raw))))))
 
 
 def _retry_after_failure(err: str | None) -> bool:
-    if should_retry_send_with_other_proxy(err):
-        return True
-    s = (err or "").upper()
-    return "SMTP_ACCEPTED_NOT_IN_SENT" in s or "NOT_IN_SENT" in s
+    return should_retry_send_with_other_proxy(err)
 
 
-async def send_mailing_one_verified(
+async def send_mailing_one(
     session: AsyncSession,
     user_id: int,
     account: EmailAccount,
@@ -59,10 +54,6 @@ async def send_mailing_one_verified(
     body: str,
     sender_name: Optional[str] = None,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
-    """
-    До MAIL_SEND_RETRIES попыток: SMTP через SOCKS5 (смена прокси внутри) → при успехе IMAP Sent.
-    Успех только если письмо найдено в «Отправленных» (или MAIL_VERIFY_SENT=0).
-    """
     last_err: Optional[str] = None
     last_msgid: Optional[str] = None
 
@@ -82,49 +73,35 @@ async def send_mailing_one_verified(
 
         if not ok:
             if _retry_after_failure(err) and attempt < MAIL_SEND_RETRIES:
-                logger.info(
-                    "[mailing retry] smtp fail %s/%s %s -> %s: %s",
-                    attempt,
-                    MAIL_SEND_RETRIES,
-                    account.email,
-                    to_email,
-                    (err or "")[:160],
-                )
                 await asyncio.sleep(MAIL_SEND_RETRY_PAUSE_SEC)
                 continue
             return False, err, msgid
 
-        if not MAIL_VERIFY_SENT:
-            return True, None, msgid
+        if MAIL_VERIFY_SENT:
+            await asyncio.sleep(MAIL_VERIFY_SENT_DELAY_SEC)
+            try:
+                verified, verify_msg = await verify_message_in_sent(
+                    account.email,
+                    account.password or "",
+                    subject=subject,
+                    to_email=to_email,
+                    message_id=msgid,
+                )
+            except Exception as e:
+                verified, verify_msg = False, str(e)
+            if not verified:
+                last_err = normalize_send_error(
+                    f"SMTP_ACCEPTED_NOT_IN_SENT|verify|{verify_msg or 'not in Sent'}"
+                )
+                if attempt < MAIL_SEND_RETRIES:
+                    await asyncio.sleep(MAIL_SEND_RETRY_PAUSE_SEC)
+                    continue
+                return False, last_err, msgid
 
-        await asyncio.sleep(MAIL_VERIFY_SENT_DELAY_SEC)
-        try:
-            verified, verify_msg = await verify_message_in_sent(
-                account.email,
-                account.password or "",
-                subject=subject,
-                to_email=to_email,
-                message_id=msgid,
-            )
-        except Exception as e:
-            verified, verify_msg = False, str(e)
-
-        if verified:
-            return True, None, msgid
-
-        last_err = normalize_send_error(
-            f"SMTP_ACCEPTED_NOT_IN_SENT|verify|{verify_msg or 'not in Sent'}"
-        )
-        logger.warning(
-            "[mailing retry] not in Sent %s/%s %s -> %s",
-            attempt,
-            MAIL_SEND_RETRIES,
-            account.email,
-            to_email,
-        )
-        if attempt < MAIL_SEND_RETRIES:
-            await asyncio.sleep(MAIL_SEND_RETRY_PAUSE_SEC)
-            continue
-        return False, last_err, msgid
+        return True, None, msgid
 
     return False, last_err or "UNKNOWN", last_msgid
+
+
+# совместимость
+send_mailing_one_verified = send_mailing_one
