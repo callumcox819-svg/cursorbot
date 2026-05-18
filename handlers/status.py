@@ -211,6 +211,11 @@ async def cmd_imap_diag(message: Message) -> None:
             )
         ).scalar() or 0
 
+        from services.incoming_mail_stats import build_incoming_breakdown, format_incoming_breakdown_html
+
+        breakdown = await build_incoming_breakdown(session, int(user.id))
+        breakdown_html = format_incoming_breakdown_html(breakdown)
+
     lines = [
         "<b>IMAP</b>",
         f"Режим: <code>{snap.get('scheduler', '—')}</code>, пауза рассылки: <code>{snap.get('mailing_pause', '—')}</code>",
@@ -235,9 +240,10 @@ async def cmd_imap_diag(message: Message) -> None:
             )
         if len(accs) > 15:
             lines.append(f"… и ещё {len(accs) - 15}")
+    lines.append(breakdown_html)
     lines.append(
-        "\n<i>Тест: ответьте на письмо рассылки с телефона → через ~30 с должна прийти карточка в Telegram. "
-        "Если в БД 0 входящих — смотрите INBOX/пароль приложения; ответы в Spam (Gmail) сейчас не читаются.</i>"
+        "\n<i>Тест: ответьте на письмо рассылки → ~30 с карточка в TG. "
+        "Gmail Spam не читаем. Письма в БД ≠ все показаны в Telegram.</i>"
     )
     text = "\n".join(lines)
     try:
