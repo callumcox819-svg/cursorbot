@@ -2458,6 +2458,7 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
                 html_body,
                 is_html=True,
                 sender_name=sender_name,
+                fast=True,
             )
 
     meta_fm = FULL_META.get((acc_id, mail_uid)) or {}
