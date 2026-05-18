@@ -823,15 +823,6 @@ async def _find_offer_if_unique_email(
     ).scalars().first()
 
 
-async def _pin_conversation_offer(session, conv, offer: Offer) -> None:
-    if not conv or not offer:
-        return
-    conv.pinned_offer_id = int(offer.id)
-    lk = (offer.link or "").strip()
-    if lk:
-        conv.ad_url = lk
-
-
 async def resolve_offer_for_mail_card(
     session,
     *,
@@ -844,12 +835,10 @@ async def resolve_offer_for_mail_card(
     from_name: str = "",
     body_text: str = "",
 ) -> Offer | None:
-    """Карточка/GAG: тема письма → ссылка этого письма → pin/ЧС → resolved_offer_id → скоринг."""
+    """Карточка/GAG: тема письма → ссылка этого письма → conv ad_url → resolved_offer_id → скоринг."""
     from services.offer_matching import resolve_best_offer_by_subject
     from services.offer_storage import find_offer_by_link
-    from services.seller_blacklist import is_seller_blacklisted
 
-    strict = await is_seller_blacklisted(session, int(user_id), from_email)
     conv = None
     if (inbox_email or "").strip() and (from_email or "").strip():
         conv = await _load_convlink(
@@ -857,18 +846,6 @@ async def resolve_offer_for_mail_card(
             inbox_email=_canon_email(inbox_email or ""),
             contact_email=_canon_email(from_email or ""),
         )
-
-    if strict and conv and getattr(conv, "pinned_offer_id", None):
-        off = (
-            await session.execute(
-                sa_select(Offer)
-                .where(Offer.id == int(conv.pinned_offer_id))
-                .where(Offer.user_id == int(user_id))
-                .limit(1)
-            )
-        ).scalars().first()
-        if off:
-            return off
 
     # 1) Тема письма — главный сигнал при нескольких лотах у одного продавца
     off_subj = await resolve_best_offer_by_subject(
@@ -880,19 +857,15 @@ async def resolve_offer_for_mail_card(
         body_text=body_text,
     )
     if off_subj:
-        if strict and conv:
-            await _pin_conversation_offer(session, conv, off_subj)
         return off_subj
 
     mail_url = (ad_url or "").strip()
     if mail_url:
         off = await find_offer_by_link(session, user_id=int(user_id), ad_url=mail_url)
         if off:
-            if strict and conv:
-                await _pin_conversation_offer(session, conv, off)
             return off
 
-    if not strict and conv and (conv.ad_url or "").strip():
+    if conv and (conv.ad_url or "").strip():
         off = await find_offer_by_link(
             session, user_id=int(user_id), ad_url=(conv.ad_url or "").strip()
         )
@@ -929,8 +902,6 @@ async def resolve_offer_for_mail_card(
             )
         ).scalars().first()
         if off:
-            if strict and conv:
-                await _pin_conversation_offer(session, conv, off)
             return off
 
     return await _find_offer_if_unique_email(session, user_id=int(user_id), from_email=from_email)

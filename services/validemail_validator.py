@@ -44,9 +44,8 @@ class ValidationConfig:
 
     user_blacklist: list[str] | None = None
     use_ssl_verify: bool = True
-    # Личный ЧС продавцов (email) и уже привязанные лоты в БД
-    seller_blacklist_emails: set[str] | None = None
-    seller_email_links: dict[str, set[str]] | None = None
+    # Личный ЧС имён продавцов (Maria Johansen и т.д.) — повторно не валидировать
+    seller_name_keys: set[str] | None = None
 
 
 # -------------------------
@@ -335,17 +334,13 @@ async def _validate_offers_old(
             }
         )
 
-    from services.offer_storage import link_key
-    from services.seller_blacklist import should_skip_validation_item_sync
+    from services.seller_blacklist import seller_name_key
 
-    seller_bl = set(cfg.seller_blacklist_emails or set())
-    email_map: dict[str, set[str]] = {
-        k: set(v) for k, v in (cfg.seller_email_links or {}).items()
-    }
-    batch_email_links: dict[str, str] = {}
-    pending_seller_bl: set[str] = set()
+    seller_bl = set(cfg.seller_name_keys or set())
+    batch_seen_names: set[str] = set()
+    pending_seller_names: set[str] = set()
     if stats is not None:
-        stats["pending_seller_bl"] = pending_seller_bl
+        stats["pending_seller_names"] = pending_seller_names
 
     # 1) Имя из JSON → local-part (готовые email в файле игнорируем)
     prepared: list[dict[str, Any]] = []
@@ -353,21 +348,16 @@ async def _validate_offers_old(
         if not isinstance(it, dict):
             continue
 
-        skip_item, _skip_reason = should_skip_validation_item_sync(
-            it,
-            email_offer_map=email_map,
-            blacklist_emails=seller_bl,
-            batch_email_links=batch_email_links,
-        )
-        if skip_item:
-            if stats is not None:
-                stats["blacklisted"] = int(stats.get("blacklisted") or 0) + 1
-            continue
-
         raw_name = seller_name_from_item(it)
         if not (raw_name or "").strip():
             if stats is not None:
                 stats["no_name"] = int(stats.get("no_name") or 0) + 1
+            continue
+
+        name_key = seller_name_key(raw_name)
+        if name_key and (name_key in seller_bl or name_key in batch_seen_names):
+            if stats is not None:
+                stats["blacklisted"] = int(stats.get("blacklisted") or 0) + 1
             continue
 
         if _is_blacklisted(raw_name, user_blacklist):
@@ -392,6 +382,7 @@ async def _validate_offers_old(
         prepared.append({
             "raw": it,
             "person_name": raw_name,
+            "name_key": name_key,
             "locals": locals_list,
             "title": str(it.get("item_title") or it.get("title") or "").strip(),
             "price": str(it.get("item_price") or it.get("price") or "").strip(),
@@ -495,20 +486,6 @@ async def _validate_offers_old(
                 if stats is not None:
                     stats["duplicates"] = int(stats.get("duplicates") or 0) + 1
                 continue
-            row_lk = link_key(str(prepared[seller_i].get("link") or ""))
-            prev_links = email_map.get(key) or set()
-            if prev_links and row_lk and row_lk not in prev_links:
-                if stats is not None:
-                    stats["blacklisted"] = int(stats.get("blacklisted") or 0) + 1
-                pending_seller_bl.add(key)
-                continue
-            if key in batch_email_links and row_lk and batch_email_links[key] != row_lk:
-                if stats is not None:
-                    stats["blacklisted"] = int(stats.get("blacklisted") or 0) + 1
-                pending_seller_bl.add(key)
-                continue
-            if row_lk:
-                batch_email_links[key] = row_lk
             seen_valid_emails.add(key)
             lst.append(key)
             if stats is not None:
@@ -566,6 +543,12 @@ async def _validate_offers_old(
             _refresh_stats()
             if found_by_idx[i]:
                 break
+
+        if found_by_idx[i]:
+            nk = str(prepared[i].get("name_key") or "").strip()
+            if nk:
+                batch_seen_names.add(nk)
+                pending_seller_names.add(nk)
 
     # 3) собираем результат
     out_rows: list[dict[str, Any]] = []

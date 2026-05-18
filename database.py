@@ -135,6 +135,18 @@ async def _ensure_offers_raw_json_column() -> None:
         await conn.execute(text("ALTER TABLE offers ADD COLUMN IF NOT EXISTS raw_json TEXT"))
 
 
+async def _migrate_seller_blacklist_names() -> None:
+    """ЧС продавцов по имени из JSON (не по email)."""
+    if engine.dialect.name != "postgresql":
+        return
+
+    async with engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE seller_blacklist ADD COLUMN IF NOT EXISTS seller_name_key TEXT"))
+        await conn.execute(text("ALTER TABLE seller_blacklist ADD COLUMN IF NOT EXISTS seller_name_display TEXT"))
+        await conn.execute(text("ALTER TABLE seller_blacklist DROP COLUMN IF EXISTS seller_email"))
+        await conn.execute(text("ALTER TABLE seller_blacklist DROP COLUMN IF EXISTS note"))
+
+
 async def _ensure_conversation_links_pinned_offer_id_column() -> None:
     if engine.dialect.name != "postgresql":
         return
@@ -210,3 +222,8 @@ async def init_db() -> None:
         await _ensure_conversation_links_pinned_offer_id_column()
     except Exception as e:
         log.error("Failed conversation_links.pinned_offer_id migration: %s", e)
+
+    try:
+        await _migrate_seller_blacklist_names()
+    except Exception as e:
+        log.error("Failed seller_blacklist name migration: %s", e)

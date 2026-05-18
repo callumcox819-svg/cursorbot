@@ -72,8 +72,7 @@ def _format_validation_status(
         f"📄 Объявлений обработано: <b>{processed}/{total}</b>",
         f"📧 Добавлено: <b>{added}</b>",
         f"♻️ Дубликатов: <b>{duplicates}</b>",
-        f"⛔ В ЧС: <b>{in_blacklist}</b>",
-        f"➕ Добавлено в ЧС: <b>{added_blacklist}</b>",
+        f"⛔ Повтор продавца (пропуск): <b>{added_blacklist}</b>",
         f"✂️ Коротких ников: <b>{short_nicks}</b>",
         f"📬 Без email: <b>{no_email}</b>",
         f"⚠️ Ошибок: <b>{errors}</b>",
@@ -351,11 +350,9 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
 
     async with Session() as session:
         user_bl = await get_or_create_user(session, tg_id)
-        from services.seller_blacklist import list_seller_blacklist, load_seller_email_offer_map
+        from services.seller_blacklist import load_seller_name_keys
 
-        bl_rows = await list_seller_blacklist(session, int(user_bl.id))
-        bl_emails = {str(r.seller_email or "").strip().lower() for r in bl_rows if r.seller_email}
-        email_map = await load_seller_email_offer_map(session, int(user_bl.id))
+        name_keys = await load_seller_name_keys(session, int(user_bl.id))
 
     cfg = ValidationConfig(
         validemail_api_keys=api_keys,
@@ -365,8 +362,7 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
         require_first_and_last=REQUIRE_FIRST_AND_LAST,
         max_len=40,
         min_len=MIN_NAME_TOKEN_LEN,
-        seller_blacklist_emails=bl_emails,
-        seller_email_links=email_map,
+        seller_name_keys=name_keys,
     )
 
     live_stats: dict = {"offers_total": total_offers}
@@ -440,21 +436,16 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
     validated_count = len(validated or [])
     eligible = int(live_stats.get("offers_eligible") or 0)
 
-    pending_bl = live_stats.get("pending_seller_bl") or set()
+    pending_names = live_stats.get("pending_seller_names") or set()
 
     async with Session() as session:
         user = await get_or_create_user(session, tg_id)
 
-        if pending_bl:
-            from services.seller_blacklist import add_seller_blacklist
+        if pending_names:
+            from services.seller_blacklist import add_seller_name_blacklist
 
-            for em in sorted(pending_bl):
-                await add_seller_blacklist(
-                    session,
-                    int(user.id),
-                    str(em),
-                    note="авто: тот же продавец, другой лот",
-                )
+            for _key in sorted(pending_names):
+                await add_seller_name_blacklist(session, int(user.id), _key)
             await session.commit()
 
         if REPLACE_OLD_FOR_USER:

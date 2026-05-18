@@ -295,17 +295,17 @@ class ConversationLink(Base):
 
 
 class SellerBlacklist(Base):
-    """Личный ЧС продавцов: для них матч только по теме письма + закрепление оффера."""
+    """Личный ЧС: имя продавца из JSON (void) — повторно не валидировать у этого user."""
 
     __tablename__ = "seller_blacklist"
     __table_args__ = (
-        UniqueConstraint("user_id", "seller_email", name="uq_seller_blacklist_user_email"),
+        UniqueConstraint("user_id", "seller_name_key", name="uq_seller_blacklist_user_name"),
     )
 
     id = Column(Integer, primary_key=True)
     user_id = Column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    seller_email = Column(String, nullable=False, index=True)
-    note = Column(String, nullable=True)
+    seller_name_key = Column(String, nullable=False, index=True)
+    seller_name_display = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="seller_blacklist")
