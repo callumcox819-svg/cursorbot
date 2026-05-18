@@ -121,6 +121,8 @@ def _build_message(
     msg["Subject"] = subj
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=(from_email.split("@")[-1] if "@" in from_email else None))
+    if not is_html:
+        msg["Reply-To"] = from_email
     return msg
 
 

@@ -35,6 +35,8 @@ MAIL_SMTP_TIMEOUT_SEC = max(20, min(60, int(os.getenv("MAIL_SMTP_TIMEOUT_SEC", "
 MAIL_SMTP_MAX_PROXIES = max(1, min(6, int(os.getenv("MAIL_SMTP_MAX_PROXIES", "3"))))
 
 _LAST_OK_PROXY_ID: dict[int, int] = {}
+# Пара (user_id, account_id) → proxy_id — один ящик стабильнее через один egress (инбокс).
+_LAST_OK_PROXY_BY_ACCOUNT: dict[tuple[int, int], int] = {}
 
 
 async def choose_required_proxy(
@@ -88,20 +90,33 @@ async def _list_active_socks5_proxies(session: AsyncSession, user_id: int) -> Li
     return out
 
 
-def _order_proxies_for_send(user_id: int, proxies: List[Proxy], *, fast: bool) -> List[Proxy]:
+def _order_proxies_for_send(
+    user_id: int,
+    proxies: List[Proxy],
+    *,
+    fast: bool,
+    account_id: int | None = None,
+) -> List[Proxy]:
     if not proxies:
         return []
     uid = int(user_id)
-    last_id = _LAST_OK_PROXY_ID.get(uid)
+    sticky_id = None
+    if account_id is not None:
+        sticky_id = _LAST_OK_PROXY_BY_ACCOUNT.get((uid, int(account_id)))
+    last_id = sticky_id or _LAST_OK_PROXY_ID.get(uid)
     head: List[Proxy] = []
+    mid: List[Proxy] = []
     tail: List[Proxy] = []
     for p in proxies:
-        if last_id and int(p.id) == int(last_id):
+        pid = int(p.id)
+        if last_id and pid == int(last_id):
             head.append(p)
+        elif sticky_id and pid == int(sticky_id) and p not in head:
+            mid.append(p)
         else:
             tail.append(p)
     random.shuffle(tail)
-    order = head + tail
+    order = head + mid + tail
     limit = REPLY_SMTP_MAX_PROXIES if fast else MAIL_SMTP_MAX_PROXIES
     return order[:limit]
 
@@ -122,7 +137,9 @@ async def send_email_via_account_with_proxy(
     if not proxies:
         return False, NO_ACTIVE_PROXY, None
 
-    order = _order_proxies_for_send(int(user_id), proxies, fast=fast)
+    order = _order_proxies_for_send(
+        int(user_id), proxies, fast=fast, account_id=int(account.id)
+    )
     smtp_tmo = REPLY_SMTP_TIMEOUT_SEC if fast else MAIL_SMTP_TIMEOUT_SEC
 
     last_err: str | None = None
@@ -156,6 +173,7 @@ async def send_email_via_account_with_proxy(
         err = normalize_send_error(err)
         if ok:
             _LAST_OK_PROXY_ID[int(user_id)] = pid
+            _LAST_OK_PROXY_BY_ACCOUNT[(int(user_id), int(account.id))] = pid
             try:
                 await ProxyManager.note_proxy_success(session, pid)
             except Exception:
@@ -212,7 +230,9 @@ async def send_batch_via_account_with_proxy(
     if not proxies:
         return [(False, NO_ACTIVE_PROXY) for _ in items]
 
-    order = _order_proxies_for_send(int(user_id), proxies, fast=False)
+    order = _order_proxies_for_send(
+        int(user_id), proxies, fast=False, account_id=int(account.id)
+    )
     merged: List[Tuple[bool, Optional[str]]] = [(False, NO_ACTIVE_PROXY) for _ in range(n)]
     pending: List[int] = list(range(n))
 
@@ -251,6 +271,7 @@ async def send_batch_via_account_with_proxy(
 
         if any_ok:
             _LAST_OK_PROXY_ID[int(user_id)] = pid
+            _LAST_OK_PROXY_BY_ACCOUNT[(int(user_id), int(account.id))] = pid
             try:
                 await ProxyManager.note_proxy_success(session, pid)
             except Exception:

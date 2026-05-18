@@ -296,9 +296,8 @@ async def start_sending(message: Message):
         message,
         "✅ <b>Рассылка запущена</b>\n"
         f"В очереди: <b>{total_targets}</b> · SOCKS5: <b>{len(socks_proxies)}</b>\n"
-        f"1 ящик → 1 письмо → пауза по таймингу\n"
-        f"Успех в /stat: <b>{'IMAP Sent' if MAIL_VERIFY_SENT else 'SMTP 250+NOOP'}</b> "
-        f"(как в обычном софте)\n"
+        f"Ротация: <b>1 ящик → 1 умный пресет → 1 адрес</b> → пауза MIN–MAX\n"
+        f"Успех в /stat: <b>{'IMAP Sent' if MAIL_VERIFY_SENT else 'SMTP 250+NOOP'}</b>\n"
         f"Прокси: до <b>{MAIL_SMTP_MAX_PROXIES}</b> × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с · "
         f"повторов <b>{MAIL_SEND_RETRIES}</b>",
         reply_markup=main_menu_kb(tg_user_id),
@@ -407,6 +406,7 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
     entered_main_loop = False
     acc_idx = 0
     rotation_accounts: List[EmailAccount] = []
+    account_send_counts: dict[int, int] = {}
 
     async with db_session() as session:
         user = await get_or_create_user(session, tg_user_id)
@@ -443,10 +443,8 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 pass
             return
 
-        timing = await load_timing(session, tg_user_id)
-        min_delay = float(timing.get("min_delay", 2.0))
-        max_delay = float(timing.get("max_delay", 4.0))
     send_one_timeout = mailing_send_timeouts()
+    mail_max_per_account = max(0, int(os.getenv("MAIL_MAX_PER_ACCOUNT", "0")))
 
     try:
         while True:
@@ -487,9 +485,38 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     set_sending_state(tg_user_id, state=state)
                     break
 
-                # Ротация: каждый шаг — другой активный ящик, новый случайный пресет, один получатель.
-                acc = rotation_accounts[acc_idx % len(rotation_accounts)]
+                timing = await load_timing(session, tg_user_id)
+                min_delay = float(timing.get("min_delay", 2.0))
+                max_delay = float(timing.get("max_delay", 4.0))
+
+                # Ротация ящиков + случайный умный пресет на каждое письмо.
+                acc: EmailAccount | None = None
+                if mail_max_per_account > 0:
+                    eligible = [
+                        a
+                        for a in rotation_accounts
+                        if account_send_counts.get(int(a.id), 0) < mail_max_per_account
+                    ]
+                    if not eligible:
+                        state.is_running = False
+                        state.last_error = (
+                            "ACCOUNT_RATE_LIMIT|cap|All accounts hit MAIL_MAX_PER_ACCOUNT"
+                        )
+                        set_sending_state(tg_user_id, state=state)
+                        try:
+                            await bot.send_message(
+                                chat_id,
+                                f"⏹ Лимит писем с ящика ({mail_max_per_account}) за этот запуск. "
+                                "Запустите рассылку снова позже.",
+                            )
+                        except Exception:
+                            pass
+                        break
+                    acc = eligible[acc_idx % len(eligible)]
+                else:
+                    acc = rotation_accounts[acc_idx % len(rotation_accounts)]
                 acc_idx += 1
+
                 tgt = targets[0]
                 to_addr = (tgt.email or "").strip()
                 state.current_to = to_addr
@@ -528,6 +555,7 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 if ok:
                     state.sent_count += 1
                     state.last_status = "NORMAL"
+                    account_send_counts[int(acc.id)] = account_send_counts.get(int(acc.id), 0) + 1
                     await _purge_target(session, db_user_id, tgt.id)
                 else:
                     state.last_status = "NORMAL"
