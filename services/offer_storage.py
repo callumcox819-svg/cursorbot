@@ -55,6 +55,14 @@ def parse_offer_raw(raw_json: str | None) -> dict[str, Any]:
         return {}
 
 
+def _first_raw_str(raw: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        v = str(raw.get(key) or "").strip()
+        if v:
+            return v
+    return ""
+
+
 def offer_effective_price(offer: Offer | None, *, default: str = "0") -> str:
     """Цена для GAG/карточки: колонка Offer.price, иначе item_price/price из raw_json, иначе default."""
     if not offer:
@@ -63,11 +71,30 @@ def offer_effective_price(offer: Offer | None, *, default: str = "0") -> str:
     if p:
         return p
     raw = parse_offer_raw(getattr(offer, "raw_json", None))
-    for key in ("item_price", "price"):
-        v = str(raw.get(key) or "").strip()
-        if v:
-            return v
-    return default
+    v = _first_raw_str(raw, ("item_price", "price"))
+    return v or default
+
+
+def offer_effective_title(offer: Offer | None) -> str:
+    """Название: Offer.title, иначе item_title/title из raw_json."""
+    if not offer:
+        return ""
+    t = str(getattr(offer, "title", None) or "").strip()
+    if t:
+        return t
+    raw = parse_offer_raw(getattr(offer, "raw_json", None))
+    return _first_raw_str(raw, ("item_title", "title"))
+
+
+def offer_effective_photo(offer: Offer | None) -> str:
+    """Фото: Offer.photo, иначе item_photo/photo/image/img из raw_json."""
+    if not offer:
+        return ""
+    p = str(getattr(offer, "photo", None) or "").strip()
+    if p:
+        return p
+    raw = parse_offer_raw(getattr(offer, "raw_json", None))
+    return _first_raw_str(raw, ("item_photo", "photo", "image", "img"))
 
 
 def index_validated_rows(validated: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

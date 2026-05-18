@@ -41,10 +41,10 @@ from services.incoming_mail_worker import (
     FULL_META,
     _try_pin,
     build_mail_card_from_mail,
-    find_offer_for_incoming_mail,
+    resolve_offer_for_mail_card,
 )
 from services.offer_matching import resolve_offer_for_incoming
-from services.offer_storage import offer_effective_price
+from services.offer_storage import offer_effective_photo, offer_effective_price, offer_effective_title
 from services.smtp_proxy_send import send_email_via_account_with_proxy
 from services.translate import translate_to_ru, _strip_html
 
@@ -784,25 +784,31 @@ async def _send_generated_link_card_to_chat(
 
     p = (photo_url or "").strip()
     if not p:
-        await bot.send_message(chat_id, "❌ Нет фото объявления (photo).", reply_to_message_id=reply_to)
-        return
-
-    try:
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=p,
-            caption=card_text,
+        await bot.send_message(
+            chat_id,
+            card_text + "\n\n<i>Фото объявления не найдено в БД.</i>",
             parse_mode="HTML",
             reply_markup=price_kb,
             reply_to_message_id=reply_to,
         )
-    except Exception:
-        await bot.send_message(
-            chat_id,
-            "❌ Не удалось отправить фото объявления.",
-            reply_to_message_id=reply_to,
-        )
-        return
+    else:
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=p,
+                caption=card_text,
+                parse_mode="HTML",
+                reply_markup=price_kb,
+                reply_to_message_id=reply_to,
+            )
+        except Exception:
+            await bot.send_message(
+                chat_id,
+                card_text + "\n\n<i>Не удалось отправить фото объявления.</i>",
+                parse_mode="HTML",
+                reply_markup=price_kb,
+                reply_to_message_id=reply_to,
+            )
 
     if reply_to:
         try:
@@ -1463,21 +1469,23 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
             await callback.answer()
             return
 
-        offer_title = offer_image = None
         offer_id = None
-        offer = await find_offer_for_incoming_mail(
+        offer = await resolve_offer_for_mail_card(
             session,
             user_id=int(tg_user.id),
             from_email=contact_email,
             resolved_offer_id=getattr(mail, "resolved_offer_id", None),
+            subject=(getattr(mail, "subject", "") or ""),
+            from_name=(getattr(mail, "from_name", "") or ""),
+            body_text=(getattr(mail, "body", "") or ""),
         )
         if offer:
             if not getattr(mail, "resolved_offer_id", None):
                 mail.resolved_offer_id = int(offer.id)
-            offer_title = (offer.title or "").strip() or None
-            offer_image = (offer.photo or "").strip() or None
             offer_id = int(getattr(offer, "id", 0) or 0) or None
 
+        offer_title = offer_effective_title(offer) or None
+        offer_image = offer_effective_photo(offer) or None
         title = offer_title or (mail.subject or "").strip()
         price = offer_effective_price(offer)
         if not title:
@@ -1703,8 +1711,6 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
             await callback.message.answer("❌ Профиль GAG не заполнен. Открой 👤 Профиль → ➕ Создать профиль.")
             return await callback.answer()
 
-        offer_title = None
-        offer_image = None
         offer_id = None
         mail = (
             await session.execute(
@@ -1718,19 +1724,22 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
 
         offer = None
         if mail:
-            offer = await find_offer_for_incoming_mail(
+            offer = await resolve_offer_for_mail_card(
                 session,
                 user_id=int(owner_user_id),
                 from_email=contact_email,
                 resolved_offer_id=getattr(mail, "resolved_offer_id", None),
+                subject=(getattr(mail, "subject", "") or ""),
+                from_name=(getattr(mail, "from_name", "") or ""),
+                body_text=(getattr(mail, "body", "") or ""),
             )
             if offer:
                 if not getattr(mail, "resolved_offer_id", None):
                     mail.resolved_offer_id = int(offer.id)
-                offer_title = (offer.title or "").strip() or None
-                offer_image = (offer.photo or "").strip() or None
                 offer_id = int(getattr(offer, "id", 0) or 0) or None
 
+        offer_title = offer_effective_title(offer) or None
+        offer_image = offer_effective_photo(offer) or None
         title = offer_title or ((mail.subject or "").strip() if mail else "")
         price = offer_effective_price(offer)
         if not title:
@@ -2722,15 +2731,15 @@ async def _gag_generate_link_for_offer(session, user: User, offer: Offer, price:
     if not (prof_name and prof_addr):
         raise GAGError("Профиль GAG не заполнен")
 
-    title = (offer.title or "").strip()
+    title = offer_effective_title(offer)
     if not title:
         raise GAGError("Нет названия объявления (title)")
 
-    p = (price or "").strip()
+    p = (price or "").strip() or offer_effective_price(offer)
     if not p:
         raise GAGError("Нет цены")
 
-    offer_image = (offer.photo or "").strip() or None
+    offer_image = offer_effective_photo(offer) or None
     api_service = gag_service_for_api(service)
 
     dom_raw = (await get_user_setting(session, user, "gag_domain_slot") or "").strip()
@@ -2810,9 +2819,9 @@ async def _regenerate_gag_link_after_price(
         await session.commit()
 
         card = {
-            "offer_title": (offer.title or "").strip() or None,
+            "offer_title": offer_effective_title(offer) or None,
             "offer_price": new_price,
-            "photo_url": (offer.photo or "").strip() or None,
+            "photo_url": offer_effective_photo(offer) or None,
             "profile_display": (
                 await get_user_setting(session, user, GAG_PROFILE_TITLE_KEY) or ""
             ).strip()

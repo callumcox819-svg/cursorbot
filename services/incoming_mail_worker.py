@@ -828,6 +828,45 @@ async def find_offer_for_incoming_mail(
     return off
 
 
+async def resolve_offer_for_mail_card(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+    resolved_offer_id: int | None = None,
+    subject: str = "",
+    from_name: str = "",
+    body_text: str = "",
+) -> Offer | None:
+    """Объявление для карточки/GAG: email/id, затем скоринг по теме/телу письма."""
+    off = await find_offer_for_incoming_mail(
+        session,
+        user_id=int(user_id),
+        from_email=from_email,
+        resolved_offer_id=resolved_offer_id,
+    )
+    if off:
+        return off
+    oid, _ = await _resolve_offer_for_incoming(
+        session,
+        user_id=int(user_id),
+        from_email=from_email,
+        subject=subject,
+        from_name=from_name,
+        body_text=body_text,
+    )
+    if not oid:
+        return None
+    return (
+        await session.execute(
+            sa_select(Offer)
+            .where(Offer.id == int(oid))
+            .where(Offer.user_id == int(user_id))
+            .limit(1)
+        )
+    ).scalars().first()
+
+
 async def mail_card_offer_meta(
     session,
     *,
@@ -836,7 +875,7 @@ async def mail_card_offer_meta(
     resolved_offer_id: int | None = None,
 ) -> tuple[int | None, str | None, str | None, str | None, str | None]:
     """Return offer_id, service_label, product_title, photo_url, offer_price."""
-    from services.offer_storage import offer_effective_price
+    from services.offer_storage import offer_effective_price, offer_effective_photo, offer_effective_title
 
     offer_id = resolved_offer_id
     service_label = product_title = photo_url = offer_price = None
@@ -849,9 +888,11 @@ async def mail_card_offer_meta(
         )
         if off:
             offer_id = int(off.id)
-            product_title = (off.title or "").strip() or None
+            t = offer_effective_title(off)
+            product_title = t or None
             service_label = _service_label_from_link((off.link or "").strip())
-            photo_url = (off.photo or "").strip() or None
+            ph = offer_effective_photo(off)
+            photo_url = ph or None
             p = offer_effective_price(off, default="")
             offer_price = p or None
     except Exception:
