@@ -108,6 +108,10 @@ async def mailing_proxy_watch_loop(
         st = get_sending_state(tg_user_id)
         if not st or not st.is_running or st.is_stopping:
             break
+        # Не держим _PROXY_LOCK параллельно с SMTP-рассылкой — иначе 0/73 «зависает».
+        if st.is_running:
+            logger.info("skip proxy recheck during mailing tg=%s", tg_user_id)
+            continue
         try:
             async with db_session() as session:
                 summary = await run_proxy_health_check(session, db_user_id)

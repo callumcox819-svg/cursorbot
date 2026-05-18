@@ -38,7 +38,9 @@ def mailing_send_overall_timeout_sec() -> int:
         (MAIL_VERIFY_SENT_DELAY_SEC + 8 if MAIL_VERIFY_SENT else 0)
         + MAIL_SEND_RETRY_PAUSE_SEC
     )
-    return max(90, int(os.getenv("SEND_ONE_TIMEOUT", str(per_smtp * MAIL_SEND_RETRIES + extra + 20))))
+    raw = int(os.getenv("SEND_ONE_TIMEOUT", str(per_smtp * MAIL_SEND_RETRIES + extra + 20)))
+    # Одно письмо не должно «висеть» в /stat без счётчиков дольше ~6 мин.
+    return max(90, min(360, raw))
 
 
 def _retry_after_failure(err: str | None) -> bool:

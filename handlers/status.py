@@ -80,6 +80,8 @@ def render_status_text(
         acc_a = st.get("accounts_active")
         last_err = (st.get("last_error") or "").strip()
         last_to = (st.get("last_failed_to") or "").strip()
+        current_to = (st.get("current_to") or "").strip()
+        total_st = int(st.get("total_targets") or 0)
     elif st:
         running = bool(getattr(st, "is_running", False) or getattr(st, "running", False))
         sent = int(getattr(st, "sent_count", 0) or getattr(st, "sent", 0) or 0)
@@ -89,6 +91,8 @@ def render_status_text(
         acc_a = getattr(st, "accounts_active", None)
         last_err = (getattr(st, "last_error", "") or "").strip()
         last_to = (getattr(st, "last_failed_to", "") or "").strip()
+        current_to = (getattr(st, "current_to", "") or "").strip()
+        total_st = int(getattr(st, "total_targets", 0) or 0)
     else:
         running = False
         sent = failed = 0
@@ -96,6 +100,8 @@ def render_status_text(
         acc_t = acc_a = None
         last_err = ""
         last_to = ""
+        current_to = ""
+        total_st = 0
 
     # приоритет: свежие значения из БД
     if accounts_total is not None:
@@ -129,8 +135,21 @@ def render_status_text(
             )
 
     progress_line = ""
-    if running and pending_now > 0:
-        progress_line = f"\nПрогресс: <b>{sent}/{pending_now}</b>"
+    total_run = total_st if total_st > 0 else (pending_now + sent + failed)
+    processed = sent + failed
+    if running:
+        if current_to and processed == 0 and failed == 0:
+            progress_line = (
+                f"\n⏳ <b>Идёт отправка</b> (первое письмо, до ~6 мин)\n"
+                f"Кому: <code>{current_to}</code>"
+            )
+        elif total_run > 0:
+            progress_line = (
+                f"\nПрогресс: <b>{processed}/{total_run}</b> "
+                f"(✅ {sent} · ❌ {failed} · в очереди {pending_now})"
+            )
+        elif pending_now > 0:
+            progress_line = f"\nПрогресс: <b>{sent}/{pending_now}</b>"
 
     return (
         "📊 <b>Статус рассылки</b>\n\n"

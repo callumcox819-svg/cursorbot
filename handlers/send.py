@@ -527,10 +527,13 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 acc = rotation_accounts[acc_idx % len(rotation_accounts)]
                 acc_idx += 1
                 tgt = targets[0]
+                to_addr = (tgt.email or "").strip()
+                state.current_to = to_addr
+                state.last_status = "SENDING"
+                set_sending_state(tg_user_id, state=state)
 
                 try:
                     subject, body = await _build_message_for_target(session, tg_user_id, tgt)
-                    to_addr = (tgt.email or "").strip()
                     logger.info(
                         "[mailing rotate] from=%s to=%s subject=%r",
                         acc.email,
@@ -557,10 +560,13 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 except Exception as e:
                     ok, err = False, normalize_send_error(str(e))
 
+                state.current_to = ""
                 if ok:
                     state.sent_count += 1
+                    state.last_status = "NORMAL"
                     await _purge_target(session, db_user_id, tgt.id)
                 else:
+                    state.last_status = "NORMAL"
                     await _handle_send_failure(
                         session=session,
                         db_user_id=db_user_id,
@@ -572,10 +578,10 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                         chat_id=chat_id,
                     )
 
+                set_sending_state(tg_user_id, state=state)
+
             if not state.is_running:
                 break
-
-            set_sending_state(tg_user_id, state=state)
             await asyncio.sleep(random.uniform(min_delay, max_delay))
 
     except TelegramNetworkError:
