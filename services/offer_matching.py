@@ -268,6 +268,8 @@ async def resolve_offer_for_incoming(
     best_email_id: int | None = None
     best_score = -1.0
 
+    subj_strong = subject_is_informative(subject)
+
     for off, oe, email_hit in candidates.values():
         sc = score_offer(
             off,
@@ -277,6 +279,12 @@ async def resolve_offer_for_incoming(
             body_text=body_text,
             email_hit=email_hit,
         )
+        if subj_strong and email_hit:
+            sm = subject_match_score(subject, off)
+            if sm < 28.0:
+                sc -= 95.0
+            elif sm >= 70.0:
+                sc += 40.0
         if sc > best_score:
             best_score = sc
             best_offer_id = int(off.id)
@@ -287,6 +295,20 @@ async def resolve_offer_for_incoming(
     if best_offer_id is not None and best_score >= min_score:
         return best_offer_id, best_email_id
     return None, None
+
+
+def subject_is_informative(subject: str) -> bool:
+    subj = _norm_subject(subject)
+    return len(subj) >= 8 or len(_subject_tokens(subj)) >= 2
+
+
+def subject_token_hits(subject: str, off: Offer) -> int:
+    from services.offer_storage import offer_effective_title
+
+    title_l = offer_effective_title(off).lower()
+    if not title_l:
+        return 0
+    return sum(1 for tok in _subject_tokens(subject) if tok in title_l)
 
 
 def subject_match_score(subject: str, off: Offer) -> float:
@@ -306,9 +328,15 @@ def subject_match_score(subject: str, off: Offer) -> float:
 
     subj_l = subj.lower()
     title_l = title.lower()
+    tok_hits = 0
     for tok in _subject_tokens(subj):
         if tok in title_l:
+            tok_hits += 1
             score += 24.0
+    if tok_hits >= 2:
+        score += 25.0 + tok_hits * 12.0
+    if tok_hits >= 3:
+        score += 40.0
 
     wants_set = any(w in subj_l for w in ("komplette", "complet", "complete", "set "))
     if wants_set:
@@ -368,27 +396,19 @@ async def list_offers_for_seller_email(
     return out
 
 
-async def resolve_best_offer_by_subject(
-    session,
+def _pick_best_offer_by_subject_scores(
+    offers: list[Offer],
     *,
-    user_id: int,
-    from_email: str,
     subject: str,
     from_name: str = "",
     body_text: str = "",
+    min_score: float,
 ) -> Offer | None:
-    offers = await list_offers_for_seller_email(session, user_id=int(user_id), from_email=from_email)
-    if not offers:
-        return None
-
-    subj = _norm_subject(subject)
-    if len(subj) < 8 and len(_subject_tokens(subj)) < 2:
+    if not offers or not subject_is_informative(subject):
         return None
 
     best: Offer | None = None
     best_sc = -1.0
-    multi = len(offers) > 1
-
     for off in offers:
         sc = subject_match_score(subject, off)
         sc += (
@@ -405,7 +425,62 @@ async def resolve_best_offer_by_subject(
             best_sc = sc
             best = off
 
-    min_sc = 58.0 if multi else 42.0
-    if best is not None and best_sc >= min_sc:
+    if best is None:
+        return None
+    if best_sc >= min_score:
+        return best
+    if subject_token_hits(subject, best) >= 3 and best_sc >= 48.0:
         return best
     return None
+
+
+async def resolve_best_offer_by_subject(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+    subject: str,
+    from_name: str = "",
+    body_text: str = "",
+) -> Offer | None:
+    offers = await list_offers_for_seller_email(session, user_id=int(user_id), from_email=from_email)
+    if not offers:
+        return None
+
+    multi = len(offers) > 1
+    return _pick_best_offer_by_subject_scores(
+        offers,
+        subject=subject,
+        from_name=from_name,
+        body_text=body_text,
+        min_score=58.0 if multi else 42.0,
+    )
+
+
+async def resolve_best_offer_by_subject_global(
+    session,
+    *,
+    user_id: int,
+    subject: str,
+    from_name: str = "",
+    body_text: str = "",
+) -> Offer | None:
+    """Если email привязан к другому лоту — ищем оффер по теме среди всех объявлений пользователя."""
+    if not subject_is_informative(subject):
+        return None
+
+    recent = (
+        await session.execute(
+            sa_select(Offer)
+            .where(Offer.user_id == int(user_id))
+            .order_by(Offer.id.desc())
+            .limit(800)
+        )
+    ).scalars().all()
+    return _pick_best_offer_by_subject_scores(
+        list(recent),
+        subject=subject,
+        from_name=from_name,
+        body_text=body_text,
+        min_score=62.0,
+    )

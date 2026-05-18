@@ -832,7 +832,12 @@ async def resolve_offer_for_mail_card(
     body_text: str = "",
 ) -> Offer | None:
     """Карточка/GAG: тема письма → ссылка этого письма → conv ad_url → resolved_offer_id → скоринг."""
-    from services.offer_matching import resolve_best_offer_by_subject
+    from services.offer_matching import (
+        resolve_best_offer_by_subject,
+        resolve_best_offer_by_subject_global,
+        subject_is_informative,
+        subject_match_score,
+    )
     from services.offer_storage import find_offer_by_link
 
     conv = None
@@ -843,17 +848,27 @@ async def resolve_offer_for_mail_card(
             contact_email=_canon_email(from_email or ""),
         )
 
-    # 1) Тема письма — главный сигнал при нескольких лотах у одного продавца
-    off_subj = await resolve_best_offer_by_subject(
-        session,
-        user_id=int(user_id),
-        from_email=from_email,
-        subject=subject,
-        from_name=from_name,
-        body_text=body_text,
-    )
-    if off_subj:
-        return off_subj
+    # 1) Тема письма — главный сигнал (даже если у продавца один лот в БД по email)
+    if subject_is_informative(subject):
+        off_subj = await resolve_best_offer_by_subject(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            subject=subject,
+            from_name=from_name,
+            body_text=body_text,
+        )
+        if off_subj:
+            return off_subj
+        off_subj = await resolve_best_offer_by_subject_global(
+            session,
+            user_id=int(user_id),
+            subject=subject,
+            from_name=from_name,
+            body_text=body_text,
+        )
+        if off_subj:
+            return off_subj
 
     mail_url = (ad_url or "").strip()
     if mail_url:
@@ -878,6 +893,18 @@ async def resolve_offer_for_mail_card(
             )
         ).scalars().first()
         if off:
+            if subject_is_informative(subject):
+                sm = subject_match_score(subject, off)
+                if sm < 25.0:
+                    better = await resolve_best_offer_by_subject_global(
+                        session,
+                        user_id=int(user_id),
+                        subject=subject,
+                        from_name=from_name,
+                        body_text=body_text,
+                    )
+                    if better:
+                        return better
             return off
 
     oid, _ = await _resolve_offer_for_incoming(
@@ -1144,21 +1171,31 @@ async def _process_mails_for_account_impl(
                         resolve_best_offer_by_subject,
                     )
 
-                    offers_for_seller = await list_offers_for_seller_email(
-                        session,
-                        user_id=int(user_id),
-                        from_email=from_email_clean,
+                    from services.offer_matching import (
+                        resolve_best_offer_by_subject,
+                        resolve_best_offer_by_subject_global,
+                        subject_is_informative,
                     )
+
                     off_subj = None
-                    if len(offers_for_seller) > 1:
+                    subj = subject or ""
+                    if subject_is_informative(subj):
                         off_subj = await resolve_best_offer_by_subject(
                             session,
                             user_id=int(user_id),
                             from_email=from_email_clean,
-                            subject=subject or "",
+                            subject=subj,
                             from_name=from_name or "",
                             body_text=body_clean or "",
                         )
+                        if not off_subj:
+                            off_subj = await resolve_best_offer_by_subject_global(
+                                session,
+                                user_id=int(user_id),
+                                subject=subj,
+                                from_name=from_name or "",
+                                body_text=body_clean or "",
+                            )
                     if off_subj:
                         resolved_offer_id = int(off_subj.id)
                         resolved_offer_email_id = None
@@ -1167,7 +1204,7 @@ async def _process_mails_for_account_impl(
                             session,
                             user_id=user_id,
                             from_email=from_email_clean,
-                            subject=subject or "",
+                            subject=subj,
                             from_name=from_name or "",
                             body_text=body_clean or "",
                         )
