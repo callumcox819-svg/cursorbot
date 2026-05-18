@@ -1164,18 +1164,26 @@ async def _process_mails_for_account_impl(
             resolved_offer_id: int | None = None
             resolved_offer_email_id: int | None = None
             mail_db_id: int | None = None
+            account_already_smtp_blocked = False
             try:
                 async with _imap_db_session() as session:
-                    from services.offer_matching import (
-                        list_offers_for_seller_email,
-                        resolve_best_offer_by_subject,
-                    )
-
                     from services.offer_matching import (
                         resolve_best_offer_by_subject,
                         resolve_best_offer_by_subject_global,
                         subject_is_informative,
                     )
+
+                    if smtp_block_bounce:
+                        acc_st = (
+                            await session.execute(
+                                sa_select(EmailAccount.status).where(
+                                    EmailAccount.id == int(acc_id)
+                                ).limit(1)
+                            )
+                        ).scalar_one_or_none()
+                        account_already_smtp_blocked = (
+                            str(acc_st or "").strip().lower() == "smtp_blocked"
+                        )
 
                     off_subj = None
                     subj = subject or ""
@@ -1251,6 +1259,35 @@ async def _process_mails_for_account_impl(
             if already_notified_tg:
                 forwarded += 1
                 continue
+
+            # Повторные Message blocked на уже снятом с SMTP ящике — не спамим карточками.
+            if smtp_block_bounce and account_already_smtp_blocked:
+                forwarded += 1
+                continue
+
+            # Первый block bounce: сразу smtp_blocked, чтобы в этом же опросе не ушло 2–3 карточки.
+            if smtp_block_bounce and not account_already_smtp_blocked:
+                try:
+                    async with _imap_db_session() as session:
+                        acc_pre = (
+                            await session.execute(
+                                sa_select(EmailAccount).where(EmailAccount.id == int(acc_id)).limit(1)
+                            )
+                        ).scalars().first()
+                        if acc_pre:
+                            from services.smtp_block_control import mark_account_smtp_blocked
+
+                            await mark_account_smtp_blocked(
+                                session,
+                                acc_pre,
+                                (body_clean or subject or "SMTP block bounce")[:1000],
+                                db_user_id=int(user_id),
+                                bot=bot,
+                                chat_id=int(tg_id),
+                                force=True,
+                            )
+                except Exception:
+                    logger.exception("Failed pre-mark smtp_blocked acc=%s", acc_id)
 
             # ad_url берём ТОЛЬКО из БД (по ТЗ: не ищем ссылку в теле письма)
             ad_url: str | None = None
@@ -1460,32 +1497,6 @@ async def _process_mails_for_account_impl(
                     )
                 except Exception:
                     pass
-
-            # ✅ Если пришёл DSN/блокировка (Message blocked) — помечаем аккаунт как неактивный
-            # и (при включённом контроле блокировок) пишем уведомление.
-            bounce_err = (body_clean or subject or "").strip()
-            if smtp_block_bounce and account_email:
-                try:
-                    async with _imap_db_session() as session:
-                        acc = (
-                            await session.execute(
-                                sa_select(EmailAccount).where(EmailAccount.id == int(acc_id)).limit(1)
-                            )
-                        ).scalars().first()
-                        if acc:
-                            from services.smtp_block_control import mark_account_smtp_blocked
-
-                            await mark_account_smtp_blocked(
-                                session,
-                                acc,
-                                bounce_err or "SMTP block bounce",
-                                db_user_id=int(user_id),
-                                bot=bot,
-                                chat_id=int(tg_id),
-                                force=True,
-                            )
-                except Exception:
-                    logger.exception("Failed to mark smtp_blocked for %s", account_email)
 
             forwarded += 1
 
