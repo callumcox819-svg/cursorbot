@@ -81,9 +81,18 @@ def set_sending_state(user_id: int, state: Optional[SendingState] = None, **kwar
 SMTP_CONCURRENCY_WITH_PROXY = 1
 SMTP_CONCURRENCY_NO_PROXY = 1
 
-# До 3 прокси × SMTP_TIMEOUT_SEC + запас (иначе ложный PROXY_ERROR|timeout).
-SEND_ONE_TIMEOUT = max(60, int(os.getenv("SEND_ONE_TIMEOUT", str(SMTP_TIMEOUT_SEC * 3 + 25))))
-SEND_BATCH_TIMEOUT = max(90, int(os.getenv("SEND_BATCH_TIMEOUT", str(SMTP_TIMEOUT_SEC * 2 + 40))))
+def _mailing_send_timeouts() -> tuple[int, int]:
+    from services.smtp_proxy_send import MAIL_SMTP_MAX_PROXIES, MAIL_SMTP_TIMEOUT_SEC
+
+    one = MAIL_SMTP_MAX_PROXIES * MAIL_SMTP_TIMEOUT_SEC + 25
+    batch = MAIL_SMTP_TIMEOUT_SEC + 45
+    return (
+        max(60, int(os.getenv("SEND_ONE_TIMEOUT", str(one)))),
+        max(75, int(os.getenv("SEND_BATCH_TIMEOUT", str(batch)))),
+    )
+
+
+SEND_ONE_TIMEOUT, SEND_BATCH_TIMEOUT = _mailing_send_timeouts()
 MAX_PROXY_FAILS_PER_TARGET = 5
 
 # user settings keys (уже используются в проекте)
