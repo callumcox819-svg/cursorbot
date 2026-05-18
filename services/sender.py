@@ -364,6 +364,8 @@ def should_retry_send_with_other_proxy(err: str | None) -> bool:
         return False
     if "no_active_proxy" in s.lower() or "no_proxy_context" in s.lower():
         return False
+    if kind in {"SMTP_SESSION_LOST", "SMTP_TIMEOUT", "PROXY_ERROR"}:
+        return True
     if is_smtp_timeout_error(err) or is_transient_connection_error(err):
         return True
     if is_definite_proxy_failure(err) or is_proxy_error_marker(err):
@@ -404,6 +406,15 @@ def _is_hard_bounce(code: Optional[str], text: str) -> bool:
     if "5.1.1" in t or "5.1.0" in t:
         return True
     return any(re.search(p, t) for p in _HARD_PATTERNS)
+
+
+def _confirm_smtp_session(s: smtplib.SMTP) -> bool:
+    """Проверка, что соединение с SMTP ещё живо после DATA (иначе ложный «успех»)."""
+    try:
+        code, _ = s.noop()
+        return 200 <= int(code) < 400
+    except Exception:
+        return False
 
 
 def _marker(kind: str, code: Optional[str], text: str) -> str:
@@ -455,6 +466,8 @@ def _send_plain_sync(
             if refused:
                 logger.warning("[SMTP] Recipient refused: %s", refused)
                 return False, "RECIPIENT_REFUSED", None
+            if not _confirm_smtp_session(s):
+                return False, _marker("SMTP_SESSION_LOST", None, "connection lost after DATA"), None
 
         msgid = msg.get("Message-ID")
         logger.info(
@@ -536,12 +549,23 @@ def _send_batch_sync(
 
             for to_email, subject, body in items:
                 body = apply_placeholders(body)
-                msg = _build_message(from_email=account.email, to_email=to_email, subject=subject, body=body, sender_name=sender_name)
+                msg = _build_message(
+                    from_email=account.email,
+                    to_email=to_email,
+                    subject=subject,
+                    body=body,
+                    sender_name=sender_name,
+                )
                 try:
-                    refused = s.sendmail(account.email, [to_email], msg.as_string())
+                    refused = s.send_message(msg, from_addr=account.email, to_addrs=[to_email])
                     if refused:
                         logger.warning("[SMTP] Recipient refused (batch): %s", refused)
                         results.append((False, "RECIPIENT_REFUSED"))
+                    elif not _confirm_smtp_session(s):
+                        results.append(
+                            (False, _marker("SMTP_SESSION_LOST", None, "connection lost after DATA"))
+                        )
+                        break
                     else:
                         logger.info(
                             "[SMTP] Sent mail (batch) via %s -> %s subject=%r msgid=%s",
@@ -570,11 +594,18 @@ def _send_batch_sync(
                         results.append((False, _marker("RECIPIENT_DEAD", code, text)))
                     else:
                         results.append((False, f"{type(e).__name__}: {code or ''} {text}".strip() or str(e)))
+                    try:
+                        s.rset()
+                    except Exception:
+                        break
 
     except Exception as e:
         code, text = _extract_code_text_from_exception(e)
-        err = f"{type(e).__name__}: {code or ''} {text}".strip() or str(e)
-        return [(False, err) for _ in items]
+        err = normalize_send_error(
+            f"{type(e).__name__}: {code or ''} {text}".strip() or str(e)
+        )
+        while len(results) < len(items):
+            results.append((False, err))
 
     return results
 

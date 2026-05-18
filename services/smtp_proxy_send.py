@@ -14,7 +14,6 @@ from models import EmailAccount, Proxy
 from proxy_manager import ProxySMTPContext, is_socks5_proxy
 from services.sender import (
     is_definite_proxy_failure,
-    is_proxy_error_marker,
     is_smtp_timeout_error,
     normalize_send_error,
     send_batch_via_account,
@@ -31,9 +30,9 @@ NO_ACTIVE_PROXY = "PROXY_ERROR|no_active_proxy|No active proxy configured"
 REPLY_SMTP_TIMEOUT_SEC = max(15, min(60, int(os.getenv("REPLY_SMTP_TIMEOUT_SEC", "28"))))
 REPLY_SMTP_MAX_PROXIES = max(1, min(6, int(os.getenv("REPLY_SMTP_MAX_PROXIES", "2"))))
 
-# Рассылка /send: один «рабочий» SOCKS5 + запасной, без перебора всех подряд.
-MAIL_SMTP_TIMEOUT_SEC = max(20, min(90, int(os.getenv("MAIL_SMTP_TIMEOUT_SEC", "40"))))
-MAIL_SMTP_MAX_PROXIES = max(1, min(6, int(os.getenv("MAIL_SMTP_MAX_PROXIES", "2"))))
+# Рассылка /send: несколько SOCKS5, таймаут на каждую попытку.
+MAIL_SMTP_TIMEOUT_SEC = max(25, min(90, int(os.getenv("MAIL_SMTP_TIMEOUT_SEC", "55"))))
+MAIL_SMTP_MAX_PROXIES = max(1, min(8, int(os.getenv("MAIL_SMTP_MAX_PROXIES", "4"))))
 
 _LAST_OK_PROXY_ID: dict[int, int] = {}
 
@@ -190,38 +189,62 @@ async def send_batch_via_account_with_proxy(
     items: list[tuple[str, str, str]],
     sender_name: Optional[str] = None,
 ) -> List[Tuple[bool, Optional[str]]]:
+    """Отправка пачки: неудачные адреса повторяются на следующем SOCKS5 (не «3 из 10»)."""
+    n = len(items)
+    if n == 0:
+        return []
+
     proxies = await _list_active_socks5_proxies(session, user_id)
     if not proxies:
         return [(False, NO_ACTIVE_PROXY) for _ in items]
 
     order = _order_proxies_for_send(int(user_id), proxies, fast=False)
-    last_results: List[Tuple[bool, Optional[str]]] = [
-        (False, NO_ACTIVE_PROXY) for _ in items
-    ]
+    merged: List[Tuple[bool, Optional[str]]] = [(False, NO_ACTIVE_PROXY) for _ in range(n)]
+    pending: List[int] = list(range(n))
 
     for proxy in order:
+        if not pending:
+            break
+
         pid = int(proxy.id)
+        batch_items = [items[i] for i in pending]
+        logger.info(
+            "[SMTP batch] proxy_id=%s account=%s pending=%s/%s",
+            pid,
+            account.email,
+            len(batch_items),
+            n,
+        )
+
         async with ProxySMTPContext(proxy):
             raw = await send_batch_via_account(
                 account,
-                items,
+                batch_items,
                 sender_name=sender_name,
                 smtp_timeout_sec=MAIL_SMTP_TIMEOUT_SEC,
             )
-        out: list[tuple[bool, str | None]] = []
+
+        new_pending: List[int] = []
         any_ok = False
-        for ok, err in raw:
+        for j, idx in enumerate(pending):
+            ok, err = raw[j] if j < len(raw) else (False, "BATCH_INDEX_ERROR")
             err_n = normalize_send_error(err)
+            merged[idx] = (bool(ok), err_n)
             if ok:
                 any_ok = True
-            out.append((bool(ok), err_n))
-        last_results = out
+            elif should_retry_send_with_other_proxy(err_n):
+                new_pending.append(idx)
+
         if any_ok:
             _LAST_OK_PROXY_ID[int(user_id)] = pid
-            return out
-        last_err = next((e for o, e in out if not o and e), None)
+
+        if not new_pending:
+            return merged
+
+        last_err = next((e for o, e in merged if not o and e), None)
         if not should_retry_send_with_other_proxy(last_err):
-            return out
+            return merged
+
         try:
             await ProxyManager.note_proxy_failure(
                 session,
@@ -232,4 +255,6 @@ async def send_batch_via_account_with_proxy(
         except Exception:
             pass
 
-    return last_results
+        pending = new_pending
+
+    return merged

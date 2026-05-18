@@ -81,18 +81,16 @@ def set_sending_state(user_id: int, state: Optional[SendingState] = None, **kwar
 SMTP_CONCURRENCY_WITH_PROXY = 1
 SMTP_CONCURRENCY_NO_PROXY = 1
 
-def _mailing_send_timeouts() -> tuple[int, int]:
+def mailing_send_timeouts(*, batch_size: int = 1) -> tuple[int, int]:
     from services.smtp_proxy_send import MAIL_SMTP_MAX_PROXIES, MAIL_SMTP_TIMEOUT_SEC
 
-    one = MAIL_SMTP_MAX_PROXIES * MAIL_SMTP_TIMEOUT_SEC + 25
-    batch = MAIL_SMTP_TIMEOUT_SEC + 45
+    bs = max(1, int(batch_size))
+    one = MAIL_SMTP_MAX_PROXIES * MAIL_SMTP_TIMEOUT_SEC + 30
+    batch = MAIL_SMTP_TIMEOUT_SEC * bs + 40
     return (
-        max(60, int(os.getenv("SEND_ONE_TIMEOUT", str(one)))),
-        max(75, int(os.getenv("SEND_BATCH_TIMEOUT", str(batch)))),
+        max(75, int(os.getenv("SEND_ONE_TIMEOUT", str(one)))),
+        max(90, int(os.getenv("SEND_BATCH_TIMEOUT", str(batch)))),
     )
-
-
-SEND_ONE_TIMEOUT, SEND_BATCH_TIMEOUT = _mailing_send_timeouts()
 MAX_PROXY_FAILS_PER_TARGET = 5
 
 # user settings keys (уже используются в проекте)
@@ -301,10 +299,13 @@ async def start_sending(message: Message):
 
     await set_mailing_active(tg_user_id, active=True)
 
+    from services.smtp_proxy_send import MAIL_SMTP_MAX_PROXIES, MAIL_SMTP_TIMEOUT_SEC
+
     await tg_answer_safe(
         message,
-        "✅ Рассылка запущена (NORMAL).\n"
-        f"В очереди: <b>{total_targets}</b> email",
+        "✅ Рассылка запущена.\n"
+        f"В очереди: <b>{total_targets}</b> email\n"
+        f"SMTP: до <b>{MAIL_SMTP_MAX_PROXIES}</b> SOCKS5 × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с",
         reply_markup=main_menu_kb(tg_user_id),
         parse_mode="HTML",
     )
@@ -341,9 +342,11 @@ async def _notify_sending_finished(*, bot: Bot, chat_id: int, tg_user_id: int) -
 
     text = (
         f"{title}\n\n"
-        f"Отправлено: <b>{sent}</b>\n"
+        f"Принято SMTP (снято с очереди): <b>{sent}</b>\n"
         f"Ошибок отправки: <b>{failed}</b>\n"
-        f"Email в очереди: <b>{pending}</b>"
+        f"Email в очереди: <b>{pending}</b>\n\n"
+        f"<i>Если ответов мало — проверьте прокси (SMTP+STARTTLS OK), "
+        f"batch_size 1–3, задержку 2–5 с.</i>"
     )
     if failed > 0 and (state.last_error or "").strip() not in ("", "-"):
         who = f"\nПоследний адрес: <code>{state.last_failed_to}</code>" if state.last_failed_to else ""
@@ -458,7 +461,7 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
         timing = await load_timing(session, tg_user_id)
         min_delay = float(timing.get("min_delay", 1.5))
         max_delay = float(timing.get("max_delay", 3.0))
-        batch_size = int(timing.get("batch_size", 1))
+        batch_size = max(1, min(5, int(timing.get("batch_size", 1))))
 
     try:
         while True:
@@ -499,6 +502,8 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 acc = accounts[acc_idx % len(accounts)]
                 acc_idx += 1
 
+                send_one_timeout, send_batch_timeout = mailing_send_timeouts(batch_size=batch_size)
+
                 if batch_size <= 1:
                     tgt = targets[0]
                     try:
@@ -515,11 +520,11 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                                     body,
                                     sender_name=sender_name,
                                 ),
-                                timeout=SEND_ONE_TIMEOUT,
+                                timeout=send_one_timeout,
                             )
                     except asyncio.TimeoutError:
                         ok, err = False, normalize_send_error(
-                            f"SMTP_TIMEOUT|timeout|SMTP send exceeded {SEND_ONE_TIMEOUT}s"
+                            f"SMTP_TIMEOUT|timeout|SMTP send exceeded {send_one_timeout}s"
                         )
                     except Exception as e:
                         ok, err = False, normalize_send_error(str(e))
@@ -557,11 +562,11 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                                     items,
                                     sender_name=sender_name,
                                 ),
-                                timeout=SEND_BATCH_TIMEOUT,
+                                timeout=send_batch_timeout,
                             )
                     except asyncio.TimeoutError:
                         err = normalize_send_error(
-                            f"SMTP_TIMEOUT|timeout|SMTP batch exceeded {SEND_BATCH_TIMEOUT}s"
+                            f"SMTP_TIMEOUT|timeout|SMTP batch exceeded {send_batch_timeout}s"
                         )
                         results = [(False, err) for _ in batch]
                     except Exception as e:
