@@ -93,6 +93,7 @@ def is_transient_smtp_check_failure(err: str | None) -> bool:
         "temporarily unavailable",
         "proxy",
         "socks",
+        "server_hostname cannot be an empty",
     )
     return any(p in t for p in phrases)
 
@@ -326,47 +327,30 @@ async def check_smtp_accounts_parallel(
     on_progress: Callable[[int, int, str | None], Awaitable[None]] | None = None,
 ) -> List[SmtpCheckResult]:
     """
-    Параллельная SMTP-проверка (несколько ящиков одновременно, отдельный SOCKS на поток).
+    Проверка SMTP тем же путём, что рассылка: ProxySMTPContext + smtplib (по одному ящику).
+    workers игнорируется — глобальный SOCKS-lock не позволяет честный параллелизм.
     """
+    del workers
     if not accounts:
         return []
 
-    n_workers = workers if workers is not None else SMTP_CHECK_WORKERS
-    sem = asyncio.Semaphore(max(1, n_workers))
-    proxies = await _load_user_proxies(session, user_id)
     total = len(accounts)
-    done = 0
+    out: List[SmtpCheckResult] = []
 
-    async def _one(acc: EmailAccount) -> SmtpCheckResult:
-        nonlocal done
+    for i, acc in enumerate(accounts):
         acc_id = int(acc.id)
         email = (acc.email or "").strip()
-        async with sem:
-            if not proxies:
-                st, err = None, "PROXY_ERROR|no_active_proxy|No active proxy configured"
-            else:
-                proxy = proxies[acc_id % len(proxies)]
-                try:
-                    st, err = await asyncio.to_thread(
-                        check_smtp_account_via_proxy_isolated,
-                        proxy,
-                        acc,
-                        timeout=SMTP_CHECK_TIMEOUT_SEC,
-                    )
-                except Exception as e:
-                    logger.exception("[SMTP check] thread crash %s", email)
-                    st, err = _classify_exception(e)
-        done += 1
+        try:
+            st, err = await check_smtp_account_with_proxy(session, int(user_id), acc)
+        except Exception as e:
+            logger.exception("[SMTP check] crash %s", email)
+            st, err = _classify_exception(e)
+
+        out.append(SmtpCheckResult(account_id=acc_id, email=email, status=st, error=err))
         if on_progress:
             try:
-                await on_progress(done, total, email)
+                await on_progress(i + 1, total, email)
             except Exception:
                 logger.exception("[SMTP check] on_progress failed")
-        return SmtpCheckResult(account_id=acc_id, email=email, status=st, error=err)
 
-    tasks = [asyncio.create_task(_one(a)) for a in accounts]
-    out: List[SmtpCheckResult] = []
-    for fut in asyncio.as_completed(tasks):
-        out.append(await fut)
-    out.sort(key=lambda r: r.account_id)
     return out

@@ -501,11 +501,10 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
         return await callback.answer("Нет аккаунтов для проверки.", show_alert=True)
 
     total_accounts = len(accounts_n)
-    workers = max(1, min(10, int(os.getenv("ACCOUNTS_SMTP_CHECK_CONCURRENCY", "5"))))
     await callback.answer("Запускаю проверку SMTP…")
     status_msg = await callback.message.answer(
         f"⏳ <b>Проверка SMTP</b>\n\n0/{total_accounts}\n"
-        f"Параллельно: <b>{workers}</b> потоков",
+        f"<i>Как при рассылке: SOCKS5 → Gmail, по одному ящику</i>",
         parse_mode="HTML",
     )
 
@@ -535,7 +534,7 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
             try:
                 await status_msg.edit_text(
                     f"⏳ <b>Проверка SMTP</b>\n\n{done}/{tot}\n"
-                    f"Параллельно: <b>{workers}</b> потоков\n{em}",
+                    f"<i>SOCKS5 → Gmail</i>\n{em}",
                     parse_mode="HTML",
                 )
             except TelegramBadRequest:
@@ -576,7 +575,6 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
                     session,
                     db_uid,
                     accounts,
-                    workers=workers,
                     on_progress=_on_progress,
                 )
 
