@@ -159,21 +159,29 @@ async def save_smart_texts(tg_id: int, texts: List[str]) -> None:
     await save_json_blob(int(tg_id), "smart_templates", clean)
 
 
+async def _mailing_text_pool(tg_id: int) -> List[str]:
+    """Умные пресеты + тексты из пресетов с названием (как в подсказке UI)."""
+    pool = list(await load_smart_texts(int(tg_id)))
+    for it in await load_templates(int(tg_id)):
+        body = (it.text or "").strip()
+        if body:
+            pool.append(body)
+    return pool
+
+
 async def pick_random_smart_preset(tg_id: int, offer_title: str) -> str:
-    """Случайный умный пресет: спинтаксис + подстановка OFFER."""
+    """Случайный текст: пресет → спинтакс {a|b} → OFFER = название товара."""
     import random
 
+    from services.offer_text import apply_offer_to_text
     from services.spintax import expand_spintax
 
-    texts = await load_smart_texts(int(tg_id))
+    texts = await _mailing_text_pool(tg_id)
     if not texts:
         return ""
     base = texts[random.randrange(len(texts))]
     txt = expand_spintax(base)
-    title = (offer_title or "").strip()
-    if title:
-        txt = txt.replace("OFFER", title)
-    return txt
+    return apply_offer_to_text(txt, offer_title)
 
 
 def _load_templates_sync(tg_id: int) -> List[TemplateItem]:

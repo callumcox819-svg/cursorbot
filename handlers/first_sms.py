@@ -46,16 +46,14 @@ async def save_presets(tg_id: int, items: List[FirstSmsPreset]) -> None:
 
 
 async def pick_random_first_sms(tg_id: int, offer_title: str) -> str:
-    """Pick random preset, apply spintax and OFFER placeholder."""
+    """Первые смс: спинтакс + OFFER (если умные пресеты пустые)."""
+    from services.offer_text import apply_offer_to_text
     from services.spintax import expand_spintax
 
     items = await load_presets(tg_id)
     base = items[random.randrange(len(items))].text if items else "Hello! Is this item still available? OFFER"
     txt = expand_spintax(base)
-    title = (offer_title or "").strip()
-    if title:
-        txt = txt.replace("OFFER", title)
-    return txt
+    return apply_offer_to_text(txt, offer_title)
 
 
 def _manage_kb(has_any: bool) -> InlineKeyboardMarkup:
