@@ -42,7 +42,6 @@ from services.sending_state import SendingState
 from services.sending_state import get_state as _get_sending_state
 from services.sending_state import set_state as _set_sending_state
 from services.settings import load_timing
-from services.proxy_manager import choose_proxy_for_user
 router = Router(name="send")
 logger = logging.getLogger(__name__)
 
@@ -229,7 +228,12 @@ async def start_sending(message: Message):
     chat_id = message.chat.id
     bot = message.bot
 
-    await tg_answer_safe(message, "⏳ Проверяю очередь, аккаунты и прокси…")
+    await tg_answer_safe(
+        message,
+        "⏳ Проверяю очередь и аккаунты…\n"
+        "<i>Прокси не тестируются отдельно — проверка идёт при первой отправке через SOCKS5.</i>",
+        parse_mode="HTML",
+    )
 
     async with db_session() as session:
         db_user = await get_or_create_user(session, int(tg_user_id))
@@ -305,7 +309,9 @@ async def start_sending(message: Message):
         message,
         "✅ Рассылка запущена.\n"
         f"В очереди: <b>{total_targets}</b> email\n"
-        f"SMTP: до <b>{MAIL_SMTP_MAX_PROXIES}</b> SOCKS5 × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с",
+        f"SOCKS5: до <b>{MAIL_SMTP_MAX_PROXIES}</b> попыток × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с "
+        f"(все в списке, не только 🟢)\n"
+        f"<i>Ошибка SMTP не отключает прокси в «Прокси».</i>",
         reply_markup=main_menu_kb(tg_user_id),
         parse_mode="HTML",
     )

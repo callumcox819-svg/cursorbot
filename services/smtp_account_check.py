@@ -266,7 +266,7 @@ async def check_smtp_account_with_proxy(
     """Одна проверка через SOCKS5 с ротацией прокси при сбое туннеля."""
     from proxy_manager import ProxySMTPContext
     from services.smtp_proxy_send import choose_required_proxy
-    from services.sender import is_definite_proxy_failure, should_retry_send_with_other_proxy
+    from services.sender import should_retry_send_with_other_proxy
     from services.proxy_manager import ProxyManager
 
     last_err: str | None = None
@@ -294,7 +294,7 @@ async def check_smtp_account_with_proxy(
 
         try:
             await ProxyManager.note_proxy_failure(
-                session, pid, (err or "")[:500], deactivate=is_definite_proxy_failure(err)
+                session, pid, (err or "")[:500], deactivate=False
             )
         except Exception:
             pass

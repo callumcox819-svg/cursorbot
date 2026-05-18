@@ -89,7 +89,7 @@ class ProxyManager:
         session: AsyncSession, proxy_id: int, error: str
     ) -> None:
         await ProxyManager.note_proxy_failure(
-            session, proxy_id, error, deactivate=True
+            session, proxy_id, error, deactivate=False
         )
 
     @staticmethod
