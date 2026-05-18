@@ -228,12 +228,7 @@ async def start_sending(message: Message):
     chat_id = message.chat.id
     bot = message.bot
 
-    await tg_answer_safe(
-        message,
-        "⏳ Проверяю очередь и аккаунты…\n"
-        "<i>Прокси не тестируются отдельно — проверка идёт при первой отправке через SOCKS5.</i>",
-        parse_mode="HTML",
-    )
+    await tg_answer_safe(message, "⏳ Проверяю очередь и аккаунты…")
 
     async with db_session() as session:
         db_user = await get_or_create_user(session, int(tg_user_id))
@@ -269,15 +264,14 @@ async def start_sending(message: Message):
             await tg_answer_safe(message, "⚠️ Рассылка уже запущена.")
             return
 
-        proxies_total = (
-            await session.execute(
-                select(func.count(Proxy.id))
-                .where(Proxy.user_id == db_user_id)
-                .where(Proxy.type.in_(["socks5", "socks5h"]))
-            )
-        ).scalar() or 0
+        from proxy_manager import is_socks5_proxy
 
-        if proxies_total <= 0:
+        all_px = (
+            await session.execute(select(Proxy).where(Proxy.user_id == db_user_id))
+        ).scalars().all()
+        socks_proxies = [p for p in all_px if is_socks5_proxy(p)]
+
+        if not socks_proxies:
             await tg_answer_safe(
                 message,
                 "❌ Нет SOCKS5 прокси. Добавьте socks5://… в «Прокси».",
@@ -285,6 +279,30 @@ async def start_sending(message: Message):
             )
             return
 
+    from services.mailing_proxy_health import (
+        MAIL_PROXY_PREFLIGHT_TIMEOUT,
+        MAIL_PROXY_RECHECK_SEC,
+        preflight_proxies_for_mailing,
+    )
+
+    await tg_answer_safe(
+        message,
+        f"⏳ <b>Проверяю {len(socks_proxies)} прокси</b> (SOCKS5 → smtp.gmail.com:587)…\n"
+        f"<i>До ~{max(30, len(socks_proxies) * MAIL_PROXY_PREFLIGHT_TIMEOUT // 2)} с</i>",
+        parse_mode="HTML",
+    )
+
+    can_start, _summary, proxy_detail = await preflight_proxies_for_mailing(int(db_user_id))
+    if not can_start:
+        await tg_answer_safe(
+            message,
+            proxy_detail,
+            reply_markup=main_menu_kb(tg_user_id),
+            parse_mode="HTML",
+        )
+        return
+
+    async with db_session() as session:
         state = SendingState(
             user_id=tg_user_id,
             is_running=True,
@@ -309,11 +327,25 @@ async def start_sending(message: Message):
         message,
         "✅ Рассылка запущена.\n"
         f"В очереди: <b>{total_targets}</b> email\n"
-        f"SOCKS5: до <b>{MAIL_SMTP_MAX_PROXIES}</b> попыток × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с "
-        f"(все в списке, не только 🟢)\n"
-        f"<i>Ошибка SMTP не отключает прокси в «Прокси».</i>",
+        f"{proxy_detail}\n"
+        f"Отправка: до <b>{MAIL_SMTP_MAX_PROXIES}</b> SOCKS5 × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с\n"
+        f"<i>Прокси перепроверяются каждые {MAIL_PROXY_RECHECK_SEC // 60} мин во время рассылки.</i>",
         reply_markup=main_menu_kb(tg_user_id),
         parse_mode="HTML",
+    )
+
+    from services.mailing_proxy_health import mailing_proxy_watch_loop
+    from utils.bg_jobs import start as bg_start
+
+    bg_start(
+        tg_user_id,
+        "mailing_proxy_watch",
+        mailing_proxy_watch_loop(
+            tg_user_id=tg_user_id,
+            db_user_id=int(db_user_id),
+            bot=bot,
+            chat_id=chat_id,
+        ),
     )
 
     asyncio.create_task(
