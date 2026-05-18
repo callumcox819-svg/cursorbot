@@ -17,6 +17,17 @@ async def set_mailing_active(telegram_id: int, *, active: bool) -> None:
         await set_user_setting(session, user, MAILING_ACTIVE_KEY, "1" if active else "0")
 
 
+async def is_user_mailing_active(telegram_id: int) -> bool:
+    """Активна ли рассылка /send у пользователя (память процесса + флаг в БД)."""
+    from services.sending_state import get_sending_state
+
+    tid = int(telegram_id)
+    st = get_sending_state(tid)
+    if st and bool(st.is_running) and not bool(st.is_stopping):
+        return True
+    return tid in await mailing_telegram_ids_from_db()
+
+
 async def mailing_telegram_ids_from_db() -> frozenset[int]:
     async with db_session() as session:
         rows = (

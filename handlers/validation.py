@@ -23,6 +23,8 @@ from services.validemail_validator import (
 )
 from services.offer_storage import save_all_offers_from_import
 from services.seller_name import MIN_NAME_TOKEN_LEN, seller_name_eligible_for_validation, seller_name_from_item
+from services.sending_state import get_sending_state, set_sending_state
+from services.mailing_active_db import is_user_mailing_active
 from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 
 router = Router()
@@ -443,6 +445,7 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
     eligible = int(live_stats.get("offers_eligible") or 0)
 
     pending_names = live_stats.get("pending_seller_names") or set()
+    append_to_active_mailing = False
 
     async with Session() as session:
         user = await get_or_create_user(session, tg_id)
@@ -454,7 +457,8 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
                 await add_seller_name_blacklist(session, int(user.id), _key)
             await session.commit()
 
-        if REPLACE_OLD_FOR_USER:
+        append_to_active_mailing = await is_user_mailing_active(tg_id)
+        if REPLACE_OLD_FOR_USER and not append_to_active_mailing:
             offer_ids = [
                 o.id
                 for o in (
@@ -480,6 +484,22 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
         )
         await session.commit()
 
+        if append_to_active_mailing and saved_email_count > 0:
+            from sqlalchemy import func as sql_func
+
+            pending_now = (
+                await session.execute(
+                    select(sql_func.count(OfferEmail.id))
+                    .select_from(OfferEmail)
+                    .join(Offer, OfferEmail.offer_id == Offer.id)
+                    .where(Offer.user_id == user.id)
+                )
+            ).scalar() or 0
+            st = get_sending_state(tg_id)
+            if st and st.is_running:
+                st.total_targets = int(st.sent_count) + int(st.failed_count) + int(pending_now)
+                set_sending_state(tg_id, st)
+
     out_path = os.path.join(
         tempfile.gettempdir(),
         f"validated_{tg_id}_{int(time.time())}.json"
@@ -498,7 +518,11 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
     except Exception:
         pass
 
+    append_note = " · ➕ добавлено к активной рассылке" if append_to_active_mailing else ""
     await message.answer_document(
         FSInputFile(out_path),
-        caption=f"📎 Результат · в БД {offers_saved}/{total_offers} · email {saved_email_count}",
+        caption=(
+            f"📎 Результат · в БД {offers_saved}/{total_offers} · email {saved_email_count}"
+            f"{append_note}"
+        ),
     )
