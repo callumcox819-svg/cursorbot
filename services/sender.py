@@ -34,7 +34,7 @@ SMTP_BY_PROVIDER = {
     "zoho": ("smtp.zoho.com", 587),
 }
 
-SMTP_TIMEOUT_SEC = max(15, min(90, int(os.getenv("SMTP_TIMEOUT_SEC", "45"))))
+SMTP_TIMEOUT_SEC = max(20, min(120, int(os.getenv("SMTP_TIMEOUT_SEC", "60"))))
 
 logger = logging.getLogger(__name__)
 
