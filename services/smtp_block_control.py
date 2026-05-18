@@ -145,12 +145,14 @@ async def mark_account_smtp_blocked(
 
     notify = force or await block_control_enabled(session, db_user_id)
     if bot and chat_id and notify:
-        await notify_smtp_stream_stopped_for_imap(
-            bot,
-            int(chat_id),
-            account.email or "",
-            reason=err,
-        )
+        # IMAP Message blocked: карточка письма уже с предупреждением — без дубля текста ошибки.
+        if not force:
+            await notify_smtp_stream_stopped_for_imap(
+                bot,
+                int(chat_id),
+                account.email or "",
+                reason=err,
+            )
         em = html.escape((account.email or "").strip())
         await bot.send_message(
             int(chat_id),
