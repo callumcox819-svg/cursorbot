@@ -24,6 +24,7 @@ _ERROR_HINTS = {
     "ACCOUNT_RATE_LIMIT": "Лимит отправки Gmail — сделайте паузу или смените аккаунт",
     "ACCOUNT_BLOCKED": "Почтовый аккаунт заблокирован для отправки",
     "RECIPIENT_DEAD": "Адрес не существует (удалён из очереди)",
+    "SMTP_ACCEPTED_NOT_IN_SENT": "SMTP принял, но в «Отправленных» нет — адрес остаётся в очереди",
     "RECIPIENT_REFUSED": "Сервер отклонил письмо на этот адрес",
     "TG_ERROR": "Сбой Telegram (сеть бота)",
     "NO_ACCOUNTS": "Нет активных аккаунтов",
@@ -135,7 +136,7 @@ def render_status_text(
         "📊 <b>Статус рассылки</b>\n\n"
         f"{run_line}\n"
         f"Режим: <b>{mode}</b>\n"
-        f"Отправлено: <b>{sent}</b>\n"
+        f"Отправлено (подтверждено): <b>{sent}</b>\n"
         f"Ошибок отправки: <b>{failed}</b>"
         f"{progress_line}"
         f"{last_err_line}\n\n"

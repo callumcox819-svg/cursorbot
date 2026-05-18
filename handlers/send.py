@@ -19,7 +19,11 @@ from sqlalchemy.orm import selectinload
 from database import db_session
 from models import EmailAccount, OfferEmail, Offer, User, Proxy
 
-from services.smtp_proxy_send import send_email_via_account_with_proxy
+from services.mailing_send import (
+    MAIL_VERIFY_SENT,
+    mailing_send_overall_timeout_sec,
+    send_mailing_one_verified,
+)
 from services.users import get_or_create_user
 from services.user_settings import get_user_setting
 from services.placeholders import apply_placeholders
@@ -28,7 +32,6 @@ from handlers.status import render_status_text, tg_answer_safe
 from services.sender import (
     SMTP_TIMEOUT_SEC,
     normalize_send_error,
-    is_proxy_error_marker,
     is_smtp_timeout_error,
 )
 from services.smtp_block_control import mark_account_smtp_blocked
@@ -78,12 +81,7 @@ SMTP_CONCURRENCY_WITH_PROXY = 1
 SMTP_CONCURRENCY_NO_PROXY = 1
 
 def mailing_send_timeouts() -> int:
-    """Таймаут одной отправки: 1 ящик × 1 письмо × до N прокси."""
-    from services.smtp_proxy_send import MAIL_SMTP_MAX_PROXIES, MAIL_SMTP_TIMEOUT_SEC
-
-    one = MAIL_SMTP_MAX_PROXIES * MAIL_SMTP_TIMEOUT_SEC + 30
-    return max(75, int(os.getenv("SEND_ONE_TIMEOUT", str(one))))
-MAX_PROXY_FAILS_PER_TARGET = 5
+    return mailing_send_overall_timeout_sec()
 
 # user settings keys (уже используются в проекте)
 GAG_PROFILE_NAME_KEY = "gag_profile_name"
@@ -314,15 +312,16 @@ async def start_sending(message: Message):
 
     await set_mailing_active(tg_user_id, active=True)
 
-    from services.smtp_proxy_send import MAIL_SMTP_MAX_PROXIES, MAIL_SMTP_TIMEOUT_SEC
+    from services.mailing_send import MAIL_SEND_RETRIES, MAIL_VERIFY_SENT
 
     await tg_answer_safe(
         message,
         "✅ Рассылка запущена.\n"
         f"В очереди: <b>{total_targets}</b> email\n"
         f"{proxy_detail}\n"
-        f"Режим: <b>1 ящик → 1 пресет → 1 адрес</b> (ротация почт по кругу)\n"
-        f"SMTP: до <b>{MAIL_SMTP_MAX_PROXIES}</b> SOCKS5 × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с\n"
+        f"Режим: <b>1 ящик → 1 пресет → 1 адрес</b> (ротация)\n"
+        f"Учёт в /stat: <b>{'Sent (IMAP)' if MAIL_VERIFY_SENT else 'SMTP 250'}</b> · "
+        f"до <b>{MAIL_SEND_RETRIES}</b> попыток на адрес\n"
         f"<i>Прокси перепроверяются каждые {max(1, MAIL_PROXY_RECHECK_SEC // 60)} мин.</i>",
         reply_markup=main_menu_kb(tg_user_id),
         parse_mode="HTML",
@@ -374,7 +373,7 @@ async def _notify_sending_finished(*, bot: Bot, chat_id: int, tg_user_id: int) -
 
     text = (
         f"{title}\n\n"
-        f"Принято SMTP (снято с очереди): <b>{sent}</b>\n"
+        f"Подтверждено отправок: <b>{sent}</b>\n"
         f"Ошибок отправки: <b>{failed}</b>\n"
         f"Email в очереди: <b>{pending}</b>\n\n"
         f"<i>Если ответов мало — проверьте прокси (SMTP+STARTTLS OK) и задержку 2–5 с.</i>"
@@ -403,7 +402,6 @@ async def _handle_send_failure(
     state: SendingState,
     tgt: OfferEmail,
     err: str,
-    fail_streak: dict[int, int],
     acc: EmailAccount,
     bot: Bot | None = None,
     chat_id: int | None = None,
@@ -433,22 +431,9 @@ async def _handle_send_failure(
             await session.rollback()
         return True
 
-    purge = False
+  # Ошибки прокси/таймаут — адрес остаётся в очереди (повтор на следующих кругах).
     if "RECIPIENT_DEAD" in err or "5.1.1" in err:
-        purge = True
-    elif is_proxy_error_marker(err):
-        tid = int(tgt.id)
-        fail_streak[tid] = fail_streak.get(tid, 0) + 1
-        if fail_streak[tid] >= MAX_PROXY_FAILS_PER_TARGET:
-            purge = True
-            logger.warning(
-                "purge target after %s proxy fails: %s",
-                fail_streak[tid],
-                state.last_failed_to,
-            )
-    if purge:
         await _purge_target(session, db_user_id, int(tgt.id))
-        fail_streak.pop(int(tgt.id), None)
     return False
 
 
@@ -456,7 +441,6 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
     state = get_sending_state(tg_user_id) or SendingState(user_id=tg_user_id)
     smtp_sem = asyncio.Semaphore(SMTP_CONCURRENCY_WITH_PROXY)
     entered_main_loop = False
-    fail_streak: dict[int, int] = {}
     acc_idx = 0
     rotation_accounts: List[EmailAccount] = []
 
@@ -555,7 +539,7 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     )
                     async with smtp_sem:
                         ok, err, _msgid = await asyncio.wait_for(
-                            send_email_via_account_with_proxy(
+                            send_mailing_one_verified(
                                 session,
                                 db_user_id,
                                 acc,
@@ -575,20 +559,18 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
 
                 if ok:
                     state.sent_count += 1
-                    fail_streak.pop(int(tgt.id), None)
                     await _purge_target(session, db_user_id, tgt.id)
-                elif await _handle_send_failure(
-                    session=session,
-                    db_user_id=db_user_id,
-                    state=state,
-                    tgt=tgt,
-                    err=err or "UNKNOWN",
-                    fail_streak=fail_streak,
-                    acc=acc,
-                    bot=bot,
-                    chat_id=chat_id,
-                ):
-                    pass
+                else:
+                    await _handle_send_failure(
+                        session=session,
+                        db_user_id=db_user_id,
+                        state=state,
+                        tgt=tgt,
+                        err=err or "UNKNOWN",
+                        acc=acc,
+                        bot=bot,
+                        chat_id=chat_id,
+                    )
 
             if not state.is_running:
                 break
