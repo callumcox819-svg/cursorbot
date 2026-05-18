@@ -55,6 +55,21 @@ def parse_offer_raw(raw_json: str | None) -> dict[str, Any]:
         return {}
 
 
+def offer_effective_price(offer: Offer | None, *, default: str = "0") -> str:
+    """Цена для GAG/карточки: колонка Offer.price, иначе item_price/price из raw_json, иначе default."""
+    if not offer:
+        return default
+    p = str(getattr(offer, "price", None) or "").strip()
+    if p:
+        return p
+    raw = parse_offer_raw(getattr(offer, "raw_json", None))
+    for key in ("item_price", "price"):
+        v = str(raw.get(key) or "").strip()
+        if v:
+            return v
+    return default
+
+
 def index_validated_rows(validated: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Индекс результатов валидации email по ссылке объявления."""
     out: dict[str, dict[str, Any]] = {}

@@ -794,26 +794,27 @@ def build_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def mail_card_offer_meta(
+async def find_offer_for_incoming_mail(
     session,
     *,
     user_id: int,
     from_email: str,
     resolved_offer_id: int | None = None,
-) -> tuple[int | None, str | None, str | None, str | None, str | None]:
-    """Return offer_id, service_label, product_title, photo_url, offer_price."""
-    offer_id = resolved_offer_id
-    service_label = product_title = photo_url = offer_price = None
-    try:
-        off = None
-        if resolved_offer_id:
-            off = (
-                await session.execute(
-                    sa_select(Offer).where(Offer.id == int(resolved_offer_id)).where(Offer.user_id == int(user_id)).limit(1)
-                )
-            ).scalars().first()
-        if not off:
-            canon = _canon_email(from_email)
+) -> Offer | None:
+    """Объявление по resolved_offer_id или последнему OfferEmail для from_email."""
+    off = None
+    if resolved_offer_id:
+        off = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.id == int(resolved_offer_id))
+                .where(Offer.user_id == int(user_id))
+                .limit(1)
+            )
+        ).scalars().first()
+    if not off:
+        canon = _canon_email(from_email)
+        if canon:
             off = (
                 await session.execute(
                     sa_select(Offer)
@@ -824,12 +825,35 @@ async def mail_card_offer_meta(
                     .limit(1)
                 )
             ).scalars().first()
+    return off
+
+
+async def mail_card_offer_meta(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+    resolved_offer_id: int | None = None,
+) -> tuple[int | None, str | None, str | None, str | None, str | None]:
+    """Return offer_id, service_label, product_title, photo_url, offer_price."""
+    from services.offer_storage import offer_effective_price
+
+    offer_id = resolved_offer_id
+    service_label = product_title = photo_url = offer_price = None
+    try:
+        off = await find_offer_for_incoming_mail(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            resolved_offer_id=resolved_offer_id,
+        )
         if off:
             offer_id = int(off.id)
             product_title = (off.title or "").strip() or None
             service_label = _service_label_from_link((off.link or "").strip())
             photo_url = (off.photo or "").strip() or None
-            offer_price = (off.price or "").strip() or None
+            p = offer_effective_price(off, default="")
+            offer_price = p or None
     except Exception:
         logger.exception("mail_card_offer_meta failed")
     return offer_id, service_label, product_title, photo_url, offer_price

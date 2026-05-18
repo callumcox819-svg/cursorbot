@@ -37,8 +37,14 @@ from services.gag_keys import (
     is_valid_gag_service,
 )
 from services.gag_network import generate_gag_url, GAGError
-from services.incoming_mail_worker import FULL_META, _try_pin, build_mail_card_from_mail
+from services.incoming_mail_worker import (
+    FULL_META,
+    _try_pin,
+    build_mail_card_from_mail,
+    find_offer_for_incoming_mail,
+)
 from services.offer_matching import resolve_offer_for_incoming
+from services.offer_storage import offer_effective_price
 from services.smtp_proxy_send import send_email_via_account_with_proxy
 from services.translate import translate_to_ru, _strip_html
 
@@ -1457,26 +1463,25 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
             await callback.answer()
             return
 
-        offer_title = offer_price = offer_image = None
+        offer_title = offer_image = None
         offer_id = None
-        if getattr(mail, "resolved_offer_id", None):
-            offer = (
-                await session.execute(select(Offer).where(Offer.id == int(mail.resolved_offer_id)).limit(1))
-            ).scalars().first()
-            if offer:
-                offer_title = (offer.title or "").strip() or None
-                offer_price = (offer.price or "").strip() or None
-                offer_image = (offer.photo or "").strip() or None
-                offer_id = int(getattr(offer, "id", 0) or 0) or None
+        offer = await find_offer_for_incoming_mail(
+            session,
+            user_id=int(tg_user.id),
+            from_email=contact_email,
+            resolved_offer_id=getattr(mail, "resolved_offer_id", None),
+        )
+        if offer:
+            if not getattr(mail, "resolved_offer_id", None):
+                mail.resolved_offer_id = int(offer.id)
+            offer_title = (offer.title or "").strip() or None
+            offer_image = (offer.photo or "").strip() or None
+            offer_id = int(getattr(offer, "id", 0) or 0) or None
 
         title = offer_title or (mail.subject or "").strip()
-        price = offer_price
+        price = offer_effective_price(offer)
         if not title:
             await callback.message.answer("❌ Нет названия объявления (title).")
-            await callback.answer()
-            return
-        if not price:
-            await callback.message.answer("❌ Нет цены объявления (price).")
             await callback.answer()
             return
 
@@ -1531,7 +1536,7 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
         await _send_generated_link_card(
             callback=callback,
             offer_title=offer_title or title,
-            offer_price=offer_price or price,
+            offer_price=price,
             photo_url=offer_image,
             profile_display=prof_title,
             service_code=service,
@@ -1699,7 +1704,6 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
             return await callback.answer()
 
         offer_title = None
-        offer_price = None
         offer_image = None
         offer_id = None
         mail = (
@@ -1712,23 +1716,25 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
             )
         ).scalars().first()
 
-        if mail and getattr(mail, "resolved_offer_id", None):
-            offer = (
-                await session.execute(select(Offer).where(Offer.id == int(mail.resolved_offer_id)).limit(1))
-            ).scalars().first()
+        offer = None
+        if mail:
+            offer = await find_offer_for_incoming_mail(
+                session,
+                user_id=int(owner_user_id),
+                from_email=contact_email,
+                resolved_offer_id=getattr(mail, "resolved_offer_id", None),
+            )
             if offer:
+                if not getattr(mail, "resolved_offer_id", None):
+                    mail.resolved_offer_id = int(offer.id)
                 offer_title = (offer.title or "").strip() or None
-                offer_price = (offer.price or "").strip() or None
                 offer_image = (offer.photo or "").strip() or None
                 offer_id = int(getattr(offer, "id", 0) or 0) or None
 
         title = offer_title or ((mail.subject or "").strip() if mail else "")
-        price = offer_price
+        price = offer_effective_price(offer)
         if not title:
             await callback.message.answer("❌ Нет названия объявления (title).")
-            return await callback.answer()
-        if not price:
-            await callback.message.answer("❌ Нет цены объявления (price).")
             return await callback.answer()
 
         api_service = gag_service_for_api(service)
@@ -1780,7 +1786,7 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
         await _send_generated_link_card(
             callback=callback,
             offer_title=offer_title or title,
-            offer_price=offer_price or price,
+            offer_price=price,
             photo_url=offer_image,
             profile_display=prof_title,
             service_code=service,
