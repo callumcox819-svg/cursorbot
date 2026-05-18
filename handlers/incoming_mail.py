@@ -1470,19 +1470,21 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
             return
 
         offer_id = None
+        mail_ad = (getattr(mail, "ad_url", "") or "").strip() or url
         offer = await resolve_offer_for_mail_card(
             session,
             user_id=int(tg_user.id),
             from_email=contact_email,
             resolved_offer_id=getattr(mail, "resolved_offer_id", None),
+            ad_url=mail_ad,
+            inbox_email=inbox_email,
             subject=(getattr(mail, "subject", "") or ""),
             from_name=(getattr(mail, "from_name", "") or ""),
             body_text=(getattr(mail, "body", "") or ""),
         )
         if offer:
-            if not getattr(mail, "resolved_offer_id", None):
-                mail.resolved_offer_id = int(offer.id)
-            offer_id = int(getattr(offer, "id", 0) or 0) or None
+            mail.resolved_offer_id = int(offer.id)
+            offer_id = int(offer.id)
 
         offer_title = offer_effective_title(offer) or None
         offer_image = offer_effective_photo(offer) or None
@@ -1724,19 +1726,21 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
 
         offer = None
         if mail:
+            mail_ad = (getattr(mail, "ad_url", "") or "").strip() or url
             offer = await resolve_offer_for_mail_card(
                 session,
                 user_id=int(owner_user_id),
                 from_email=contact_email,
                 resolved_offer_id=getattr(mail, "resolved_offer_id", None),
+                ad_url=mail_ad,
+                inbox_email=inbox_email,
                 subject=(getattr(mail, "subject", "") or ""),
                 from_name=(getattr(mail, "from_name", "") or ""),
                 body_text=(getattr(mail, "body", "") or ""),
             )
             if offer:
-                if not getattr(mail, "resolved_offer_id", None):
-                    mail.resolved_offer_id = int(offer.id)
-                offer_id = int(getattr(offer, "id", 0) or 0) or None
+                mail.resolved_offer_id = int(offer.id)
+                offer_id = int(offer.id)
 
         offer_title = offer_effective_title(offer) or None
         offer_image = offer_effective_photo(offer) or None

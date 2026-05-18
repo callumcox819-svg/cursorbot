@@ -794,15 +794,65 @@ def build_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def find_offer_for_incoming_mail(
+async def _find_offer_if_unique_email(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+) -> Offer | None:
+    """Только если у продавца ровно одно объявление с этим email."""
+    canon = _canon_email(from_email)
+    if not canon:
+        return None
+    ids = (
+        await session.execute(
+            sa_select(Offer.id)
+            .join(OfferEmail, OfferEmail.offer_id == Offer.id)
+            .where(Offer.user_id == int(user_id))
+            .where(func.lower(OfferEmail.email) == canon)
+        )
+    ).scalars().all()
+    uniq = {int(x) for x in ids if x}
+    if len(uniq) != 1:
+        return None
+    oid = next(iter(uniq))
+    return (
+        await session.execute(
+            sa_select(Offer).where(Offer.id == int(oid)).where(Offer.user_id == int(user_id)).limit(1)
+        )
+    ).scalars().first()
+
+
+async def resolve_offer_for_mail_card(
     session,
     *,
     user_id: int,
     from_email: str,
     resolved_offer_id: int | None = None,
+    ad_url: str | None = None,
+    inbox_email: str | None = None,
+    subject: str = "",
+    from_name: str = "",
+    body_text: str = "",
 ) -> Offer | None:
-    """Объявление по resolved_offer_id или последнему OfferEmail для from_email."""
-    off = None
+    """Объявление для карточки/GAG: ad_url диалога → resolved_offer_id → скоринг письма → единственный email."""
+    from services.offer_storage import find_offer_by_link
+
+    url = (ad_url or "").strip()
+    if not url and (inbox_email or "").strip() and (from_email or "").strip():
+        conv = await _load_convlink(
+            user_id=int(user_id),
+            inbox_email=_canon_email(inbox_email or ""),
+            contact_email=_canon_email(from_email or ""),
+        )
+        if conv and (conv.ad_url or "").strip():
+            url = (conv.ad_url or "").strip()
+
+    if url:
+        off = await find_offer_by_link(session, user_id=int(user_id), ad_url=url)
+        if off:
+            return off
+
     if resolved_offer_id:
         off = (
             await session.execute(
@@ -812,41 +862,9 @@ async def find_offer_for_incoming_mail(
                 .limit(1)
             )
         ).scalars().first()
-    if not off:
-        canon = _canon_email(from_email)
-        if canon:
-            off = (
-                await session.execute(
-                    sa_select(Offer)
-                    .join(OfferEmail, OfferEmail.offer_id == Offer.id)
-                    .where(Offer.user_id == int(user_id))
-                    .where(func.lower(OfferEmail.email) == canon)
-                    .order_by(Offer.id.desc())
-                    .limit(1)
-                )
-            ).scalars().first()
-    return off
+        if off:
+            return off
 
-
-async def resolve_offer_for_mail_card(
-    session,
-    *,
-    user_id: int,
-    from_email: str,
-    resolved_offer_id: int | None = None,
-    subject: str = "",
-    from_name: str = "",
-    body_text: str = "",
-) -> Offer | None:
-    """Объявление для карточки/GAG: email/id, затем скоринг по теме/телу письма."""
-    off = await find_offer_for_incoming_mail(
-        session,
-        user_id=int(user_id),
-        from_email=from_email,
-        resolved_offer_id=resolved_offer_id,
-    )
-    if off:
-        return off
     oid, _ = await _resolve_offer_for_incoming(
         session,
         user_id=int(user_id),
@@ -855,16 +873,19 @@ async def resolve_offer_for_mail_card(
         from_name=from_name,
         body_text=body_text,
     )
-    if not oid:
-        return None
-    return (
-        await session.execute(
-            sa_select(Offer)
-            .where(Offer.id == int(oid))
-            .where(Offer.user_id == int(user_id))
-            .limit(1)
-        )
-    ).scalars().first()
+    if oid:
+        off = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.id == int(oid))
+                .where(Offer.user_id == int(user_id))
+                .limit(1)
+            )
+        ).scalars().first()
+        if off:
+            return off
+
+    return await _find_offer_if_unique_email(session, user_id=int(user_id), from_email=from_email)
 
 
 async def mail_card_offer_meta(
@@ -873,6 +894,11 @@ async def mail_card_offer_meta(
     user_id: int,
     from_email: str,
     resolved_offer_id: int | None = None,
+    ad_url: str | None = None,
+    inbox_email: str | None = None,
+    subject: str = "",
+    from_name: str = "",
+    body_text: str = "",
 ) -> tuple[int | None, str | None, str | None, str | None, str | None]:
     """Return offer_id, service_label, product_title, photo_url, offer_price."""
     from services.offer_storage import offer_effective_price, offer_effective_photo, offer_effective_title
@@ -880,11 +906,16 @@ async def mail_card_offer_meta(
     offer_id = resolved_offer_id
     service_label = product_title = photo_url = offer_price = None
     try:
-        off = await find_offer_for_incoming_mail(
+        off = await resolve_offer_for_mail_card(
             session,
             user_id=int(user_id),
             from_email=from_email,
             resolved_offer_id=resolved_offer_id,
+            ad_url=ad_url,
+            inbox_email=inbox_email,
+            subject=subject,
+            from_name=from_name,
+            body_text=body_text,
         )
         if off:
             offer_id = int(off.id)
@@ -1168,18 +1199,13 @@ async def _process_mails_for_account_impl(
 
             if ad_url:
                 FULL_META[(acc_id, uid_key)]["ad_url"] = ad_url
-                await _upsert_convlink(
-                    user_id=user_id,
-                    inbox_email=_canon_email(inbox_email_clean),
-                    contact_email=_canon_email(from_email_clean),
-                    )
 
-            # ✅ ТЗ: трединг в Telegram требует, чтобы ConversationLink существовал даже если ссылки ещё нет.
-            # Это НЕ добавляет новой логики ссылок, только гарантирует запись для хранения tg_message_id.
+            # ✅ тред + ad_url диалога (чтобы GAG не брал «последнее» объявление продавца)
             await _upsert_convlink(
                 user_id=user_id,
                 inbox_email=_canon_email(inbox_email_clean),
                 contact_email=_canon_email(from_email_clean),
+                ad_url=(ad_url or None),
             )
 
             conv = await _load_convlink(
@@ -1231,6 +1257,11 @@ async def _process_mails_for_account_impl(
                         user_id=int(user_id),
                         from_email=from_email_clean,
                         resolved_offer_id=resolved_offer_id,
+                        ad_url=(FULL_META.get((acc_id, uid_key), {}).get("ad_url") or ad_url or "").strip() or None,
+                        inbox_email=inbox_email_clean,
+                        subject=subject or "",
+                        from_name=(from_name or "").strip(),
+                        body_text=body_clean or "",
                     )
             except Exception:
                 logger.exception("Failed to load Offer meta for incoming mail: from=%s", from_email_clean)

@@ -6,6 +6,8 @@ import json
 import re
 from typing import Any
 
+from sqlalchemy import select as sa_select
+
 from models import Offer, OfferEmail
 
 _LINK_QS_RE = re.compile(r"\?.*$")
@@ -84,6 +86,26 @@ def offer_effective_title(offer: Offer | None) -> str:
         return t
     raw = parse_offer_raw(getattr(offer, "raw_json", None))
     return _first_raw_str(raw, ("item_title", "title"))
+
+
+async def find_offer_by_link(session, *, user_id: int, ad_url: str) -> Offer | None:
+    """Offer по ссылке объявления (нормализованный link_key)."""
+    lk = link_key(ad_url)
+    if not lk:
+        return None
+    rows = (
+        await session.execute(
+            sa_select(Offer)
+            .where(Offer.user_id == int(user_id))
+            .where(Offer.link.is_not(None))
+            .order_by(Offer.id.desc())
+            .limit(800)
+        )
+    ).scalars().all()
+    for off in rows:
+        if link_key(str(off.link or "")) == lk:
+            return off
+    return None
 
 
 def offer_effective_photo(offer: Offer | None) -> str:
