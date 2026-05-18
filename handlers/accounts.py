@@ -511,6 +511,7 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
         from services.smtp_account_check import (
             check_smtp_accounts_parallel,
             is_account_no_access_status,
+            is_transient_smtp_check_failure,
         )
         from services.smtp_block_control import short_block_reason
 
@@ -545,6 +546,17 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
                 return
             db_uid = int(user.id)
 
+            healed = 0
+            for acc in accounts:
+                if (acc.status or "").strip().lower() == "error" and is_transient_smtp_check_failure(
+                    acc.last_error
+                ):
+                    acc.status = "active"
+                    acc.last_error = None
+                    healed += 1
+            if healed:
+                await session.commit()
+
             results = await check_smtp_accounts_parallel(
                 session,
                 db_uid,
@@ -560,9 +572,18 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
 
                 st, err = res.status, res.error
 
-                if st is None:
+                if st is None or st == "error":
                     skip_n += 1
-                    lines.append(f"⏭ <code>{_e(res.email)}</code> — прокси/таймаут")
+                    reason = short_block_reason(err) or "прокси / SMTP-туннель"
+                    lines.append(
+                        f"⏭ <code>{_e(res.email)}</code> — проверка не удалась\n"
+                        f"   <i>{_e(reason)}</i>"
+                    )
+                    prev_st = (row.status or "").strip().lower()
+                    if prev_st == "error" and is_transient_smtp_check_failure(err):
+                        row.status = "active"
+                        row.last_error = None
+                        await session.commit()
                     continue
 
                 if is_account_no_access_status(st):
@@ -596,16 +617,18 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
                         f"   <i>{_e(reason)}</i>"
                     )
                 else:
+                    skip_n += 1
                     lines.append(
-                        f"🔴 <code>{_e(res.email)}</code> — {_e(short_block_reason(err))}"
+                        f"⏭ <code>{_e(res.email)}</code> — неизвестный сбой проверки\n"
+                        f"   <i>{_e(short_block_reason(err))}</i>"
                     )
 
         summary = (
             "✅ <b>Проверка SMTP завершена</b>\n\n"
-            f"🟢 активны: <b>{ok_n}</b>\n"
+            f"🟢 активны (SMTP OK): <b>{ok_n}</b>\n"
             f"🟡 лимит/блок (smtp_blocked): <b>{blocked_n}</b>\n"
             f"🗑 удалено (нет доступа): <b>{deleted_n}</b>\n"
-            f"⏭ без смены статуса (прокси): <b>{skip_n}</b>\n\n"
+            f"⏭ проверка не удалась (ящик <u>не</u> трогали): <b>{skip_n}</b>\n\n"
             + _trim_details(lines, limit=25)
         )
         try:

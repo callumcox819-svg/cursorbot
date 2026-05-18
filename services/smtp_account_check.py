@@ -70,6 +70,32 @@ def _err_from_docmd(code: int, resp: bytes | str) -> str:
     return f"{code} {text}".strip()
 
 
+def _is_transient_smtp_check_failure(err: str | None) -> bool:
+    """Прокси/туннель/рукопожатие SMTP — не значит, что ящик мёртв."""
+    t = f"{type(err).__name__ if isinstance(err, BaseException) else ''} {(err or '')}".lower()
+    names = (
+        "smtpnotsupportederror",
+        "smtpserverdisconnected",
+        "timeouterror",
+        "connectionerror",
+        "oserror",
+        "sslerror",
+    )
+    if any(n in t for n in names):
+        return True
+    phrases = (
+        "starttls extension not supported",
+        "connection unexpectedly closed",
+        "eof occurred",
+        "connection reset",
+        "timed out",
+        "temporarily unavailable",
+        "proxy",
+        "socks",
+    )
+    return any(p in t for p in phrases)
+
+
 def _classify_status(err: str) -> Tuple[Optional[str], str]:
     norm = normalize_send_error(err)
     if is_smtp_account_block_error(norm):
@@ -81,11 +107,15 @@ def _classify_status(err: str) -> Tuple[Optional[str], str]:
         return None, norm
     if "proxy" in norm.lower() or "timeout" in norm.lower():
         return None, norm
+    if _is_transient_smtp_check_failure(norm):
+        return None, norm
     return "error", norm
 
 
 def _classify_exception(e: Exception) -> Tuple[Optional[str], str]:
     code, text = _extract_code_text_from_exception(e)
+    if _is_transient_smtp_check_failure(str(e)) or _is_transient_smtp_check_failure(text):
+        return None, _marker("PROXY_ERROR", code or "smtp_check", text or str(e))
     if _is_proxy_error(e, text):
         return None, _marker("PROXY_ERROR", code or "socks", text or str(e))
     if _is_invalid_creds(code, text):
@@ -168,11 +198,11 @@ def _connect_smtp_via_socks(proxy: Proxy, host: str, port: int, *, timeout: floa
     client = smtplib.SMTP(timeout=timeout)
     client.sock = sock
     client.file = sock.makefile("rb")
-    client.helo_resp = None
-    client.ehlo_resp = None
-    client.does_esmtp = False
     client.host = host
     client.port = int(port)
+    code, _msg = client.getreply()
+    if code != 220:
+        raise smtplib.SMTPConnectError(code, repr(_msg))
     return client
 
 
