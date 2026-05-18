@@ -76,6 +76,7 @@ def _is_transient_smtp_check_failure(err: str | None) -> bool:
     names = (
         "smtpnotsupportederror",
         "smtpserverdisconnected",
+        "smtpconnecterror",
         "timeouterror",
         "connectionerror",
         "oserror",
@@ -345,15 +346,22 @@ async def check_smtp_accounts_parallel(
                 st, err = None, "PROXY_ERROR|no_active_proxy|No active proxy configured"
             else:
                 proxy = proxies[acc_id % len(proxies)]
-                st, err = await asyncio.to_thread(
-                    check_smtp_account_via_proxy_isolated,
-                    proxy,
-                    acc,
-                    timeout=SMTP_CHECK_TIMEOUT_SEC,
-                )
+                try:
+                    st, err = await asyncio.to_thread(
+                        check_smtp_account_via_proxy_isolated,
+                        proxy,
+                        acc,
+                        timeout=SMTP_CHECK_TIMEOUT_SEC,
+                    )
+                except Exception as e:
+                    logger.exception("[SMTP check] thread crash %s", email)
+                    st, err = _classify_exception(e)
         done += 1
         if on_progress:
-            await on_progress(done, total, email)
+            try:
+                await on_progress(done, total, email)
+            except Exception:
+                logger.exception("[SMTP check] on_progress failed")
         return SmtpCheckResult(account_id=acc_id, email=email, status=st, error=err)
 
     tasks = [asyncio.create_task(_one(a)) for a in accounts]

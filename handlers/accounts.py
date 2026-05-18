@@ -18,7 +18,7 @@ from aiogram.types import (
 )
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
-from sqlalchemy import select
+from sqlalchemy import select, update, or_
 
 from database import Session, db_session
 from models import User, EmailAccount
@@ -491,18 +491,20 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
         user = await get_user(session, tg_id)
         if not user:
             return await callback.answer("Пользователь не найден", show_alert=True)
-        result = await session.execute(
-            select(EmailAccount).where(EmailAccount.user_id == user.id).order_by(EmailAccount.id)
-        )
-        accounts = list(result.scalars())
+        accounts_n = (
+            await session.execute(
+                select(EmailAccount.id).where(EmailAccount.user_id == user.id)
+            )
+        ).all()
 
-    if not accounts:
+    if not accounts_n:
         return await callback.answer("Нет аккаунтов для проверки.", show_alert=True)
 
+    total_accounts = len(accounts_n)
     workers = max(1, min(10, int(os.getenv("ACCOUNTS_SMTP_CHECK_CONCURRENCY", "5"))))
     await callback.answer("Запускаю проверку SMTP…")
     status_msg = await callback.message.answer(
-        f"⏳ <b>Проверка SMTP</b>\n\n0/{len(accounts)}\n"
+        f"⏳ <b>Проверка SMTP</b>\n\n0/{total_accounts}\n"
         f"Параллельно: <b>{workers}</b> потоков",
         parse_mode="HTML",
     )
@@ -520,7 +522,7 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
         deleted_n = 0
         skip_n = 0
         lines: List[str] = []
-        total = len(accounts)
+        total = total_accounts
         last_progress_edit = 0.0
 
         async def _on_progress(done: int, tot: int, email: str | None) -> None:
@@ -539,104 +541,127 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
             except TelegramBadRequest:
                 pass
 
-        async with Session() as session:
-            user = await get_user(session, tg_id)
-            if not user:
-                await status_msg.edit_text("❌ Пользователь не найден.")
-                return
-            db_uid = int(user.id)
-
-            healed = 0
-            for acc in accounts:
-                if (acc.status or "").strip().lower() == "error" and is_transient_smtp_check_failure(
-                    acc.last_error
-                ):
-                    acc.status = "active"
-                    acc.last_error = None
-                    healed += 1
-            if healed:
-                await session.commit()
-
-            results = await check_smtp_accounts_parallel(
-                session,
-                db_uid,
-                accounts,
-                workers=workers,
-                on_progress=_on_progress,
-            )
-
-            for res in results:
-                row = await session.get(EmailAccount, int(res.account_id))
-                if not row:
-                    continue
-
-                st, err = res.status, res.error
-
-                if st is None or st == "error":
-                    skip_n += 1
-                    reason = short_block_reason(err) or "прокси / SMTP-туннель"
-                    lines.append(
-                        f"⏭ <code>{_e(res.email)}</code> — проверка не удалась\n"
-                        f"   <i>{_e(reason)}</i>"
-                    )
-                    prev_st = (row.status or "").strip().lower()
-                    if prev_st == "error" and is_transient_smtp_check_failure(err):
-                        row.status = "active"
-                        row.last_error = None
-                        await session.commit()
-                    continue
-
-                if is_account_no_access_status(st):
-                    deleted_n += 1
-                    em = row.email or ""
-                    reason = short_block_reason(err)
-                    await session.delete(row)
-                    await session.commit()
-                    lines.append(
-                        f"🗑 <code>{_e(em)}</code> — удалён (нет доступа)\n"
-                        f"   <i>{_e(reason)}</i>"
-                    )
-                    continue
-
-                prev = (row.status or "").strip().lower()
-                row.status = st
-                row.last_error = (err or "")[:1000] if err else None
-                await session.commit()
-
-                if st == "active":
-                    ok_n += 1
-                    if prev != "active":
-                        lines.append(f"🟢 <code>{_e(res.email)}</code> — снова активен (SMTP)")
-                    else:
-                        lines.append(f"🟢 <code>{_e(res.email)}</code> — SMTP OK")
-                elif st == "smtp_blocked":
-                    blocked_n += 1
-                    reason = short_block_reason(err)
-                    lines.append(
-                        f"🟡 <code>{_e(res.email)}</code> — лимит/блок SMTP\n"
-                        f"   <i>{_e(reason)}</i>"
-                    )
-                else:
-                    skip_n += 1
-                    lines.append(
-                        f"⏭ <code>{_e(res.email)}</code> — неизвестный сбой проверки\n"
-                        f"   <i>{_e(short_block_reason(err))}</i>"
-                    )
-
-        summary = (
-            "✅ <b>Проверка SMTP завершена</b>\n\n"
-            f"🟢 активны (SMTP OK): <b>{ok_n}</b>\n"
-            f"🟡 лимит/блок (smtp_blocked): <b>{blocked_n}</b>\n"
-            f"🗑 удалено (нет доступа): <b>{deleted_n}</b>\n"
-            f"⏭ проверка не удалась (ящик <u>не</u> трогали): <b>{skip_n}</b>\n\n"
-            + _trim_details(lines, limit=25)
-        )
         try:
-            await status_msg.edit_text(summary, parse_mode="HTML")
-        except TelegramBadRequest:
-            await callback.message.answer(summary, parse_mode="HTML")
+            async with Session() as session:
+                user = await get_user(session, tg_id)
+                if not user:
+                    await status_msg.edit_text("❌ Пользователь не найден.")
+                    return
+                db_uid = int(user.id)
 
-        await render_accounts_menu(callback, tg_id, page=1, status_filter="all")
+                await session.execute(
+                    update(EmailAccount)
+                    .where(EmailAccount.user_id == db_uid)
+                    .where(EmailAccount.status == "error")
+                    .where(
+                        or_(
+                            EmailAccount.last_error.ilike("%starttls%"),
+                            EmailAccount.last_error.ilike("%connection unexpectedly%"),
+                            EmailAccount.last_error.ilike("%smtpnotsupported%"),
+                            EmailAccount.last_error.ilike("%smtpserverdisconnected%"),
+                        )
+                    )
+                    .values(status="active", last_error=None)
+                )
+                await session.commit()
+
+                result = await session.execute(
+                    select(EmailAccount)
+                    .where(EmailAccount.user_id == db_uid)
+                    .order_by(EmailAccount.id)
+                )
+                accounts = list(result.scalars().all())
+
+                results = await check_smtp_accounts_parallel(
+                    session,
+                    db_uid,
+                    accounts,
+                    workers=workers,
+                    on_progress=_on_progress,
+                )
+
+                for res in results:
+                    row = await session.get(EmailAccount, int(res.account_id))
+                    if not row:
+                        continue
+
+                    st, err = res.status, res.error
+
+                    if st is None or st == "error":
+                        skip_n += 1
+                        reason = short_block_reason(err) or "прокси / SMTP-туннель"
+                        lines.append(
+                            f"⏭ <code>{_e(res.email)}</code> — проверка не удалась\n"
+                            f"   <i>{_e(reason)}</i>"
+                        )
+                        prev_st = (row.status or "").strip().lower()
+                        if prev_st == "error" and is_transient_smtp_check_failure(err):
+                            row.status = "active"
+                            row.last_error = None
+                            await session.commit()
+                        continue
+
+                    if is_account_no_access_status(st):
+                        deleted_n += 1
+                        em = row.email or ""
+                        reason = short_block_reason(err)
+                        await session.delete(row)
+                        await session.commit()
+                        lines.append(
+                            f"🗑 <code>{_e(em)}</code> — удалён (нет доступа)\n"
+                            f"   <i>{_e(reason)}</i>"
+                        )
+                        continue
+
+                    prev = (row.status or "").strip().lower()
+                    row.status = st
+                    row.last_error = (err or "")[:1000] if err else None
+                    await session.commit()
+
+                    if st == "active":
+                        ok_n += 1
+                        if prev != "active":
+                            lines.append(f"🟢 <code>{_e(res.email)}</code> — снова активен (SMTP)")
+                        else:
+                            lines.append(f"🟢 <code>{_e(res.email)}</code> — SMTP OK")
+                    elif st == "smtp_blocked":
+                        blocked_n += 1
+                        reason = short_block_reason(err)
+                        lines.append(
+                            f"🟡 <code>{_e(res.email)}</code> — лимит/блок SMTP\n"
+                            f"   <i>{_e(reason)}</i>"
+                        )
+                    else:
+                        skip_n += 1
+                        lines.append(
+                            f"⏭ <code>{_e(res.email)}</code> — неизвестный сбой проверки\n"
+                            f"   <i>{_e(short_block_reason(err))}</i>"
+                        )
+
+            summary = (
+                "✅ <b>Проверка SMTP завершена</b>\n\n"
+                f"🟢 активны (SMTP OK): <b>{ok_n}</b>\n"
+                f"🟡 лимит/блок (smtp_blocked): <b>{blocked_n}</b>\n"
+                f"🗑 удалено (нет доступа): <b>{deleted_n}</b>\n"
+                f"⏭ проверка не удалась (ящик <u>не</u> трогали): <b>{skip_n}</b>\n\n"
+                + _trim_details(lines, limit=25)
+            )
+            try:
+                await status_msg.edit_text(summary, parse_mode="HTML")
+            except TelegramBadRequest:
+                await callback.message.answer(summary, parse_mode="HTML")
+
+            await render_accounts_menu(callback, tg_id, page=1, status_filter="all")
+        except Exception as e:
+            logger.exception("acc_check_smtp job failed tg_id=%s", tg_id)
+            err_txt = _e(str(e))[:400]
+            try:
+                await status_msg.edit_text(
+                    f"❌ <b>Проверка SMTP упала</b>\n\n<code>{err_txt}</code>",
+                    parse_mode="HTML",
+                )
+            except TelegramBadRequest:
+                pass
 
     if not bg_start(tg_id, "accounts_smtp_check", _job()):
         await callback.answer("Проверка SMTP уже выполняется…", show_alert=True)
