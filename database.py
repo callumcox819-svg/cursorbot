@@ -98,6 +98,17 @@ async def _ensure_users_telegram_bigint() -> None:
             log.warning("Migrated users.telegram_id to BIGINT ✅")
 
 
+async def _ensure_incoming_mail_telegram_message_id_column() -> None:
+    """Не дублировать карточку входящего в TG при повторном IMAP-опросе."""
+    if engine.dialect.name != "postgresql":
+        return
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("ALTER TABLE incoming_mails ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT")
+        )
+
+
 async def _ensure_incoming_mail_link_columns() -> None:
     """Автомиграция: добавляем incoming_mails.ad_url и incoming_mails.generated_link если их нет.
 
@@ -200,6 +211,11 @@ async def init_db() -> None:
         await _ensure_incoming_mail_link_columns()
     except Exception as e:
         log.error("Failed incoming_mails link columns migration: %s", e)
+
+    try:
+        await _ensure_incoming_mail_telegram_message_id_column()
+    except Exception as e:
+        log.error("Failed incoming_mails.telegram_message_id migration: %s", e)
 
     # затем — безопасное добавление колонки в conversation_links (для "Создать ссылку")
     try:

@@ -61,6 +61,9 @@ class User(Base):
     conversation_links = relationship("ConversationLink", back_populates="user", cascade="all, delete-orphan")
     seller_blacklist = relationship("SellerBlacklist", back_populates="user", cascade="all, delete-orphan")
     lines = relationship("Line", back_populates="user", cascade="all, delete-orphan")
+    facebook_accounts = relationship(
+        "FacebookAccount", back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 # =========================
@@ -171,6 +174,28 @@ class Proxy(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user = relationship("User", back_populates="proxies")
+
+
+# =========================
+# FACEBOOK (Marketplace)
+# =========================
+class FacebookAccount(Base):
+    __tablename__ = "facebook_accounts"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    label = Column(String, nullable=True)
+    cookies_json = Column(Text, nullable=False)
+
+    is_active = Column(Boolean, default=True)
+    last_error = Column(Text, nullable=True)
+    last_checked_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", back_populates="facebook_accounts")
 
 
 # =========================
@@ -339,6 +364,9 @@ class IncomingMail(Base):
 
     resolved_offer_id = Column(ForeignKey("offers.id", ondelete="SET NULL"), nullable=True, index=True)
     resolved_offer_email_id = Column(ForeignKey("offer_emails.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    # ID карточки в Telegram — не слать дубликат при повторном IMAP-опросе
+    telegram_message_id = Column(Integer, nullable=True, index=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -711,15 +711,11 @@ def _service_label_from_link(link: str) -> str:
 
 
 def _service_html(label: str) -> str:
+    """Как «Товар» — моноширинный текст для копирования, без кликабельной ссылки и превью."""
     s = (label or "").strip()
     if not s:
         return ""
-    low = s.lower()
-    if low.startswith("http"):
-        url = s
-    else:
-        url = f"https://www.{low}"
-    return f'<a href="{_e(url)}">{_e(s)}</a>'
+    return f"<code>{_e(s)}</code>"
 
 
 def render_mail_text_chunks(
@@ -1184,6 +1180,9 @@ async def _process_mails_for_account_impl(
                             .limit(1)
                         )
                     ).scalars().first()
+                    already_notified_tg = int(existing.telegram_message_id) if (
+                        existing and getattr(existing, "telegram_message_id", None)
+                    ) else None
 
                     if not existing:
                         existing = IncomingMail(
@@ -1209,6 +1208,10 @@ async def _process_mails_for_account_impl(
                 logger.exception("Failed to persist IncomingMail acc=%s uid=%s", acc_id, uid)
 
             if skip_telegram_notify:
+                forwarded += 1
+                continue
+
+            if already_notified_tg:
                 forwarded += 1
                 continue
 
@@ -1363,6 +1366,7 @@ async def _process_mails_for_account_impl(
                     reply_markup=kb,
                     parse_mode="HTML",
                     reply_to_message_id=reply_to_id,
+                    disable_web_page_preview=True,
                 )
             else:
                 m = await bot.send_message(
@@ -1371,7 +1375,24 @@ async def _process_mails_for_account_impl(
                     reply_markup=kb,
                     parse_mode="HTML",
                     reply_to_message_id=reply_to_id,
+                    disable_web_page_preview=True,
                 )
+
+            if mail_db_id:
+                try:
+                    async with _imap_db_session() as session:
+                        mail_row = (
+                            await session.execute(
+                                sa_select(IncomingMail).where(IncomingMail.id == int(mail_db_id)).limit(1)
+                            )
+                        ).scalars().first()
+                        if mail_row:
+                            mail_row.telegram_message_id = int(m.message_id)
+                            await _db_commit_retry(session)
+                except Exception:
+                    logger.exception(
+                        "Failed to persist telegram_message_id mail_id=%s", mail_db_id
+                    )
 
             # Карточка письма в TG — anchor для ответов «Написать ещё» (не только FSM).
             try:
@@ -1748,6 +1769,7 @@ async def _poll_account_once(bot: Bot, acc: EmailAccount, tg_id: int) -> None:
 
     if new_last is not None:
         LAST_UID[acc_id] = int(new_last)
+        await _set_last_seen_uid(acc_id, int(new_last))
 
     if mails:
         await _process_mails_for_account(
