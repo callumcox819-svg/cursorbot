@@ -433,19 +433,35 @@ async def _validate_offers_old(
     url = str(cfg.validation_url or DEFAULT_VALIDEMAIL_URL).strip()
 
     seen_valid_emails: set[str] = set()
+    state_lock = asyncio.Lock()
+    n_keys = len(api_keys)
+    per_key_limit = max(4, limit // n_keys) if n_keys > 1 else limit
+    parallel_pool = per_key_limit * n_keys if n_keys > 1 else limit
+    sellers_completed = 0
+
+    if n_keys >= 2:
+        logger.info(
+            "validemail: %s keys in parallel (stride), concurrency/key=%s pool=%s sellers=%s",
+            n_keys,
+            per_key_limit,
+            parallel_pool,
+            len(prepared),
+        )
 
     async def _run_batch(
         batch_emails: list[str],
         *,
         seller_i: int,
         dom: str,
+        api_key: str,
     ) -> list[tuple[str, bool, dict]]:
         if not batch_emails:
             return []
-        if stats is not None:
-            stats["current_domain"] = dom
-            stats["current_probe"] = batch_emails[0]
-        base_done = overall_done
+        async with state_lock:
+            if stats is not None:
+                stats["current_domain"] = dom
+                stats["current_probe"] = batch_emails[0]
+            base_done = overall_done
 
         def _wrap_progress(
             done: int, total: int, lim: int, in_use: int, _bd: int = base_done
@@ -453,44 +469,45 @@ async def _validate_offers_old(
             if not progress_cb:
                 return
             try:
-                progress_cb(_bd + int(done or 0), overall_total, lim, in_use)
+                progress_cb(_bd + int(done or 0), overall_total, parallel_pool, in_use)
             except Exception:
                 pass
 
         return await validate_emails_fast(
             batch_emails,
-            api_keys=api_keys,
-            concurrency=limit,
+            api_keys=[api_key],
+            concurrency=per_key_limit,
             url=url,
             use_ssl_verify=bool(cfg.use_ssl_verify),
             progress_cb=lambda d, t, l, u, _bd=base_done: _wrap_progress(d, t, l, u, _bd),
         )
 
-    def _consume_results(
+    async def _consume_results(
         seller_i: int, results: list[tuple[str, bool, dict]]
     ) -> int:
         nonlocal overall_done
-        overall_done += len(results)
-        combos_valid = 0
-        for _e, ok, raw in results:
-            if not ok:
-                if stats is not None and _is_api_failure(ok, raw):
-                    stats["api_errors"] = int(stats.get("api_errors") or 0) + 1
-                continue
-            combos_valid += 1
-            key = (_e or "").strip().lower()
-            lst = found_by_idx[seller_i]
-            if len(lst) >= per_seller_limit or key in lst:
-                continue
-            if key in seen_valid_emails:
+        async with state_lock:
+            overall_done += len(results)
+            combos_valid = 0
+            for _e, ok, raw in results:
+                if not ok:
+                    if stats is not None and _is_api_failure(ok, raw):
+                        stats["api_errors"] = int(stats.get("api_errors") or 0) + 1
+                    continue
+                combos_valid += 1
+                key = (_e or "").strip().lower()
+                lst = found_by_idx[seller_i]
+                if len(lst) >= per_seller_limit or key in lst:
+                    continue
+                if key in seen_valid_emails:
+                    if stats is not None:
+                        stats["duplicates"] = int(stats.get("duplicates") or 0) + 1
+                    continue
+                seen_valid_emails.add(key)
+                lst.append(key)
                 if stats is not None:
-                    stats["duplicates"] = int(stats.get("duplicates") or 0) + 1
-                continue
-            seen_valid_emails.add(key)
-            lst.append(key)
-            if stats is not None:
-                stats["last_valid_email"] = key
-        return combos_valid
+                    stats["last_valid_email"] = key
+            return combos_valid
 
     def _refresh_stats() -> None:
         if stats is None:
@@ -502,17 +519,15 @@ async def _validate_offers_old(
         eligible_o = int(stats.get("offers_eligible") or len(prepared))
         stats["offers_remaining"] = max(0, eligible_o - sellers_found)
 
-    # 2) Продавец → домены по приоритету; основной логин (sam.day), затем запасные
-    n_sellers = len(prepared)
-    for i, row in enumerate(prepared):
-        if stats is not None:
-            stats["seller_index"] = i + 1
-            stats["sellers_total"] = n_sellers
-            stats["current_seller_name"] = str(row.get("person_name") or "")[:60]
+    async def _validate_seller(i: int, api_key: str) -> None:
+        row = prepared[i]
+        async with state_lock:
+            if stats is not None:
+                stats["current_seller_name"] = str(row.get("person_name") or "")[:60]
 
         locals_list = list(row.get("locals") or [])
         if not locals_list:
-            continue
+            return
 
         primary = locals_list[0]
         extra_locals = locals_list[1:]
@@ -521,34 +536,64 @@ async def _validate_offers_old(
             if len(found_by_idx[i]) >= per_seller_limit:
                 break
             batch = [f"{primary}@{dom}".lower()]
-            results = await _run_batch(batch, seller_i=i, dom=dom)
-            cv = _consume_results(i, results)
-            if stats is not None:
-                stats["combinations_valid"] = int(stats.get("combinations_valid") or 0) + cv
-            _refresh_stats()
+            results = await _run_batch(batch, seller_i=i, dom=dom, api_key=api_key)
+            cv = await _consume_results(i, results)
+            async with state_lock:
+                if stats is not None:
+                    stats["combinations_valid"] = int(stats.get("combinations_valid") or 0) + cv
+                _refresh_stats()
             if found_by_idx[i]:
                 break
 
         if found_by_idx[i] or not extra_locals:
-            continue
+            return
 
         for dom in domains_clean:
             if len(found_by_idx[i]) >= per_seller_limit:
                 break
             batch = [f"{local}@{dom}".lower() for local in extra_locals]
-            results = await _run_batch(batch, seller_i=i, dom=dom)
-            cv = _consume_results(i, results)
-            if stats is not None:
-                stats["combinations_valid"] = int(stats.get("combinations_valid") or 0) + cv
-            _refresh_stats()
+            results = await _run_batch(batch, seller_i=i, dom=dom, api_key=api_key)
+            cv = await _consume_results(i, results)
+            async with state_lock:
+                if stats is not None:
+                    stats["combinations_valid"] = int(stats.get("combinations_valid") or 0) + cv
+                _refresh_stats()
             if found_by_idx[i]:
                 break
 
         if found_by_idx[i]:
             nk = str(prepared[i].get("name_key") or "").strip()
             if nk:
-                batch_seen_names.add(nk)
-                pending_seller_names.add(nk)
+                async with state_lock:
+                    batch_seen_names.add(nk)
+                    pending_seller_names.add(nk)
+
+    async def _worker(key_idx: int) -> None:
+        nonlocal sellers_completed
+        my_key = api_keys[key_idx]
+        for i in range(key_idx, len(prepared), n_keys):
+            await _validate_seller(i, my_key)
+            async with state_lock:
+                sellers_completed += 1
+                if stats is not None:
+                    stats["seller_index"] = sellers_completed
+                    stats["sellers_total"] = len(prepared)
+                _refresh_stats()
+
+    # 2) Продавцы: при 2+ ключах — два потока (каждый ключ свой), иначе последовательно
+    n_sellers = len(prepared)
+    if stats is not None:
+        stats["sellers_total"] = n_sellers
+
+    if n_keys >= 2:
+        await asyncio.gather(*(_worker(k) for k in range(n_keys)))
+    else:
+        for i in range(n_sellers):
+            await _validate_seller(i, api_keys[0])
+            sellers_completed = i + 1
+            if stats is not None:
+                stats["seller_index"] = sellers_completed
+            _refresh_stats()
 
     # 3) собираем результат
     out_rows: list[dict[str, Any]] = []
