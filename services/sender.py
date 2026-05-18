@@ -517,6 +517,7 @@ def _send_batch_sync(
     account: EmailAccount,
     items: list[tuple[str, str, str]],
     sender_name: Optional[str] = None,
+    smtp_timeout_sec: float | None = None,
 ) -> List[Tuple[bool, Optional[str]]]:
     guard_err = smtp_proxy_required_error()
     if guard_err:
@@ -524,9 +525,10 @@ def _send_batch_sync(
 
     host, port = _smtp_host_port(getattr(account, "provider", "") or "", account.email)
     results: List[Tuple[bool, Optional[str]]] = []
+    tmo = float(smtp_timeout_sec if smtp_timeout_sec is not None else SMTP_TIMEOUT_SEC)
 
     try:
-        with smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT_SEC) as s:
+        with smtplib.SMTP(host, port, timeout=tmo) as s:
             s.ehlo()
             s.starttls()
             s.ehlo()
@@ -581,5 +583,9 @@ async def send_batch_via_account(
     account: EmailAccount,
     items: list[tuple[str, str, str]],
     sender_name: Optional[str] = None,
+    *,
+    smtp_timeout_sec: float | None = None,
 ) -> List[Tuple[bool, Optional[str]]]:
-    return await asyncio.to_thread(_send_batch_sync, account, items, sender_name)
+    return await asyncio.to_thread(
+        _send_batch_sync, account, items, sender_name, smtp_timeout_sec
+    )

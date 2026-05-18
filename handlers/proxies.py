@@ -472,7 +472,8 @@ async def proxy_add_menu(callback: CallbackQuery, state: FSMContext):
         "<b>Примеры:</b>\n"
         "<code>socks5://user:pass@109.104.153.100:10811</code>\n"
         "<code>109.104.153.100:10811:user:pass:socks5</code>\n"
-        "<code>user:pass@109.104.153.100:10811</code>\n\n"
+        "<code>user:pass@109.104.153.100:10811</code>\n"
+        "<code>8PlwM16nj5ZDjKnE:8PlwM16nj5ZDjKnE@185.90.61.65:14439</code>\n\n"
         "<b>Или так (карточкой):</b>\n"
         "<code>Тип прокси: socks5\nХост: 109.104.153.100\nПорт: 10811\nЛогин: user\nПароль: pass</code>\n\n"
         "Каждый прокси будет проверен.\n",

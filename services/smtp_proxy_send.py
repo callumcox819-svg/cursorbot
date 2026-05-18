@@ -27,9 +27,13 @@ logger = logging.getLogger(__name__)
 
 NO_ACTIVE_PROXY = "PROXY_ERROR|no_active_proxy|No active proxy configured"
 
-# Быстрый ответ в чате (пресет/HTML/текст): меньше прокси и короче таймаут, чем /send.
+# Быстрый ответ в чате (пресет/HTML/текст).
 REPLY_SMTP_TIMEOUT_SEC = max(15, min(60, int(os.getenv("REPLY_SMTP_TIMEOUT_SEC", "28"))))
 REPLY_SMTP_MAX_PROXIES = max(1, min(6, int(os.getenv("REPLY_SMTP_MAX_PROXIES", "2"))))
+
+# Рассылка /send: один «рабочий» SOCKS5 + запасной, без перебора всех подряд.
+MAIL_SMTP_TIMEOUT_SEC = max(20, min(90, int(os.getenv("MAIL_SMTP_TIMEOUT_SEC", "40"))))
+MAIL_SMTP_MAX_PROXIES = max(1, min(6, int(os.getenv("MAIL_SMTP_MAX_PROXIES", "2"))))
 
 _LAST_OK_PROXY_ID: dict[int, int] = {}
 
@@ -91,9 +95,8 @@ def _order_proxies_for_send(user_id: int, proxies: List[Proxy], *, fast: bool) -
             tail.append(p)
     random.shuffle(tail)
     order = head + tail
-    if fast:
-        return order[:REPLY_SMTP_MAX_PROXIES]
-    return order
+    limit = REPLY_SMTP_MAX_PROXIES if fast else MAIL_SMTP_MAX_PROXIES
+    return order[:limit]
 
 
 async def send_email_via_account_with_proxy(
@@ -113,7 +116,7 @@ async def send_email_via_account_with_proxy(
         return False, NO_ACTIVE_PROXY, None
 
     order = _order_proxies_for_send(int(user_id), proxies, fast=fast)
-    smtp_tmo = REPLY_SMTP_TIMEOUT_SEC if fast else None
+    smtp_tmo = REPLY_SMTP_TIMEOUT_SEC if fast else MAIL_SMTP_TIMEOUT_SEC
 
     last_err: str | None = None
     last_msgid: str | None = None
@@ -187,26 +190,46 @@ async def send_batch_via_account_with_proxy(
     items: list[tuple[str, str, str]],
     sender_name: Optional[str] = None,
 ) -> List[Tuple[bool, Optional[str]]]:
-    proxy, err = await choose_required_proxy(session, user_id)
-    if err:
-        return [(False, err) for _ in items]
-    async with ProxySMTPContext(proxy):
-        results = await send_batch_via_account(account, items, sender_name=sender_name)
-    out: list[tuple[bool, str | None]] = []
-    proxy_failed = False
-    for ok, err in results:
-        err_n = normalize_send_error(err)
-        if not ok and is_proxy_error_marker(err_n):
-            proxy_failed = True
-        out.append((bool(ok), err_n))
-    if proxy_failed:
+    proxies = await _list_active_socks5_proxies(session, user_id)
+    if not proxies:
+        return [(False, NO_ACTIVE_PROXY) for _ in items]
+
+    order = _order_proxies_for_send(int(user_id), proxies, fast=False)
+    last_results: List[Tuple[bool, Optional[str]]] = [
+        (False, NO_ACTIVE_PROXY) for _ in items
+    ]
+
+    for proxy in order:
+        pid = int(proxy.id)
+        async with ProxySMTPContext(proxy):
+            raw = await send_batch_via_account(
+                account,
+                items,
+                sender_name=sender_name,
+                smtp_timeout_sec=MAIL_SMTP_TIMEOUT_SEC,
+            )
+        out: list[tuple[bool, str | None]] = []
+        any_ok = False
+        for ok, err in raw:
+            err_n = normalize_send_error(err)
+            if ok:
+                any_ok = True
+            out.append((bool(ok), err_n))
+        last_results = out
+        if any_ok:
+            _LAST_OK_PROXY_ID[int(user_id)] = pid
+            return out
+        last_err = next((e for o, e in out if not o and e), None)
+        if not should_retry_send_with_other_proxy(last_err):
+            return out
         try:
             await ProxyManager.note_proxy_failure(
                 session,
-                int(proxy.id),
-                "PROXY_ERROR batch",
-                deactivate=any(is_definite_proxy_failure(e) for _, e in out if e),
+                pid,
+                (last_err or "batch fail")[:500],
+                deactivate=is_definite_proxy_failure(last_err or ""),
             )
         except Exception:
             pass
-    return out
+
+    return last_results
