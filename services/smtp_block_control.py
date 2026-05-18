@@ -22,6 +22,14 @@ def is_smtp_account_block_error(err: str | None) -> bool:
     s = normalize_send_error(err or "")
     kind = s.split("|", 1)[0].split(":", 1)[0].strip().upper()
     if kind in (
+        "RECIPIENT_DEAD",
+        "RECIPIENT_REFUSED",
+        "PROXY_ERROR",
+        "SMTP_TIMEOUT",
+        "SMTP_ACCEPTED_NOT_IN_SENT",
+    ):
+        return False
+    if kind in (
         "ACCOUNT_BLOCKED",
         "ACCOUNT_RATE_LIMIT",
         "ACCOUNT_INVALID_CREDENTIALS",
@@ -29,20 +37,40 @@ def is_smtp_account_block_error(err: str | None) -> bool:
     ):
         return True
     t = s.lower()
+    # Обычный DSN / отбой на адрес получателя — ящик отправителя не блокируем.
+    recipient_only = (
+        "could not be delivered to one or more recipients",
+        "your email could not be delivered",
+        "system-generated message to inform you",
+        "details of the email and the error",
+        "no such user",
+        "user unknown",
+        "mailbox unavailable",
+        "recipient address rejected",
+        "address rejected",
+        "undeliverable address",
+        "delivery status notification",
+        "mail delivery subsystem",
+        "5.1.1",
+        "5.1.0",
+        "5.2.1",
+        "5.4.4",
+        "host 127.0.0.1",
+    )
+    if any(p in t for p in recipient_only):
+        return False
     phrases = (
         "daily user sending limit",
         "sending limit exceeded",
         "user sending limit",
-        "limit exceeded",
         "too many messages",
         "mailbox full",
         "account has been disabled",
         "web login required",
         "username and password not accepted",
         "5.4.5",
+        "5.7.1",
         "message blocked",
-        "delivery status notification (failure)",
-        "mailer-daemon",
     )
     return any(p in t for p in phrases)
 

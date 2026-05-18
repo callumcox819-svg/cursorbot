@@ -1113,16 +1113,8 @@ async def _process_mails_for_account_impl(
             except Exception:
                 logger.exception("Failed to check offer title for GMX spam")
                 continue
+        # Только явный Gmail block / 5.7.1 — не любой DSN об недоставке получателю.
         smtp_block_bounce = _is_smtp_block_bounce(from_email, subject, body)
-        if not smtp_block_bounce:
-            try:
-                from services.smtp_block_control import is_smtp_account_block_error
-
-                smtp_block_bounce = is_smtp_account_block_error(
-                    f"{subject or ''}\n{body or ''}"
-                )
-            except Exception:
-                pass
 
         if (not is_spam_box) and _looks_like_spam(from_email, from_name, subject, body):
             continue
