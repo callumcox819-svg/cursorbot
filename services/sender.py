@@ -425,6 +425,7 @@ def _send_plain_sync(
     body: str,
     sender_name: Optional[str] = None,
     is_html: Optional[bool] = None,
+    smtp_timeout_sec: float | None = None,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     guard_err = smtp_proxy_required_error()
     if guard_err:
@@ -442,8 +443,9 @@ def _send_plain_sync(
         is_html=is_html,
     )
 
+    tmo = float(smtp_timeout_sec if smtp_timeout_sec is not None else SMTP_TIMEOUT_SEC)
     try:
-        with smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT_SEC) as s:
+        with smtplib.SMTP(host, port, timeout=tmo) as s:
             s.ehlo()
             s.starttls()
             s.ehlo()
@@ -496,8 +498,19 @@ async def send_email_via_account(
     body: str,
     sender_name: Optional[str] = None,
     is_html: Optional[bool] = None,
+    *,
+    smtp_timeout_sec: float | None = None,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
-    return await asyncio.to_thread(_send_plain_sync, account, to_email, subject, body, sender_name, is_html)
+    return await asyncio.to_thread(
+        _send_plain_sync,
+        account,
+        to_email,
+        subject,
+        body,
+        sender_name,
+        is_html,
+        smtp_timeout_sec,
+    )
 
 
 def _send_batch_sync(

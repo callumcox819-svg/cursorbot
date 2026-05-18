@@ -48,16 +48,11 @@ from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 
 router = Router()
 
-# Рассылка ответа/пресета через SOCKS: до N прокси × SMTP_TIMEOUT_SEC — 25с обрывало отправку.
-_INCOMING_SMTP_TIMEOUT = max(
-    90,
-    int(
-        os.getenv(
-            "INCOMING_SMTP_TIMEOUT_SEC",
-            str(max(160, int(os.getenv("SMTP_TIMEOUT_SEC", "45")) * 4 + 40)),
-        )
-    ),
-)
+def _incoming_smtp_wait_sec() -> int:
+    from services.smtp_proxy_send import REPLY_SMTP_MAX_PROXIES, REPLY_SMTP_TIMEOUT_SEC
+
+    default = REPLY_SMTP_MAX_PROXIES * REPLY_SMTP_TIMEOUT_SEC + 20
+    return max(45, int(os.getenv("INCOMING_SMTP_TIMEOUT_SEC", str(default))))
 REPLY_CHOICE_TEXT = "Выберите вариант"
 
 COUNTRY_KEY = "country"
@@ -382,10 +377,12 @@ async def _bg_incoming_smtp(
 
     async def _job() -> None:
         try:
-            ok, err, _msgid = await asyncio.wait_for(coro_fn(), timeout=_INCOMING_SMTP_TIMEOUT + 10)
+            ok, err, _msgid = await asyncio.wait_for(
+                coro_fn(), timeout=_incoming_smtp_wait_sec() + 10
+            )
         except asyncio.TimeoutError:
             ok, err = False, (
-                f"Timeout: SMTP отправка > {_INCOMING_SMTP_TIMEOUT}с "
+                f"Timeout: SMTP отправка > {_incoming_smtp_wait_sec()}с "
                 f"(прокси перебираются, подождите или уменьшите число прокси)"
             )
         except Exception as e:
@@ -432,10 +429,12 @@ async def _bg_message_smtp(
 
     async def _job() -> None:
         try:
-            ok, err, _msgid = await asyncio.wait_for(coro_fn(), timeout=_INCOMING_SMTP_TIMEOUT + 10)
+            ok, err, _msgid = await asyncio.wait_for(
+                coro_fn(), timeout=_incoming_smtp_wait_sec() + 10
+            )
         except asyncio.TimeoutError:
             ok, err = False, (
-                f"Timeout: SMTP отправка > {_INCOMING_SMTP_TIMEOUT}с "
+                f"Timeout: SMTP отправка > {_incoming_smtp_wait_sec()}с "
                 f"(прокси перебираются, подождите или уменьшите число прокси)"
             )
         except Exception as e:
@@ -1999,18 +1998,12 @@ async def cb_mail_reply_preset_send(callback: CallbackQuery, state: FSMContext):
         if tmpl_pre:
             preset_body = (tmpl_pre.body or "").strip()
 
+    if not (preset_body or "").strip():
+        return await callback.answer("Пресет пустой или не найден", show_alert=True)
+
     async def _send() -> tuple[bool, str | None]:
         async with Session() as session:
             user = await get_or_create_user(session, tg_id)
-            tmpl = (
-                await session.execute(
-                    sa_select(QuickTemplate)
-                    .where(QuickTemplate.user_id == int(user.id))
-                    .where(QuickTemplate.id == int(tid))
-                )
-            ).scalar_one_or_none()
-            if not tmpl:
-                return False, "Пресет не найден"
             acc = (
                 await session.execute(sa_select(EmailAccount).where(EmailAccount.id == int(acc_id)))
             ).scalar_one_or_none()
@@ -2023,22 +2016,27 @@ async def cb_mail_reply_preset_send(callback: CallbackQuery, state: FSMContext):
                 acc,
                 to_email,
                 out_subject,
-                tmpl.body or "",
+                preset_body,
+                fast=True,
             )
 
     meta_fm = FULL_META.get((acc_id, mail_uid)) or {}
-    notify = await _reply_notify_build_async(
-        acc_id=acc_id,
-        uid=str(mail_uid),
-        meta=meta_fm,
-        state_data=data,
-        body_text=preset_body,
-        is_preset=True,
-        extra_cleanup=[callback.message.message_id],
-        user_id=db_user_id,
-    )
+    state_snap = dict(data)
+
+    async def _notify_builder() -> ReplyNotifyCtx | None:
+        return await _reply_notify_build_async(
+            acc_id=acc_id,
+            uid=str(mail_uid),
+            meta=meta_fm,
+            state_data=state_snap,
+            body_text=preset_body,
+            is_preset=True,
+            extra_cleanup=[callback.message.message_id],
+            user_id=db_user_id,
+        )
+
     await state.clear()
-    if not await _bg_incoming_smtp(callback, tg_id, _send, notify=notify):
+    if not await _bg_incoming_smtp(callback, tg_id, _send, notify_builder=_notify_builder):
         return
 
 
@@ -2245,6 +2243,7 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
                 html_body,
                 is_html=True,
                 sender_name=sender_name,
+                fast=True,
             )
 
     meta_fm = FULL_META.get((acc_id, uid)) or {}
@@ -2325,23 +2324,28 @@ async def mail_reply_text(message: Message, state: FSMContext):
                 to_email,
                 out_subject,
                 text,
+                fast=True,
             )
 
     meta_fm = FULL_META.get((acc_id, uid)) or {}
+    state_snap = dict(data)
     db_user_id: int | None = None
     async with Session() as session:
         user = await get_or_create_user(session, tg_id)
         db_user_id = int(user.id)
-    notify = await _reply_notify_build_async(
-        acc_id=acc_id,
-        uid=uid,
-        meta=meta_fm,
-        state_data=data,
-        body_text=body_for_notify,
-        user_id=db_user_id,
-    )
+
+    async def _notify_builder() -> ReplyNotifyCtx | None:
+        return await _reply_notify_build_async(
+            acc_id=acc_id,
+            uid=uid,
+            meta=meta_fm,
+            state_data=state_snap,
+            body_text=body_for_notify,
+            user_id=db_user_id,
+        )
+
     await state.clear()
-    if await _bg_message_smtp(message, tg_id, _send, notify=notify):
+    if await _bg_message_smtp(message, tg_id, _send, notify_builder=_notify_builder):
         try:
             FULL_META[(acc_id, uid)] = {
                 **(FULL_META.get((acc_id, uid)) or {}),

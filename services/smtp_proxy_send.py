@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 from typing import List, Optional, Tuple
 
@@ -25,6 +26,12 @@ from services.proxy_manager import ProxyManager
 logger = logging.getLogger(__name__)
 
 NO_ACTIVE_PROXY = "PROXY_ERROR|no_active_proxy|No active proxy configured"
+
+# Быстрый ответ в чате (пресет/HTML/текст): меньше прокси и короче таймаут, чем /send.
+REPLY_SMTP_TIMEOUT_SEC = max(15, min(60, int(os.getenv("REPLY_SMTP_TIMEOUT_SEC", "28"))))
+REPLY_SMTP_MAX_PROXIES = max(1, min(6, int(os.getenv("REPLY_SMTP_MAX_PROXIES", "2"))))
+
+_LAST_OK_PROXY_ID: dict[int, int] = {}
 
 
 async def choose_required_proxy(
@@ -70,6 +77,25 @@ async def _list_active_socks5_proxies(session: AsyncSession, user_id: int) -> Li
     return out
 
 
+def _order_proxies_for_send(user_id: int, proxies: List[Proxy], *, fast: bool) -> List[Proxy]:
+    if not proxies:
+        return []
+    uid = int(user_id)
+    last_id = _LAST_OK_PROXY_ID.get(uid)
+    head: List[Proxy] = []
+    tail: List[Proxy] = []
+    for p in proxies:
+        if last_id and int(p.id) == int(last_id):
+            head.append(p)
+        else:
+            tail.append(p)
+    random.shuffle(tail)
+    order = head + tail
+    if fast:
+        return order[:REPLY_SMTP_MAX_PROXIES]
+    return order
+
+
 async def send_email_via_account_with_proxy(
     session: AsyncSession,
     user_id: int,
@@ -79,13 +105,15 @@ async def send_email_via_account_with_proxy(
     body: str,
     sender_name: Optional[str] = None,
     is_html: Optional[bool] = None,
+    *,
+    fast: bool = False,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     proxies = await _list_active_socks5_proxies(session, user_id)
     if not proxies:
         return False, NO_ACTIVE_PROXY, None
 
-    order = list(proxies)
-    random.shuffle(order)
+    order = _order_proxies_for_send(int(user_id), proxies, fast=fast)
+    smtp_tmo = REPLY_SMTP_TIMEOUT_SEC if fast else None
 
     last_err: str | None = None
     last_msgid: str | None = None
@@ -95,7 +123,7 @@ async def send_email_via_account_with_proxy(
         pid = int(proxy.id)
         tried += 1
         logger.info(
-            "[SMTP send] try proxy_id=%s %s:%s account=%s -> %s (%s/%s)",
+            "[SMTP send] try proxy_id=%s %s:%s account=%s -> %s (%s/%s fast=%s)",
             pid,
             proxy.host,
             proxy.port,
@@ -103,6 +131,7 @@ async def send_email_via_account_with_proxy(
             to_email,
             tried,
             len(order),
+            fast,
         )
         async with ProxySMTPContext(proxy):
             ok, err, msgid = await send_email_via_account(
@@ -112,9 +141,11 @@ async def send_email_via_account_with_proxy(
                 body,
                 sender_name=sender_name,
                 is_html=is_html,
+                smtp_timeout_sec=smtp_tmo,
             )
         err = normalize_send_error(err)
         if ok:
+            _LAST_OK_PROXY_ID[int(user_id)] = pid
             return True, err, msgid
 
         last_err = err
