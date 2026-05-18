@@ -19,10 +19,7 @@ from sqlalchemy.orm import selectinload
 from database import db_session
 from models import EmailAccount, OfferEmail, Offer, User, Proxy
 
-from services.smtp_proxy_send import (
-    send_batch_via_account_with_proxy,
-    send_email_via_account_with_proxy,
-)
+from services.smtp_proxy_send import send_email_via_account_with_proxy
 from services.users import get_or_create_user
 from services.user_settings import get_user_setting
 from services.placeholders import apply_placeholders
@@ -80,16 +77,12 @@ def set_sending_state(user_id: int, state: Optional[SendingState] = None, **kwar
 SMTP_CONCURRENCY_WITH_PROXY = 1
 SMTP_CONCURRENCY_NO_PROXY = 1
 
-def mailing_send_timeouts(*, batch_size: int = 1) -> tuple[int, int]:
+def mailing_send_timeouts() -> int:
+    """Таймаут одной отправки: 1 ящик × 1 письмо × до N прокси."""
     from services.smtp_proxy_send import MAIL_SMTP_MAX_PROXIES, MAIL_SMTP_TIMEOUT_SEC
 
-    bs = max(1, int(batch_size))
     one = MAIL_SMTP_MAX_PROXIES * MAIL_SMTP_TIMEOUT_SEC + 30
-    batch = MAIL_SMTP_TIMEOUT_SEC * bs + 40
-    return (
-        max(75, int(os.getenv("SEND_ONE_TIMEOUT", str(one)))),
-        max(90, int(os.getenv("SEND_BATCH_TIMEOUT", str(batch)))),
-    )
+    return max(75, int(os.getenv("SEND_ONE_TIMEOUT", str(one))))
 MAX_PROXY_FAILS_PER_TARGET = 5
 
 # user settings keys (уже используются в проекте)
@@ -328,8 +321,9 @@ async def start_sending(message: Message):
         "✅ Рассылка запущена.\n"
         f"В очереди: <b>{total_targets}</b> email\n"
         f"{proxy_detail}\n"
-        f"Отправка: до <b>{MAIL_SMTP_MAX_PROXIES}</b> SOCKS5 × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с\n"
-        f"<i>Прокси перепроверяются каждые {MAIL_PROXY_RECHECK_SEC // 60} мин во время рассылки.</i>",
+        f"Режим: <b>1 ящик → 1 пресет → 1 адрес</b> (ротация почт по кругу)\n"
+        f"SMTP: до <b>{MAIL_SMTP_MAX_PROXIES}</b> SOCKS5 × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с\n"
+        f"<i>Прокси перепроверяются каждые {max(1, MAIL_PROXY_RECHECK_SEC // 60)} мин.</i>",
         reply_markup=main_menu_kb(tg_user_id),
         parse_mode="HTML",
     )
@@ -383,8 +377,7 @@ async def _notify_sending_finished(*, bot: Bot, chat_id: int, tg_user_id: int) -
         f"Принято SMTP (снято с очереди): <b>{sent}</b>\n"
         f"Ошибок отправки: <b>{failed}</b>\n"
         f"Email в очереди: <b>{pending}</b>\n\n"
-        f"<i>Если ответов мало — проверьте прокси (SMTP+STARTTLS OK), "
-        f"batch_size 1–3, задержку 2–5 с.</i>"
+        f"<i>Если ответов мало — проверьте прокси (SMTP+STARTTLS OK) и задержку 2–5 с.</i>"
     )
     if failed > 0 and (state.last_error or "").strip() not in ("", "-"):
         who = f"\nПоследний адрес: <code>{state.last_failed_to}</code>" if state.last_failed_to else ""
@@ -465,13 +458,14 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
     entered_main_loop = False
     fail_streak: dict[int, int] = {}
     acc_idx = 0
+    rotation_accounts: List[EmailAccount] = []
 
     async with db_session() as session:
         user = await get_or_create_user(session, tg_user_id)
         db_user_id = user.id
 
-        accounts = await _get_active_accounts(session, db_user_id)
-        if not accounts:
+        rotation_accounts = list(await _get_active_accounts(session, db_user_id))
+        if not rotation_accounts:
             state.is_running = False
             state.last_error = "NO_ACCOUNTS|no_accounts|No active accounts"
             set_sending_state(tg_user_id, state=state)
@@ -480,6 +474,7 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
             except Exception:
                 pass
             return
+        random.shuffle(rotation_accounts)
 
         from proxy_manager import is_socks5_proxy
 
@@ -501,9 +496,9 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
             return
 
         timing = await load_timing(session, tg_user_id)
-        min_delay = float(timing.get("min_delay", 1.5))
-        max_delay = float(timing.get("max_delay", 3.0))
-        batch_size = max(1, min(5, int(timing.get("batch_size", 1))))
+        min_delay = float(timing.get("min_delay", 2.0))
+        max_delay = float(timing.get("max_delay", 4.0))
+    send_one_timeout = mailing_send_timeouts()
 
     try:
         while True:
@@ -520,8 +515,11 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 db_user_id = int(user.id)
                 sender_name = getattr(user, "sender_name", None)
 
-                accounts = await _get_active_accounts(session, db_user_id)
-                if not accounts:
+                if not rotation_accounts:
+                    rotation_accounts = list(await _get_active_accounts(session, db_user_id))
+                    if rotation_accounts:
+                        random.shuffle(rotation_accounts)
+                if not rotation_accounts:
                     state.is_running = False
                     state.last_status = "STOPPED"
                     set_sending_state(tg_user_id, state=state)
@@ -541,97 +539,56 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     set_sending_state(tg_user_id, state=state)
                     break
 
-                acc = accounts[acc_idx % len(accounts)]
+                # Ротация: каждый шаг — другой активный ящик, новый случайный пресет, один получатель.
+                acc = rotation_accounts[acc_idx % len(rotation_accounts)]
                 acc_idx += 1
+                tgt = targets[0]
 
-                send_one_timeout, send_batch_timeout = mailing_send_timeouts(batch_size=batch_size)
-
-                if batch_size <= 1:
-                    tgt = targets[0]
-                    try:
-                        subject, body = await _build_message_for_target(session, tg_user_id, tgt)
-                        to_addr = (tgt.email or "").strip()
-                        async with smtp_sem:
-                            ok, err, _msgid = await asyncio.wait_for(
-                                send_email_via_account_with_proxy(
-                                    session,
-                                    db_user_id,
-                                    acc,
-                                    to_addr,
-                                    subject,
-                                    body,
-                                    sender_name=sender_name,
-                                ),
-                                timeout=send_one_timeout,
-                            )
-                    except asyncio.TimeoutError:
-                        ok, err = False, normalize_send_error(
-                            f"SMTP_TIMEOUT|timeout|SMTP send exceeded {send_one_timeout}s"
+                try:
+                    subject, body = await _build_message_for_target(session, tg_user_id, tgt)
+                    to_addr = (tgt.email or "").strip()
+                    logger.info(
+                        "[mailing rotate] from=%s to=%s subject=%r",
+                        acc.email,
+                        to_addr,
+                        (subject or "")[:60],
+                    )
+                    async with smtp_sem:
+                        ok, err, _msgid = await asyncio.wait_for(
+                            send_email_via_account_with_proxy(
+                                session,
+                                db_user_id,
+                                acc,
+                                to_addr,
+                                subject,
+                                body,
+                                sender_name=sender_name,
+                            ),
+                            timeout=send_one_timeout,
                         )
-                    except Exception as e:
-                        ok, err = False, normalize_send_error(str(e))
+                except asyncio.TimeoutError:
+                    ok, err = False, normalize_send_error(
+                        f"SMTP_TIMEOUT|timeout|SMTP send exceeded {send_one_timeout}s"
+                    )
+                except Exception as e:
+                    ok, err = False, normalize_send_error(str(e))
 
-                    if ok:
-                        state.sent_count += 1
-                        fail_streak.pop(int(tgt.id), None)
-                        await _purge_target(session, db_user_id, tgt.id)
-                    elif await _handle_send_failure(
-                        session=session,
-                        db_user_id=db_user_id,
-                        state=state,
-                        tgt=tgt,
-                        err=err or "UNKNOWN",
-                        fail_streak=fail_streak,
-                        acc=acc,
-                        bot=bot,
-                        chat_id=chat_id,
-                    ):
-                        pass
-
-                else:
-                    batch = targets[:batch_size]
-                    try:
-                        items: list[tuple[str, str, str]] = []
-                        for t in batch:
-                            subj, body = await _build_message_for_target(session, tg_user_id, t)
-                            items.append(((t.email or "").strip(), subj, body))
-                        async with smtp_sem:
-                            results = await asyncio.wait_for(
-                                send_batch_via_account_with_proxy(
-                                    session,
-                                    db_user_id,
-                                    acc,
-                                    items,
-                                    sender_name=sender_name,
-                                ),
-                                timeout=send_batch_timeout,
-                            )
-                    except asyncio.TimeoutError:
-                        err = normalize_send_error(
-                            f"SMTP_TIMEOUT|timeout|SMTP batch exceeded {send_batch_timeout}s"
-                        )
-                        results = [(False, err) for _ in batch]
-                    except Exception as e:
-                        err = normalize_send_error(str(e))
-                        results = [(False, err) for _ in batch]
-
-                    for t, (ok, err) in zip(batch, results):
-                        if ok:
-                            state.sent_count += 1
-                            fail_streak.pop(int(t.id), None)
-                            await _purge_target(session, db_user_id, t.id)
-                        else:
-                            await _handle_send_failure(
-                                session=session,
-                                db_user_id=db_user_id,
-                                state=state,
-                                tgt=t,
-                                err=err or "UNKNOWN",
-                                fail_streak=fail_streak,
-                                acc=acc,
-                                bot=bot,
-                                chat_id=chat_id,
-                            )
+                if ok:
+                    state.sent_count += 1
+                    fail_streak.pop(int(tgt.id), None)
+                    await _purge_target(session, db_user_id, tgt.id)
+                elif await _handle_send_failure(
+                    session=session,
+                    db_user_id=db_user_id,
+                    state=state,
+                    tgt=tgt,
+                    err=err or "UNKNOWN",
+                    fail_streak=fail_streak,
+                    acc=acc,
+                    bot=bot,
+                    chat_id=chat_id,
+                ):
+                    pass
 
             if not state.is_running:
                 break
