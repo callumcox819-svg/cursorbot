@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -47,7 +48,16 @@ from utils.bg_jobs import is_running as bg_is_running, start as bg_start
 
 router = Router()
 
-_INCOMING_SMTP_TIMEOUT = 25
+# Рассылка ответа/пресета через SOCKS: до N прокси × SMTP_TIMEOUT_SEC — 25с обрывало отправку.
+_INCOMING_SMTP_TIMEOUT = max(
+    90,
+    int(
+        os.getenv(
+            "INCOMING_SMTP_TIMEOUT_SEC",
+            str(max(160, int(os.getenv("SMTP_TIMEOUT_SEC", "45")) * 4 + 40)),
+        )
+    ),
+)
 REPLY_CHOICE_TEXT = "Выберите вариант"
 
 COUNTRY_KEY = "country"
@@ -374,7 +384,10 @@ async def _bg_incoming_smtp(
         try:
             ok, err, _msgid = await asyncio.wait_for(coro_fn(), timeout=_INCOMING_SMTP_TIMEOUT + 10)
         except asyncio.TimeoutError:
-            ok, err = False, "Timeout: SMTP отправка заняла слишком долго"
+            ok, err = False, (
+                f"Timeout: SMTP отправка > {_INCOMING_SMTP_TIMEOUT}с "
+                f"(прокси перебираются, подождите или уменьшите число прокси)"
+            )
         except Exception as e:
             ok, err = False, f"{type(e).__name__}: {e}"
         if ok:
@@ -421,7 +434,10 @@ async def _bg_message_smtp(
         try:
             ok, err, _msgid = await asyncio.wait_for(coro_fn(), timeout=_INCOMING_SMTP_TIMEOUT + 10)
         except asyncio.TimeoutError:
-            ok, err = False, "Timeout: SMTP отправка заняла слишком долго"
+            ok, err = False, (
+                f"Timeout: SMTP отправка > {_INCOMING_SMTP_TIMEOUT}с "
+                f"(прокси перебираются, подождите или уменьшите число прокси)"
+            )
         except Exception as e:
             ok, err = False, f"{type(e).__name__}: {e}"
         if ok:
