@@ -231,9 +231,7 @@ def check_smtp_account_via_proxy_isolated(
 
 
 def check_smtp_account_sync(account: EmailAccount) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Проверка SMTP (прокси должен быть уже применён через ProxySMTPContext).
-    """
+    """Прямое TCP-подключение к SMTP-серверу (host:587, STARTTLS, login)."""
     email = (account.email or "").strip()
     host, port = _smtp_host_port(getattr(account, "provider", "") or "", email)
     s: smtplib.SMTP | None = None
@@ -246,6 +244,18 @@ def check_smtp_account_sync(account: EmailAccount) -> Tuple[Optional[str], Optio
         return st or "error", err
     finally:
         _close_smtp(s)
+
+
+def check_smtp_account_direct_sync(account: EmailAccount) -> Tuple[Optional[str], Optional[str]]:
+    """Проверка без SOCKS — сбрасываем патч smtplib и идём напрямую к Gmail/GMX."""
+    from proxy_manager import reset_smtplib_proxy
+
+    reset_smtplib_proxy()
+    return check_smtp_account_sync(account)
+
+
+async def check_smtp_account_direct(account: EmailAccount) -> Tuple[Optional[str], Optional[str]]:
+    return await asyncio.to_thread(check_smtp_account_direct_sync, account)
 
 
 async def check_smtp_account_with_proxy(
@@ -327,10 +337,10 @@ async def check_smtp_accounts_parallel(
     on_progress: Callable[[int, int, str | None], Awaitable[None]] | None = None,
 ) -> List[SmtpCheckResult]:
     """
-    Проверка SMTP тем же путём, что рассылка: ProxySMTPContext + smtplib (по одному ящику).
-    workers игнорируется — глобальный SOCKS-lock не позволяет честный параллелизм.
+    Проверка SMTP напрямую (без прокси): логин на smtp.gmail.com и т.п.
+    Рассылка /send по-прежнему идёт через SOCKS5 — это только диагностика ящика.
     """
-    del workers
+    del workers, session, user_id
     if not accounts:
         return []
 
@@ -341,7 +351,7 @@ async def check_smtp_accounts_parallel(
         acc_id = int(acc.id)
         email = (acc.email or "").strip()
         try:
-            st, err = await check_smtp_account_with_proxy(session, int(user_id), acc)
+            st, err = await check_smtp_account_direct(acc)
         except Exception as e:
             logger.exception("[SMTP check] crash %s", email)
             st, err = _classify_exception(e)

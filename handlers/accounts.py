@@ -504,7 +504,7 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
     await callback.answer("Запускаю проверку SMTP…")
     status_msg = await callback.message.answer(
         f"⏳ <b>Проверка SMTP</b>\n\n0/{total_accounts}\n"
-        f"<i>Как при рассылке: SOCKS5 → Gmail, по одному ящику</i>",
+        f"<i>Напрямую к SMTP (без прокси), по одному ящику</i>",
         parse_mode="HTML",
     )
 
@@ -534,11 +534,12 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
             try:
                 await status_msg.edit_text(
                     f"⏳ <b>Проверка SMTP</b>\n\n{done}/{tot}\n"
-                    f"<i>SOCKS5 → Gmail</i>\n{em}",
+                    f"<i>прямое SMTP</i>\n{em}",
                     parse_mode="HTML",
                 )
-            except TelegramBadRequest:
-                pass
+            except TelegramBadRequest as e:
+                if "message is not modified" not in str(e).lower():
+                    raise
 
         try:
             async with Session() as session:
@@ -587,7 +588,7 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
 
                     if st is None or st == "error":
                         skip_n += 1
-                        reason = short_block_reason(err) or "прокси / SMTP-туннель"
+                        reason = short_block_reason(err) or "сеть / таймаут SMTP"
                         lines.append(
                             f"⏭ <code>{_e(res.email)}</code> — проверка не удалась\n"
                             f"   <i>{_e(reason)}</i>"
@@ -646,10 +647,16 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
             )
             try:
                 await status_msg.edit_text(summary, parse_mode="HTML")
-            except TelegramBadRequest:
-                await callback.message.answer(summary, parse_mode="HTML")
+            except TelegramBadRequest as e:
+                if "message is not modified" in str(e).lower():
+                    pass
+                else:
+                    await callback.message.answer(summary, parse_mode="HTML")
 
             await render_accounts_menu(callback, tg_id, page=1, status_filter="all")
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e).lower():
+                raise
         except Exception as e:
             logger.exception("acc_check_smtp job failed tg_id=%s", tg_id)
             err_txt = _e(str(e))[:400]
@@ -658,8 +665,9 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
                     f"❌ <b>Проверка SMTP упала</b>\n\n<code>{err_txt}</code>",
                     parse_mode="HTML",
                 )
-            except TelegramBadRequest:
-                pass
+            except TelegramBadRequest as te:
+                if "message is not modified" not in str(te).lower():
+                    raise
 
     if not bg_start(tg_id, "accounts_smtp_check", _job()):
         await callback.answer("Проверка SMTP уже выполняется…", show_alert=True)
