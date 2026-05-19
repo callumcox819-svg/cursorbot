@@ -60,8 +60,18 @@ async def choose_required_proxy(
     return None, NO_ACTIVE_PROXY
 
 
+def _smtp_eligible_proxy_row(p: Proxy) -> bool:
+    if not is_socks5_proxy(p):
+        t = (getattr(p, "type", None) or "").strip().lower()
+        if t in ("http", "https"):
+            return False
+        if t and not t.startswith("socks"):
+            return False
+    return True
+
+
 async def _list_active_socks5_proxies(session: AsyncSession, user_id: int) -> List[Proxy]:
-    """Все SOCKS5 пользователя; «красные» в UI не исключаем из рассылки."""
+    """SOCKS5 для рассылки: без 🔴 (is_active=False). 🟢 и 🟡 (None) — можно."""
     rows = (
         await session.execute(
             sa_select(Proxy)
@@ -71,20 +81,16 @@ async def _list_active_socks5_proxies(session: AsyncSession, user_id: int) -> Li
     ).scalars().all()
     out: List[Proxy] = []
     for p in rows:
-        if not is_socks5_proxy(p):
-            t = (getattr(p, "type", None) or "").strip().lower()
-            if t in ("http", "https"):
-                continue
-            if t and not t.startswith("socks"):
-                continue
+        if not _smtp_eligible_proxy_row(p):
+            continue
+        if p.is_active is False:
+            continue
         out.append(p)
 
     def _pref_key(px: Proxy) -> int:
         if px.is_active is True:
             return 0
-        if px.is_active is None:
-            return 1
-        return 2
+        return 1
 
     out.sort(key=_pref_key)
     return out

@@ -117,6 +117,20 @@ async def _get_active_accounts(session: AsyncSession, user_id: int) -> List[Emai
     return list(rows)
 
 
+def _shuffle_rotation_accounts(accounts: List[EmailAccount]) -> List[EmailAccount]:
+    out = list(accounts)
+    random.shuffle(out)
+    return out
+
+
+def _remove_account_from_rotation(
+    rotation_accounts: List[EmailAccount], account_id: int
+) -> List[EmailAccount]:
+    """Убрать ящик из SMTP-ротации (smtp_blocked — IMAP не трогаем)."""
+    aid = int(account_id)
+    return [a for a in rotation_accounts if int(a.id) != aid]
+
+
 async def _get_targets(session: AsyncSession, user_id: int) -> List[OfferEmail]:
     """Targets are OfferEmail rows belonging to offers of this user."""
     rows = (
@@ -221,11 +235,10 @@ async def start_sending(message: Message):
     chat_id = message.chat.id
     bot = message.bot
 
-    await tg_answer_safe(message, "⏳ Проверяю очередь и аккаунты…")
+    status_msg = await message.answer("⏳ Проверяю очередь и аккаунты…", parse_mode="HTML")
 
     async with db_session() as session:
         db_user = await get_or_create_user(session, int(tg_user_id))
-        timing = await load_timing(session, tg_user_id)
 
         db_user_id = db_user.id
         accounts = await _get_active_accounts(session, db_user_id)
@@ -237,16 +250,14 @@ async def start_sending(message: Message):
         total_targets = await _get_targets_count(session, db_user_id)
 
         if not accounts:
-            await tg_answer_safe(
-                message,
+            await status_msg.edit_text(
                 "❌ Нет активных аккаунтов.\nДобавьте почту в «Настройки → Аккаунты».",
                 reply_markup=main_menu_kb(tg_user_id),
             )
             return
 
         if total_targets <= 0:
-            await tg_answer_safe(
-                message,
+            await status_msg.edit_text(
                 "❌ Очередь пуста — нет email в БД после валидации.",
                 reply_markup=main_menu_kb(tg_user_id),
             )
@@ -254,7 +265,7 @@ async def start_sending(message: Message):
 
         state = get_sending_state(tg_user_id)
         if state and getattr(state, "is_running", False):
-            await tg_answer_safe(message, "⚠️ Рассылка уже запущена.")
+            await status_msg.edit_text("⚠️ Рассылка уже запущена.")
             return
 
         from proxy_manager import is_socks5_proxy
@@ -262,15 +273,44 @@ async def start_sending(message: Message):
         all_px = (
             await session.execute(select(Proxy).where(Proxy.user_id == db_user_id))
         ).scalars().all()
-        socks_proxies = [p for p in all_px if is_socks5_proxy(p)]
+        socks_total = sum(1 for p in all_px if is_socks5_proxy(p))
 
-        if not socks_proxies:
-            await tg_answer_safe(
-                message,
+        if socks_total <= 0:
+            await status_msg.edit_text(
                 "❌ Нет SOCKS5 прокси. Добавьте socks5://… в «Прокси».",
                 reply_markup=main_menu_kb(tg_user_id),
             )
             return
+
+    try:
+        await status_msg.edit_text(
+            "⏳ Проверяю SOCKS5 (туннель + SMTP+STARTTLS)…\n"
+            "<i>Это может занять 1–2 минуты.</i>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    from services.mailing_proxy_health import preflight_proxies_for_mailing
+
+    px_ok, px_summary, px_detail = await preflight_proxies_for_mailing(int(db_user_id))
+    if not px_ok:
+        try:
+            await status_msg.edit_text(
+                "❌ <b>Рассылка не запущена</b>\n\n" + px_detail,
+                parse_mode="HTML",
+                reply_markup=main_menu_kb(tg_user_id),
+            )
+        except Exception:
+            await tg_answer_safe(
+                message,
+                "❌ Рассылка не запущена.\n\n" + px_detail,
+                reply_markup=main_menu_kb(tg_user_id),
+                parse_mode="HTML",
+            )
+        return
+
+    sendable_px = int(px_summary.ok) + int(px_summary.unknown)
 
     async with db_session() as session:
         state = SendingState(
@@ -294,17 +334,26 @@ async def start_sending(message: Message):
     from services.mailing_send import MAIL_SEND_RETRIES, MAIL_VERIFY_SENT
     from services.smtp_proxy_send import MAIL_SMTP_MAX_PROXIES, MAIL_SMTP_TIMEOUT_SEC
 
-    await tg_answer_safe(
-        message,
-        "✅ <b>Рассылка запущена</b>\n"
-        f"В очереди: <b>{total_targets}</b> · SOCKS5: <b>{len(socks_proxies)}</b>\n"
-        f"Ротация: <b>1 ящик → 1 умный пресет → 1 адрес</b> → пауза MIN–MAX\n"
-        f"Успех в /stat: <b>{'IMAP Sent' if MAIL_VERIFY_SENT else 'SMTP 250+NOOP'}</b>\n"
-        f"Прокси: до <b>{MAIL_SMTP_MAX_PROXIES}</b> × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с · "
-        f"повторов <b>{MAIL_SEND_RETRIES}</b>",
-        reply_markup=main_menu_kb(tg_user_id),
-        parse_mode="HTML",
-    )
+    try:
+        await status_msg.edit_text(
+            "✅ <b>Рассылка запущена</b>\n"
+            f"В очереди: <b>{total_targets}</b> · ящиков active: <b>{len(accounts)}</b>\n"
+            f"{px_detail}\n"
+            f"В рассылке SOCKS5: <b>{sendable_px}</b> (🔴 не используются)\n"
+            f"Ротация: <b>1 ящик → 1 умный пресет → 1 адрес</b> → пауза MIN–MAX\n"
+            f"Успех в /stat: <b>{'IMAP Sent' if MAIL_VERIFY_SENT else 'SMTP 250+NOOP'}</b>\n"
+            f"Прокси: до <b>{MAIL_SMTP_MAX_PROXIES}</b> × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с · "
+            f"повторов <b>{MAIL_SEND_RETRIES}</b>\n\n"
+            "<i>Ящик с Message blocked снимается с рассылки, IMAP остаётся.</i>",
+            reply_markup=main_menu_kb(tg_user_id),
+            parse_mode="HTML",
+        )
+    except Exception:
+        await tg_answer_safe(
+            message,
+            "✅ Рассылка запущена.",
+            reply_markup=main_menu_kb(tg_user_id),
+        )
 
     asyncio.create_task(
         _sending_loop(bot=bot, chat_id=chat_id, tg_user_id=tg_user_id)
@@ -414,7 +463,9 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
         user = await get_or_create_user(session, tg_user_id)
         db_user_id = user.id
 
-        rotation_accounts = list(await _get_active_accounts(session, db_user_id))
+        rotation_accounts = _shuffle_rotation_accounts(
+            await _get_active_accounts(session, db_user_id)
+        )
         if not rotation_accounts:
             state.is_running = False
             state.last_error = "NO_ACCOUNTS|no_accounts|No active accounts"
@@ -424,22 +475,18 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
             except Exception:
                 pass
             return
-        random.shuffle(rotation_accounts)
 
-        from proxy_manager import is_socks5_proxy
+        from services.smtp_proxy_send import _list_active_socks5_proxies
 
-        all_proxies = (
-            await session.execute(select(Proxy).where(Proxy.user_id == int(db_user_id)))
-        ).scalars().all()
-        socks_n = sum(1 for p in all_proxies if is_socks5_proxy(p))
-        if socks_n <= 0:
+        if not await _list_active_socks5_proxies(session, int(db_user_id)):
             state.is_running = False
-            state.last_error = "PROXY_ERROR|no_active_proxy|No SOCKS5 configured"
+            state.last_error = "PROXY_ERROR|no_active_proxy|No sendable SOCKS5"
             set_sending_state(tg_user_id, state=state)
             try:
                 await bot.send_message(
                     chat_id,
-                    "❌ Рассылка остановлена: нет SOCKS5 в «Прокси».",
+                    "❌ Рассылка остановлена: нет 🟢/🟡 SOCKS5 (все 🔴). "
+                    "Проверьте прокси в «Прокси».",
                 )
             except Exception:
                 pass
@@ -464,9 +511,9 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 sender_name = getattr(user, "sender_name", None)
 
                 if not rotation_accounts:
-                    rotation_accounts = list(await _get_active_accounts(session, db_user_id))
-                    if rotation_accounts:
-                        random.shuffle(rotation_accounts)
+                    rotation_accounts = _shuffle_rotation_accounts(
+                        await _get_active_accounts(session, db_user_id)
+                    )
                 if not rotation_accounts:
                     state.is_running = False
                     state.last_status = "STOPPED"
@@ -561,7 +608,7 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     await _purge_target(session, db_user_id, tgt.id)
                 else:
                     state.last_status = "NORMAL"
-                    await _handle_send_failure(
+                    blocked = await _handle_send_failure(
                         session=session,
                         db_user_id=db_user_id,
                         state=state,
@@ -571,6 +618,15 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                         bot=bot,
                         chat_id=chat_id,
                     )
+                    if blocked:
+                        rotation_accounts = _remove_account_from_rotation(
+                            rotation_accounts, int(acc.id)
+                        )
+                        state.accounts_active = len(rotation_accounts)
+                        logger.info(
+                            "removed smtp_blocked account from rotation: %s",
+                            acc.email,
+                        )
 
                 set_sending_state(tg_user_id, state=state)
 

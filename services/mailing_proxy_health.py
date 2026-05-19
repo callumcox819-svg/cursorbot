@@ -132,7 +132,7 @@ async def mailing_proxy_watch_loop(
                         int(chat_id),
                         "⚠️ <b>Перепроверка прокси</b>\n"
                         f"{summary.format_lines()}\n\n"
-                        "<i>Рассылка продолжается — попытки идут по всем SOCKS5.</i>",
+                        "<i>Рассылка продолжается — только по 🟢/🟡 SOCKS5 (🔴 пропускаются).</i>",
                         parse_mode="HTML",
                     )
                 except Exception:
