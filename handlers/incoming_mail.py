@@ -132,28 +132,17 @@ async def _notify_reply_sent(bot, chat_id: int, ctx: ReplyNotifyCtx) -> None:
 
     from_acc = _e(ctx.account_email or "—")
     to_addr = _e(ctx.to_email or "—")
-    incoming = _e(ctx.incoming_from or ctx.to_email or "—")
     anchor = int(ctx.anchor_message_id)
-    label = (ctx.inbox_label or "").strip()
-    head_inbox = ""
-    if label:
-        head_inbox = f'⚡️ Получено сообщение на "<b>{_e(label)}</b>" <code>{from_acc}</code>\n'
 
     if ctx.is_html:
-        main = (
-            f"{head_inbox}"
-            f"⚡️ Ответ: <b>[HTML]</b> успешно отправлен на <code>{to_addr}</code> "
-            f"с аккаунта <code>{from_acc}</code> ⚡️\n"
-            f"От кого было входящее: <code>{incoming}</code>"
-        )
+        body_part = "<b>[HTML]</b>"
     else:
-        preview = _preview_reply_body(ctx.body_text, is_html=False)
-        main = (
-            f"{head_inbox}"
-            f"⚡️ <code>{from_acc}</code> — <b>{_e(preview)}</b> — <code>{to_addr}</code>\n\n"
-            f"успешно отправлен на <code>{to_addr}</code> с аккаунта <code>{from_acc}</code> ⚡️\n"
-            f"От кого было входящее: <code>{incoming}</code>"
-        )
+        body_part = f"<b>{_e(_preview_reply_body(ctx.body_text, is_html=False))}</b>"
+
+    main = (
+        f"⚡️ Ответ {body_part} успешно отправлен на <code>{to_addr}</code> "
+        f"с аккаунта <code>{from_acc}</code> ⚡️"
+    )
 
     try:
         await bot.send_message(
