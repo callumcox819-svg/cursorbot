@@ -695,6 +695,16 @@ def _e(s: str) -> str:
     return html.escape(s or "", quote=False)
 
 
+def _format_aqua_link_error(err: BaseException) -> str:
+    msg = str(err).strip()
+    low = msg.lower()
+    if "connection_lost" in low or "server disconnected" in low:
+        return "сеть оборвалась при запросе к GAG — нажми «Создать ссылку» ещё раз"
+    if isinstance(err, asyncio.TimeoutError) or "timeout" in low:
+        return "таймаут GAG API — попробуй ещё раз через несколько секунд"
+    return msg or err.__class__.__name__
+
+
 def _clean(v: str | None) -> str:
     return (v or "").strip()
 
@@ -1344,10 +1354,11 @@ async def cb_create_goo_link_from_db(callback: CallbackQuery):
             await _create_aqua_link_from_db_work(callback, mail_id)
         except Exception as e:
             logger.exception("aqua_link mail_id=%s failed", mail_id)
+            err_msg = _format_aqua_link_error(e)
             try:
                 await callback.bot.send_message(
                     int(callback.message.chat.id),
-                    f"❌ Ошибка при создании ссылки: {_e(str(e))[:400]}",
+                    f"❌ Ошибка при создании ссылки: {_e(err_msg)[:400]}",
                 )
             except Exception:
                 pass
@@ -1472,32 +1483,53 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
             dom_slot = None
         api_domain = (dom_slot + 4) if dom_slot in (1, 2, 3, 4) else None
 
-        try:
-            gag_url = await generate_gag_url(
-                endpoint=gag_generate_endpoint(),
-                apikey=gag_key,
-                title=title,
-                price=price,
-                service=api_service,
-                name=prof_name,
-                address=prof_addr,
-                image=offer_image,
-                domain=api_domain,
-                version=gag_default_version(),
+        user_db_id = int(tg_user.id)
+        pinned_offer_id = int(offer.id) if offer else None
+        inbox_label = (getattr(tg_user, "sender_name", None) or "").strip()
+        mail_uid = str(getattr(mail, "imap_uid", "") or "")
+        await session.commit()
+
+    try:
+        gag_url = await generate_gag_url(
+            endpoint=gag_generate_endpoint(),
+            apikey=gag_key,
+            title=title,
+            price=price,
+            service=api_service,
+            name=prof_name,
+            address=prof_addr,
+            image=offer_image,
+            domain=api_domain,
+            version=gag_default_version(),
+        )
+    except GAGError as e:
+        await callback.message.answer(f"❌ GAG ошибка: {e}")
+        await callback.answer()
+        return
+    except Exception as e:
+        await callback.message.answer(f"❌ {_format_aqua_link_error(e)}")
+        await callback.answer()
+        return
+
+    async with Session() as session:
+        mail = (
+            await session.execute(
+                sa_select(IncomingMail).where(IncomingMail.id == int(mail_id)).limit(1)
             )
-        except GAGError as e:
-            await callback.message.answer(f"❌ GAG ошибка: {e}")
+        ).scalars().first()
+        if not mail:
+            await callback.message.answer("❌ Письмо не найдено после генерации ссылки.")
             await callback.answer()
             return
 
         await _upsert_convlink(
             session,
-            user_id=int(tg_user.id),
+            user_id=user_db_id,
             inbox_email=inbox_email,
             contact_email=contact_email,
             ad_url=url,
             generated_link=gag_url,
-            pinned_offer_id=int(offer.id) if offer else None,
+            pinned_offer_id=pinned_offer_id,
         )
         try:
             mail.generated_link = gag_url
@@ -1505,26 +1537,24 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
             pass
         await session.commit()
 
-        mail_uid = str(getattr(mail, "imap_uid", "") or "")
-        meta_fm = FULL_META.get((acc_id, mail_uid)) or {}
-        anchor = _resolve_mail_anchor(acc_id, mail_uid, meta_fm, callback.message)
-        inbox_label = (getattr(tg_user, "sender_name", None) or "").strip()
+    meta_fm = FULL_META.get((acc_id, mail_uid)) or {}
+    anchor = _resolve_mail_anchor(acc_id, mail_uid, meta_fm, callback.message)
 
-        await _send_generated_link_card(
-            callback=callback,
-            offer_title=offer_title or title,
-            offer_price=price,
-            photo_url=offer_image,
-            profile_display=prof_title,
-            service_code=service,
-            link=gag_url,
-            offer_id=offer_id,
-            anchor_message_id=anchor,
-            account_email=inbox_email,
-            contact_email=contact_email,
-            inbox_label=inbox_label or None,
-        )
-        await callback.answer()
+    await _send_generated_link_card(
+        callback=callback,
+        offer_title=offer_title or title,
+        offer_price=price,
+        photo_url=offer_image,
+        profile_display=prof_title,
+        service_code=service,
+        link=gag_url,
+        offer_id=offer_id,
+        anchor_message_id=anchor,
+        account_email=inbox_email,
+        contact_email=contact_email,
+        inbox_label=inbox_label or None,
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("goo_link:"))

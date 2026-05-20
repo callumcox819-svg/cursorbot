@@ -1,28 +1,60 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import Any
 
 import aiohttp
+from aiohttp import ClientError
 
 
 class GAGError(Exception):
     pass
 
 
+def _is_transient_network_error(err: BaseException) -> bool:
+    if isinstance(err, (asyncio.TimeoutError, ClientError, ConnectionResetError, OSError)):
+        return True
+    msg = str(err).lower()
+    return (
+        "connection_lost" in msg
+        or "connection reset" in msg
+        or "server disconnected" in msg
+        or "cannot connect" in msg
+    )
+
+
 async def _post_json(endpoint: str, payload: dict[str, Any], *, timeout_sec: float = 25.0) -> dict[str, Any]:
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(endpoint, json=payload) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                raise GAGError(f"HTTP {resp.status}: {text[:300]}")
-            try:
-                data = await resp.json()
-            except Exception:
-                raise GAGError(f"Bad JSON: {text[:300]}")
-    if not isinstance(data, dict):
-        raise GAGError(f"Unexpected response: {str(data)[:300]}")
-    return data
+    last_err: BaseException | None = None
+    attempts = 3
+
+    for attempt in range(attempts):
+        try:
+            connector = aiohttp.TCPConnector(force_close=True, enable_cleanup_closed=True)
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                async with session.post(endpoint, json=payload) as resp:
+                    text = await resp.text()
+                    if resp.status != 200:
+                        raise GAGError(f"HTTP {resp.status}: {text[:300]}")
+                    try:
+                        data = json.loads(text)
+                    except json.JSONDecodeError:
+                        raise GAGError(f"Bad JSON: {text[:300]}")
+            if not isinstance(data, dict):
+                raise GAGError(f"Unexpected response: {str(data)[:300]}")
+            return data
+        except GAGError:
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt + 1 >= attempts or not _is_transient_network_error(e):
+                raise
+            await asyncio.sleep(1.5 * (attempt + 1))
+
+    if last_err:
+        raise last_err
+    raise GAGError("GAG request failed")
 
 
 async def generate_gag_url(
