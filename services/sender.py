@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import smtplib
+from email.message import EmailMessage
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr, formatdate, make_msgid
@@ -87,6 +88,14 @@ def _strip_html(html_text: str) -> str:
     return txt.strip()
 
 
+def _plain_body_content_transfer_encoding(body: str) -> str:
+    try:
+        (body or "").encode("ascii")
+        return "7bit"
+    except UnicodeEncodeError:
+        return "quoted-printable"
+
+
 def _build_message(
     *,
     from_email: str,
@@ -109,20 +118,32 @@ def _build_message(
         plain = _strip_html(b) or " "
         msg.attach(MIMEText(plain, "plain", "utf-8"))
         msg.attach(MIMEText(b, "html", "utf-8"))
-    else:
-        msg = MIMEText(b, "plain", "utf-8")
+        if sender_name:
+            msg["From"] = formataddr((sender_name, from_email))
+        else:
+            msg["From"] = from_email
+        msg["To"] = to_email
+        msg["Subject"] = subj
+        msg["Date"] = formatdate(localtime=True)
+        msg["Message-ID"] = make_msgid(
+            domain=(from_email.split("@")[-1] if "@" in from_email else None)
+        )
+        msg["Reply-To"] = from_email
+        return msg
 
+    msg = EmailMessage()
+    msg.set_content(b, subtype="plain", charset="utf-8", cte=_plain_body_content_transfer_encoding(b))
     if sender_name:
         msg["From"] = formataddr((sender_name, from_email))
     else:
         msg["From"] = from_email
-
     msg["To"] = to_email
     msg["Subject"] = subj
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain=(from_email.split("@")[-1] if "@" in from_email else None))
-    if not is_html:
-        msg["Reply-To"] = from_email
+    msg["Message-ID"] = make_msgid(
+        domain=(from_email.split("@")[-1] if "@" in from_email else None)
+    )
+    msg["Reply-To"] = from_email
     return msg
 
 
@@ -395,9 +416,11 @@ def _is_rate_limit(code: Optional[str], text: str) -> bool:
 
 
 def _is_blocked(code: Optional[str], text: str) -> bool:
+    if _is_hard_bounce(code, text):
+        return False
     t = (text or "").lower()
     if code in {"550", "553", "554"}:
-        return any(re.search(p, t) for p in _BLOCKED_PATTERNS) or True
+        return any(re.search(p, t) for p in _BLOCKED_PATTERNS)
     return any(re.search(p, t) for p in _BLOCKED_PATTERNS)
 
 
@@ -499,11 +522,11 @@ def _send_plain_sync(
         if _is_rate_limit(code, text):
             return False, _marker("ACCOUNT_RATE_LIMIT", code, text), None
 
-        if _is_blocked(code, text):
-            return False, _marker("ACCOUNT_BLOCKED", code, text), None
-
         if _is_hard_bounce(code, text):
             return False, _marker("RECIPIENT_DEAD", code, text), None
+
+        if _is_blocked(code, text):
+            return False, _marker("ACCOUNT_BLOCKED", code, text), None
 
         return False, f"{type(e).__name__}: {code or ''} {text}".strip() or str(e), None
 
@@ -592,10 +615,10 @@ def _send_batch_sync(
                         results.append((False, _marker("ACCOUNT_WEB_LOGIN_REQUIRED", code, text)))
                     elif _is_rate_limit(code, text):
                         results.append((False, _marker("ACCOUNT_RATE_LIMIT", code, text)))
-                    elif _is_blocked(code, text):
-                        results.append((False, _marker("ACCOUNT_BLOCKED", code, text)))
                     elif _is_hard_bounce(code, text):
                         results.append((False, _marker("RECIPIENT_DEAD", code, text)))
+                    elif _is_blocked(code, text):
+                        results.append((False, _marker("ACCOUNT_BLOCKED", code, text)))
                     else:
                         results.append((False, f"{type(e).__name__}: {code or ''} {text}".strip() or str(e)))
                     try:
