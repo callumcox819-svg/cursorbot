@@ -1397,8 +1397,10 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
 
         reasons: list[str] = []
         if not url:
+            subj_hint = (subj or "")[:120]
             reasons.append(
-                "нет Offer в БД по теме этого письма — загрузите JSON с этим объявлением и провалидируйте"
+                f"нет Offer в БД по теме «{subj_hint}» и email продавца — "
+                "проверьте, что JSON с этим лотом загружен и валидирован (email 42/79)"
             )
 
         if not url:
@@ -1591,8 +1593,10 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
 
         reasons: list[str] = []
         if not url:
+            subj_hint = (subj_pre or "")[:120]
             reasons = [
-                "нет Offer в БД по теме этого письма — загрузите JSON с этим объявлением и провалидируйте"
+                f"нет Offer в БД по теме «{subj_hint}» и email продавца — "
+                "проверьте, что JSON с этим лотом загружен и валидирован"
             ]
 
         if not url:

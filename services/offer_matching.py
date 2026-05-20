@@ -226,6 +226,7 @@ async def resolve_offer_for_incoming(
             session,
             user_id=int(user_id),
             subject=subject,
+            from_email=from_email,
             from_name=from_name,
             body_text=body_text,
         )
@@ -476,6 +477,65 @@ async def list_offers_for_seller_email(
             continue
         seen.add(oid)
         out.append(off)
+
+    if out or not fe_can:
+        return out
+
+    # Fallback: тот же продавец, другой домен / точки в local-part (gmail vs hotmail).
+    try:
+        email_rows = (
+            await session.execute(
+                sa_select(OfferEmail.email, Offer.id)
+                .join(Offer, Offer.id == OfferEmail.offer_id)
+                .where(Offer.user_id == int(user_id))
+                .order_by(OfferEmail.id.desc())
+                .limit(2000)
+            )
+        ).all()
+        oid_to_off: dict[int, Offer] = {}
+        for em, oid in email_rows:
+            if _canon_email(em or "") != fe_can:
+                continue
+            if int(oid) in seen:
+                continue
+            seen.add(int(oid))
+        if seen:
+            offs = (
+                await session.execute(
+                    sa_select(Offer).where(Offer.id.in_(list(seen))).order_by(Offer.id.desc())
+                )
+            ).scalars().all()
+            out.extend(offs)
+    except Exception:
+        pass
+    return out
+
+
+async def list_offers_for_seller_name(
+    session,
+    *,
+    user_id: int,
+    from_name: str,
+) -> list[Offer]:
+    """Офферы по имени продавца из парсера (если email ответа ≠ угаданному при валидации)."""
+    fn = (from_name or "").strip().lower()
+    if len(fn) < 4:
+        return []
+    recent = (
+        await session.execute(
+            sa_select(Offer).where(Offer.user_id == int(user_id)).order_by(Offer.id.desc()).limit(400)
+        )
+    ).scalars().all()
+    out: list[Offer] = []
+    for off in recent:
+        pn = (off.person_name or "").strip().lower()
+        if not pn:
+            raw = parse_offer_raw(getattr(off, "raw_json", None))
+            pn = str(raw.get("item_person_name") or raw.get("person_name") or "").strip().lower()
+        if not pn:
+            continue
+        if fn in pn or pn in fn or _ratio(fn, pn) >= 0.72:
+            out.append(off)
     return out
 
 
@@ -516,6 +576,8 @@ def _pick_best_offer_by_subject_scores(
         return None
     if best_sc >= min_score:
         return best
+    if subject_token_hits(subject, best) >= 1 and best_sc >= max(28.0, min_score - 18.0):
+        return best
     if subject_token_hits(subject, best) >= 3 and best_sc >= 48.0:
         return best
     return None
@@ -540,9 +602,9 @@ async def resolve_best_offer_by_subject(
         subject=subject,
         from_name=from_name,
         body_text=body_text,
-        min_score=58.0 if multi else 50.0,
+        min_score=42.0 if multi else 36.0,
     )
-    if picked and offer_matches_incoming_subject(picked, subject):
+    if picked:
         return picked
     return None
 
@@ -552,12 +614,31 @@ async def resolve_best_offer_by_subject_global(
     *,
     user_id: int,
     subject: str,
+    from_email: str = "",
     from_name: str = "",
     body_text: str = "",
 ) -> Offer | None:
     """Если email привязан к другому лоту — ищем оффер по теме среди всех объявлений пользователя."""
     if not subject_is_informative(subject):
         return None
+
+    seller_offs = await list_offers_for_seller_email(
+        session, user_id=int(user_id), from_email=from_email
+    )
+    if not seller_offs and from_name:
+        seller_offs = await list_offers_for_seller_name(
+            session, user_id=int(user_id), from_name=from_name
+        )
+    if seller_offs:
+        picked = _pick_best_offer_by_subject_scores(
+            seller_offs,
+            subject=subject,
+            from_name=from_name,
+            body_text=body_text,
+            min_score=34.0,
+        )
+        if picked:
+            return picked
 
     recent = (
         await session.execute(
@@ -572,9 +653,9 @@ async def resolve_best_offer_by_subject_global(
         subject=subject,
         from_name=from_name,
         body_text=body_text,
-        min_score=62.0,
+        min_score=46.0,
     )
-    if picked and offer_matches_incoming_subject(picked, subject):
+    if picked:
         return picked
     return None
 
@@ -634,6 +715,7 @@ async def resolve_offer_for_incoming_mail(
             session,
             user_id=int(user_id),
             subject=subj,
+            from_email=from_email,
             from_name=from_name,
             body_text=body_text,
         )
@@ -645,6 +727,20 @@ async def resolve_offer_for_incoming_mail(
         seller_offers = await list_offers_for_seller_email(
             session, user_id=int(user_id), from_email=from_email
         )
+        if not seller_offers and from_name:
+            seller_offers = await list_offers_for_seller_name(
+                session, user_id=int(user_id), from_name=from_name
+            )
+        if len(seller_offers) > 1:
+            picked = _pick_best_offer_by_subject_scores(
+                seller_offers,
+                subject=subj,
+                from_name=from_name,
+                body_text=body_text,
+                min_score=32.0,
+            )
+            if picked:
+                return picked
         if len(seller_offers) == 1:
             only = seller_offers[0]
             title = offer_effective_title(only)
@@ -693,39 +789,47 @@ async def offer_link_for_seller(
             session,
             user_id=int(user_id),
             subject=subject,
+            from_email=from_email,
         )
         if off and (off.link or "").strip():
             return str(off.link).strip()
         seller_offers = await list_offers_for_seller_email(
             session, user_id=int(user_id), from_email=from_email
         )
+        if len(seller_offers) > 1:
+            picked = _pick_best_offer_by_subject_scores(
+                seller_offers, subject=subject, min_score=32.0
+            )
+            if picked and (picked.link or "").strip():
+                return str(picked.link).strip()
         if len(seller_offers) == 1 and (seller_offers[0].link or "").strip():
             from services.offer_storage import offer_effective_title
 
             title = offer_effective_title(seller_offers[0])
             if not title or not _subject_title_conflicts(subject, title):
                 return str(seller_offers[0].link).strip()
-        if len(seller_offers) > 1:
-            return None
 
     if not user_id or not from_email or "@" not in from_email:
         return None
 
-    fe = from_email.strip().lower()
-    row = (
-        await session.execute(
-            sa_select(Offer.link)
-            .select_from(OfferEmail)
-            .join(Offer, Offer.id == OfferEmail.offer_id)
-            .where(Offer.user_id == int(user_id))
-            .where(func.lower(OfferEmail.email) == fe)
-            .where(Offer.link.is_not(None))
-            .order_by(Offer.id.desc())
-            .limit(1)
-        )
-    ).first()
-    if row and row[0]:
-        return str(row[0]).strip()
+    fe_can = _canon_email(from_email)
+    try:
+        rows = (
+            await session.execute(
+                sa_select(OfferEmail.email, Offer.link)
+                .select_from(OfferEmail)
+                .join(Offer, Offer.id == OfferEmail.offer_id)
+                .where(Offer.user_id == int(user_id))
+                .where(Offer.link.is_not(None))
+                .order_by(OfferEmail.id.desc())
+                .limit(2000)
+            )
+        ).all()
+        for em, lk in rows:
+            if lk and fe_can and _canon_email(em or "") == fe_can:
+                return str(lk).strip()
+    except Exception:
+        pass
     return None
 
 
