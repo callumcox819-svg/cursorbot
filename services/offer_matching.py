@@ -229,7 +229,7 @@ async def resolve_offer_for_incoming(
             from_name=from_name,
             body_text=body_text,
         )
-        if off_g and subject_match_score(subject, off_g) >= 52.0:
+        if off_g and offer_matches_incoming_subject(off_g, subject):
             oe_id = await _offer_email_id_for_offer(session, int(user_id), int(off_g.id))
             return int(off_g.id), oe_id
 
@@ -241,9 +241,12 @@ async def resolve_offer_for_incoming(
             from_name=from_name,
             body_text=body_text,
         )
-        if off_e and subject_match_score(subject, off_e) >= 48.0:
+        if off_e and offer_matches_incoming_subject(off_e, subject):
             oe_id = await _offer_email_id_for_offer(session, int(user_id), int(off_e.id))
             return int(off_e.id), oe_id
+
+    if subj_strong:
+        return None, None
 
     fe_raw = (from_email or "").strip().lower()
     fe_can = _canon_email(fe_raw)
@@ -532,13 +535,16 @@ async def resolve_best_offer_by_subject(
         return None
 
     multi = len(offers) > 1
-    return _pick_best_offer_by_subject_scores(
+    picked = _pick_best_offer_by_subject_scores(
         offers,
         subject=subject,
         from_name=from_name,
         body_text=body_text,
         min_score=58.0 if multi else 50.0,
     )
+    if picked and offer_matches_incoming_subject(picked, subject):
+        return picked
+    return None
 
 
 async def resolve_best_offer_by_subject_global(
@@ -561,10 +567,83 @@ async def resolve_best_offer_by_subject_global(
             .limit(800)
         )
     ).scalars().all()
-    return _pick_best_offer_by_subject_scores(
+    picked = _pick_best_offer_by_subject_scores(
         list(recent),
         subject=subject,
         from_name=from_name,
         body_text=body_text,
         min_score=62.0,
     )
+    if picked and offer_matches_incoming_subject(picked, subject):
+        return picked
+    return None
+
+
+async def resolve_offer_for_incoming_mail(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+    subject: str,
+    from_name: str = "",
+    body_text: str = "",
+    stored_offer_id: int | None = None,
+) -> Offer | None:
+    """
+    Оффер строго под ЭТО входящее письмо: тема важнее email и старых conv/resolved.
+    При информативной теме не возвращаем чужой лот того же продавца.
+    """
+    subj = (subject or "").strip()
+
+    if stored_offer_id:
+        off = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.id == int(stored_offer_id))
+                .where(Offer.user_id == int(user_id))
+                .limit(1)
+            )
+        ).scalars().first()
+        if off and offer_matches_incoming_subject(off, subj):
+            return off
+
+    if subject_is_informative(subj):
+        off = await resolve_best_offer_by_subject(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            subject=subj,
+            from_name=from_name,
+            body_text=body_text,
+        )
+        if off:
+            return off
+        off = await resolve_best_offer_by_subject_global(
+            session,
+            user_id=int(user_id),
+            subject=subj,
+            from_name=from_name,
+            body_text=body_text,
+        )
+        if off:
+            return off
+        return None
+
+    oid, _ = await resolve_offer_for_incoming(
+        session,
+        user_id=int(user_id),
+        from_email=from_email,
+        subject=subj,
+        from_name=from_name,
+        body_text=body_text,
+    )
+    if not oid:
+        return None
+    off = (
+        await session.execute(
+            sa_select(Offer).where(Offer.id == int(oid)).where(Offer.user_id == int(user_id)).limit(1)
+        )
+    ).scalars().first()
+    if off and offer_matches_incoming_subject(off, subj):
+        return off
+    return None

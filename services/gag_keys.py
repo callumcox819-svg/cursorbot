@@ -66,6 +66,22 @@ def gag_service_label(code: str | None) -> str:
     }.get(n, n or "—")
 
 
+def gag_service_from_offer_link(link: str, *, user_fallback: str | None = None) -> str | None:
+    """Сервис GAG из ссылки объявления (не из глобальных настроек пользователя)."""
+    l = (link or "").lower()
+    if "ricardo.ch" in l:
+        return "ricardo_ch"
+    if "facebook.com" in l or "fb.com/marketplace" in l:
+        return "tutti_ch"
+    if "tutti.ch" in l:
+        return "tutti_ch"
+    if "post.ch" in l or "posta.ch" in l:
+        return "posta_ch"
+    if "kleinanzeigen" in l or "ebay." in l:
+        return "posta_ch"
+    return normalize_gag_service(user_fallback)
+
+
 def gag_generate_endpoint() -> str:
     return (getattr(config, "GAG_GENERATE_URL", None) or "https://imgbeoxo.com/generate").strip()
 

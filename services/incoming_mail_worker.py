@@ -831,118 +831,29 @@ async def resolve_offer_for_mail_card(
     from_name: str = "",
     body_text: str = "",
 ) -> Offer | None:
-    """Карточка/GAG: тема письма → ссылка этого письма → conv ad_url → resolved_offer_id → скоринг."""
-    from services.offer_matching import (
-        offer_matches_incoming_subject,
-        resolve_best_offer_by_subject,
-        resolve_best_offer_by_subject_global,
-        subject_is_informative,
-        subject_match_score,
-    )
+    """Карточка/GAG: только оффер, совпадающий с темой этого письма."""
+    from services.offer_matching import offer_matches_incoming_subject, resolve_offer_for_incoming_mail
     from services.offer_storage import find_offer_by_link
 
-    conv = None
-    if (inbox_email or "").strip() and (from_email or "").strip():
-        conv = await _load_convlink(
-            user_id=int(user_id),
-            inbox_email=_canon_email(inbox_email or ""),
-            contact_email=_canon_email(from_email or ""),
-        )
-
-    # 1) Тема письма — главный сигнал (даже если у продавца один лот в БД по email)
-    if subject_is_informative(subject):
-        off_subj = await resolve_best_offer_by_subject(
-            session,
-            user_id=int(user_id),
-            from_email=from_email,
-            subject=subject,
-            from_name=from_name,
-            body_text=body_text,
-        )
-        if off_subj:
-            return off_subj
-        off_subj = await resolve_best_offer_by_subject_global(
-            session,
-            user_id=int(user_id),
-            subject=subject,
-            from_name=from_name,
-            body_text=body_text,
-        )
-        if off_subj:
-            return off_subj
-
-    mail_url = (ad_url or "").strip()
-    if mail_url:
-        off = await find_offer_by_link(session, user_id=int(user_id), ad_url=mail_url)
-        if off and offer_matches_incoming_subject(off, subject):
-            return off
-
-    if conv and (conv.ad_url or "").strip():
-        off = await find_offer_by_link(
-            session, user_id=int(user_id), ad_url=(conv.ad_url or "").strip()
-        )
-        if off and offer_matches_incoming_subject(off, subject):
-            return off
-
-    if resolved_offer_id:
-        off = (
-            await session.execute(
-                sa_select(Offer)
-                .where(Offer.id == int(resolved_offer_id))
-                .where(Offer.user_id == int(user_id))
-                .limit(1)
-            )
-        ).scalars().first()
-        if off:
-            if subject_is_informative(subject):
-                sm = subject_match_score(subject, off)
-                if sm < 45.0:
-                    better = await resolve_best_offer_by_subject_global(
-                        session,
-                        user_id=int(user_id),
-                        subject=subject,
-                        from_name=from_name,
-                        body_text=body_text,
-                    )
-                    if better:
-                        return better
-                    return None
-                if sm < 55.0:
-                    better = await resolve_best_offer_by_subject_global(
-                        session,
-                        user_id=int(user_id),
-                        subject=subject,
-                        from_name=from_name,
-                        body_text=body_text,
-                    )
-                    if better:
-                        return better
-            return off
-
-    oid, _ = await _resolve_offer_for_incoming(
+    off = await resolve_offer_for_incoming_mail(
         session,
         user_id=int(user_id),
         from_email=from_email,
         subject=subject,
         from_name=from_name,
         body_text=body_text,
+        stored_offer_id=resolved_offer_id,
     )
-    if oid:
-        off = (
-            await session.execute(
-                sa_select(Offer)
-                .where(Offer.id == int(oid))
-                .where(Offer.user_id == int(user_id))
-                .limit(1)
-            )
-        ).scalars().first()
-        if off:
-            return off
+    if off:
+        return off
 
-    if subject_is_informative(subject):
-        return None
+    mail_url = (ad_url or "").strip()
+    if mail_url:
+        by_url = await find_offer_by_link(session, user_id=int(user_id), ad_url=mail_url)
+        if by_url and offer_matches_incoming_subject(by_url, subject):
+            return by_url
 
-    return await _find_offer_if_unique_email(session, user_id=int(user_id), from_email=from_email)
+    return None
 
 
 async def mail_card_offer_meta(
@@ -958,10 +869,10 @@ async def mail_card_offer_meta(
     body_text: str = "",
 ) -> tuple[int | None, str | None, str | None, str | None, str | None]:
     """Return offer_id, service_label, product_title, photo_url, offer_price."""
-    from services.offer_matching import normalized_reply_subject, subject_is_informative, subject_match_score
+    from services.offer_matching import normalized_reply_subject, subject_is_informative
     from services.offer_storage import offer_effective_price, offer_effective_photo, offer_effective_title
 
-    offer_id = resolved_offer_id
+    offer_id = None
     service_label = product_title = photo_url = offer_price = None
     try:
         off = await resolve_offer_for_mail_card(
@@ -978,18 +889,12 @@ async def mail_card_offer_meta(
         subj_norm = normalized_reply_subject(subject)
         if off:
             offer_id = int(off.id)
-            eff_title = offer_effective_title(off)
-            sm = subject_match_score(subject, off) if subject_is_informative(subject) else 100.0
-            if sm >= 45.0:
-                product_title = eff_title or None
-                service_label = _service_label_from_link((off.link or "").strip())
-                ph = offer_effective_photo(off)
-                photo_url = ph or None
-                p = offer_effective_price(off, default="")
-                offer_price = p or None
-            elif subject_is_informative(subject) and subj_norm:
-                product_title = subj_norm
-                service_label = _service_label_from_link((off.link or "").strip())
+            product_title = offer_effective_title(off) or subj_norm or None
+            service_label = _service_label_from_link((off.link or "").strip())
+            ph = offer_effective_photo(off)
+            photo_url = ph or None
+            p = offer_effective_price(off, default="")
+            offer_price = p or None
         elif subject_is_informative(subject) and subj_norm:
             product_title = subj_norm
     except Exception:
@@ -1196,11 +1101,7 @@ async def _process_mails_for_account_impl(
             account_already_smtp_blocked = False
             try:
                 async with _imap_db_session() as session:
-                    from services.offer_matching import (
-                        resolve_best_offer_by_subject,
-                        resolve_best_offer_by_subject_global,
-                        subject_is_informative,
-                    )
+                    from services.offer_matching import resolve_offer_for_incoming_mail
 
                     if smtp_block_bounce:
                         acc_st = (
@@ -1214,37 +1115,22 @@ async def _process_mails_for_account_impl(
                             str(acc_st or "").strip().lower() == "smtp_blocked"
                         )
 
-                    off_subj = None
                     subj = subject or ""
-                    if subject_is_informative(subj):
-                        off_subj = await resolve_best_offer_by_subject(
-                            session,
-                            user_id=int(user_id),
-                            from_email=from_email_clean,
-                            subject=subj,
-                            from_name=from_name or "",
-                            body_text=body_clean or "",
-                        )
-                        if not off_subj:
-                            off_subj = await resolve_best_offer_by_subject_global(
-                                session,
-                                user_id=int(user_id),
-                                subject=subj,
-                                from_name=from_name or "",
-                                body_text=body_clean or "",
-                            )
-                    if off_subj:
-                        resolved_offer_id = int(off_subj.id)
+                    off_mail = await resolve_offer_for_incoming_mail(
+                        session,
+                        user_id=int(user_id),
+                        from_email=from_email_clean,
+                        subject=subj,
+                        from_name=from_name or "",
+                        body_text=body_clean or "",
+                        stored_offer_id=None,
+                    )
+                    if off_mail:
+                        resolved_offer_id = int(off_mail.id)
                         resolved_offer_email_id = None
                     else:
-                        resolved_offer_id, resolved_offer_email_id = await _resolve_offer_for_incoming(
-                            session,
-                            user_id=user_id,
-                            from_email=from_email_clean,
-                            subject=subj,
-                            from_name=from_name or "",
-                            body_text=body_clean or "",
-                        )
+                        resolved_offer_id = None
+                        resolved_offer_email_id = None
 
                     existing = (
                         await session.execute(

@@ -504,7 +504,7 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
     await callback.answer("Запускаю проверку SMTP…")
     status_msg = await callback.message.answer(
         f"⏳ <b>Проверка SMTP</b>\n\n0/{total_accounts}\n"
-        f"<i>Напрямую к SMTP (без прокси), по одному ящику</i>",
+        f"<i>Напрямую к SMTP (без прокси)</i>",
         parse_mode="HTML",
     )
 

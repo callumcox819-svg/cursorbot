@@ -33,6 +33,7 @@ from services.gag_keys import (
     gag_generate_endpoint,
     gag_service_for_api,
     gag_service_for_html_dir,
+    gag_service_from_offer_link,
     get_user_gag_api_key,
     is_valid_gag_service,
 )
@@ -738,24 +739,11 @@ async def _send_generated_link_card_to_chat(
     contact_email: str | None = None,
     inbox_label: str | None = None,
 ):
-    """Карточка GAG-ссылки — reply к исходному письму (как пресет/HTML)."""
+    """Карточка GAG-ссылки — reply к исходному письму, те же поля что на карточке письма."""
     service_label = _service_label_for_card(service_code)
     reply_to = int(anchor_message_id) if anchor_message_id else None
 
-    from_acc = _e((account_email or "").strip() or "—")
-    to_addr = _e((contact_email or "").strip() or "—")
-    label = (inbox_label or "").strip()
-    head = ""
-    if label and reply_to:
-        head = f'⚡️ Получено сообщение на "<b>{_e(label)}</b>" <code>{from_acc}</code>\n'
-    if reply_to:
-        head += (
-            f"⚡️ <code>{from_acc}</code> — <b>ссылка создана</b> — <code>{to_addr}</code>\n"
-            f"От кого было входящее: <code>{to_addr}</code>\n\n"
-        )
-
     card_text = (
-        f"{head}"
         f"📣 <b>Объявления » {_e(service_label)}</b>\n\n"
         f"📌 <b>Название:</b> {_e((offer_title or '').strip()) or '—'}\n"
         f"💰 <b>Цена:</b> {_e((offer_price or '').strip()) or '—'}\n"
@@ -983,6 +971,7 @@ async def _upsert_convlink(
     contact_email: str,
     ad_url: str | None = None,
     generated_link: str | None = None,
+    pinned_offer_id: int | None = None,
 ) -> None:
     """
     Обновить/создать запись ConversationLink.
@@ -1016,7 +1005,43 @@ async def _upsert_convlink(
             conv.ad_url = (ad_url or "").strip() or conv.ad_url
         if generated_link:
             conv.generated_link = (generated_link or "").strip() or conv.generated_link
+        if pinned_offer_id:
+            conv.pinned_offer_id = int(pinned_offer_id)
     await session.commit()
+
+
+async def _resolve_gag_from_incoming_mail(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+    subject: str,
+    from_name: str = "",
+    body_text: str = "",
+    ad_url: str | None = None,
+) -> tuple[Offer | None, str]:
+    """Один оффер и ad_url строго под это входящее письмо (как на карточке)."""
+    from services.incoming_mail_worker import resolve_offer_for_mail_card
+
+    off = await resolve_offer_for_mail_card(
+        session,
+        user_id=int(user_id),
+        from_email=from_email,
+        resolved_offer_id=None,
+        ad_url=ad_url,
+        subject=subject,
+        from_name=from_name,
+        body_text=body_text,
+    )
+    url = (off.link or "").strip() if off else ""
+    if not url and off is None:
+        url = (
+            await _offer_link_by_sender_email(
+                session, int(user_id), from_email, subject=subject
+            )
+            or ""
+        ).strip()
+    return off, url
 
 
 async def _offer_link_by_sender_email(
@@ -1366,31 +1391,25 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
         inbox_email = _canon_email(mail.account_email or "")
         contact_email = _canon_email(mail.from_email or "")
 
-        # Сначала оффер по теме письма (не «последний лот» продавца)
         subj = (getattr(mail, "subject", "") or "").strip()
-        offer = await resolve_offer_for_mail_card(
+        offer, url = await _resolve_gag_from_incoming_mail(
             session,
             user_id=int(tg_user.id),
             from_email=contact_email,
-            resolved_offer_id=None,
-            ad_url=(getattr(mail, "ad_url", "") or "").strip() or None,
-            inbox_email=inbox_email,
             subject=subj,
             from_name=(getattr(mail, "from_name", "") or ""),
             body_text=(getattr(mail, "body", "") or ""),
+            ad_url=(getattr(mail, "ad_url", "") or "").strip() or None,
         )
         if offer:
             mail.resolved_offer_id = int(offer.id)
+            mail.ad_url = url or mail.ad_url
 
-        url = (offer.link or "").strip() if offer else ""
         reasons: list[str] = []
-
         if not url:
-            url = (await _offer_link_by_sender_email(
-                session, int(tg_user.id), contact_email, subject=subj
-            )) or ""
-        if not url:
-            reasons.append("нет Offer.link по теме/email (не используем старый conv/resolved)")
+            reasons.append(
+                "нет Offer в БД по теме этого письма — загрузите JSON с этим объявлением и провалидируйте"
+            )
 
         if not url:
             reason_text = "\n".join([f"• { _e(r) }" for r in (reasons or ["не удалось получить ссылку из БД"])])
@@ -1417,10 +1436,12 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
             await callback.answer()
             return
 
-        service = (await get_user_setting(session, tg_user, GAG_SERVICE_KEY) or "").strip()
+        user_svc = (await get_user_setting(session, tg_user, GAG_SERVICE_KEY) or "").strip()
+        service = gag_service_from_offer_link(url, user_fallback=user_svc) or ""
         if not is_valid_gag_service(service):
             await callback.message.answer(
-                "❌ Не выбран сервис (ТУТТИ/ПОСТ/Ricardo.ch). Открой 👤 Профиль → 🧭 Выбор сервиса."
+                "❌ Не удалось определить сервис GAG по ссылке объявления. "
+                "Проверьте Offer.link (ricardo/tutti/post) или выберите сервис в 👤 Профиль."
             )
             await callback.answer()
             return
@@ -1437,7 +1458,7 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
 
         offer_id = int(offer.id) if offer else None
 
-        from services.offer_matching import normalized_reply_subject, subject_is_informative
+        from services.offer_matching import normalized_reply_subject
 
         offer_title = offer_effective_title(offer) if offer else None
         offer_image = offer_effective_photo(offer) if offer else None
@@ -1484,6 +1505,7 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
             contact_email=contact_email,
             ad_url=url,
             generated_link=gag_url,
+            pinned_offer_id=int(offer.id) if offer else None,
         )
         try:
             mail.generated_link = gag_url
@@ -1560,30 +1582,24 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
         ).scalars().first()
 
         subj_pre = (getattr(mail_pre, "subject", "") or meta.get("subject") or "").strip()
-        offer_pre = await resolve_offer_for_mail_card(
+        offer_pre, url = await _resolve_gag_from_incoming_mail(
             session,
             user_id=int(owner_user_id),
             from_email=contact_email,
-            resolved_offer_id=None,
-            ad_url=(getattr(mail_pre, "ad_url", "") or "").strip() if mail_pre else None,
-            inbox_email=inbox_email,
             subject=subj_pre,
             from_name=(getattr(mail_pre, "from_name", "") or meta.get("from_name") or "").strip(),
-            body_text=(getattr(mail_pre, "body", "") or "").strip() if mail_pre else "",
+            body_text=(getattr(mail_pre, "body", "") or meta.get("body") or "").strip() if mail_pre else "",
+            ad_url=(getattr(mail_pre, "ad_url", "") or "").strip() if mail_pre else None,
         )
         if offer_pre and mail_pre:
             mail_pre.resolved_offer_id = int(offer_pre.id)
+            mail_pre.ad_url = url or mail_pre.ad_url
 
-        url = (offer_pre.link or "").strip() if offer_pre else ""
-        if not url:
-            url = (
-                await _offer_link_by_sender_email(
-                    session, int(owner_user_id), contact_email, subject=subj_pre
-                )
-            ) or ""
         reasons: list[str] = []
         if not url:
-            reasons = ["нет Offer.link по теме/email (не используем старый conv/resolved)"]
+            reasons = [
+                "нет Offer в БД по теме этого письма — загрузите JSON с этим объявлением и провалидируйте"
+            ]
 
         if not url:
             reason_text = "\n".join([f"• { _e(r) }" for r in (reasons or ["не удалось получить ссылку из БД"])])
@@ -1611,10 +1627,12 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
             )
             return await callback.answer()
 
-        service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
+        user_svc = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
+        service = gag_service_from_offer_link(url, user_fallback=user_svc) or ""
         if not is_valid_gag_service(service):
             await callback.message.answer(
-                "❌ Не выбран сервис (ТУТТИ/ПОСТ/Ricardo.ch). Открой 👤 Профиль → 🧭 Выбор сервиса."
+                "❌ Не удалось определить сервис GAG по ссылке объявления. "
+                "Проверьте Offer.link или выберите сервис в 👤 Профиль."
             )
             return await callback.answer()
 
@@ -1674,6 +1692,7 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
             contact_email=contact_email,
             ad_url=url,
             generated_link=gag_url,
+            pinned_offer_id=int(offer.id) if offer else None,
         )
         if mail:
             try:
