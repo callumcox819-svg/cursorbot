@@ -832,8 +832,25 @@ async def resolve_offer_for_mail_card(
     body_text: str = "",
 ) -> Offer | None:
     """Карточка/GAG: только оффер, совпадающий с темой этого письма."""
+    from models import ConversationLink
     from services.offer_matching import offer_matches_incoming_subject, resolve_offer_for_incoming_mail
     from services.offer_storage import find_offer_by_link
+
+    stored_id = resolved_offer_id
+    inbox = (inbox_email or "").strip().lower()
+    contact = (from_email or "").strip().lower()
+    if inbox and contact:
+        conv = (
+            await session.execute(
+                sa_select(ConversationLink)
+                .where(ConversationLink.user_id == int(user_id))
+                .where(func.lower(ConversationLink.account_email) == inbox)
+                .where(func.lower(ConversationLink.from_email) == contact)
+                .limit(1)
+            )
+        ).scalars().first()
+        if conv and getattr(conv, "pinned_offer_id", None):
+            stored_id = int(conv.pinned_offer_id)
 
     off = await resolve_offer_for_incoming_mail(
         session,
@@ -842,7 +859,7 @@ async def resolve_offer_for_mail_card(
         subject=subject,
         from_name=from_name,
         body_text=body_text,
-        stored_offer_id=resolved_offer_id,
+        stored_offer_id=stored_id,
     )
     if off:
         return off

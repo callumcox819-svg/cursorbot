@@ -241,6 +241,14 @@ async def cust_send_imap(callback: CallbackQuery):
                     mail_gen_link = str(mail_row.generated_link)
             except Exception:
                 pass
+            mail_subj = (
+                (getattr(mail_row, "subject", None) or meta.get("subject") or "").strip()
+                if mail_row
+                else (meta.get("subject") or "").strip()
+            )
+            mail_body = (getattr(mail_row, "body", None) or "").strip() if mail_row else ""
+            mail_from_name = (getattr(mail_row, "from_name", None) or "").strip() if mail_row else ""
+
             link = await resolve_gag_link_for_reply(
                 session,
                 int(user.id),
@@ -248,7 +256,15 @@ async def cust_send_imap(callback: CallbackQuery):
                 seller_email=to_email,
                 mail_generated_link=mail_gen_link,
             )
-            ctx = await build_offer_html_ctx(session, int(user.id), to_email, link=link)
+            ctx = await build_offer_html_ctx(
+                session,
+                int(user.id),
+                to_email,
+                link=link,
+                subject=mail_subj,
+                from_name=mail_from_name,
+                body_text=mail_body,
+            )
             html_body = await prepare_html_body(raw_html, session, user)
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
@@ -349,7 +365,15 @@ async def cust_send_html(callback: CallbackQuery):
                 seller_email=to_email,
                 mail_generated_link=(meta.get("generated_link") if isinstance(meta, dict) else None),
             )
-            ctx = await build_offer_html_ctx(session, int(user.id), to_email, link=link)
+            ctx = await build_offer_html_ctx(
+                session,
+                int(user.id),
+                to_email,
+                link=link,
+                subject=(meta.get("subject") or meta.get("offer_title") or "").strip()
+                if isinstance(meta, dict)
+                else "",
+            )
             html_body = await prepare_html_body(raw_html, session, user)
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", html_signature)

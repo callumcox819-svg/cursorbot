@@ -58,31 +58,35 @@ async def build_offer_html_ctx(
     seller_email: str,
     *,
     link: str = "",
+    subject: str = "",
+    from_name: str = "",
+    body_text: str = "",
 ) -> dict[str, str]:
-    """Контекст для Post.ch HTML: оффер из БД + email продавца + GAG-ссылка."""
-    from sqlalchemy import select
-
-    from models import Offer, OfferEmail
+    """Контекст для HTML: оффер строго по теме письма (как карточка/GAG), не последний по email."""
+    from services.incoming_mail_worker import resolve_offer_for_mail_card
+    from services.offer_matching import normalized_reply_subject, subject_is_informative
+    from services.offer_storage import offer_effective_photo, offer_effective_price, offer_effective_title
 
     title = ""
     price = ""
     photo = ""
+    subj_norm = normalized_reply_subject(subject)
     try:
-        canon = _canon_email(seller_email)
-        off = (
-            await session.execute(
-                select(Offer)
-                .join(OfferEmail, OfferEmail.offer_id == Offer.id)
-                .where(Offer.user_id == int(user_id))
-                .where(OfferEmail.email == canon)
-                .order_by(Offer.id.desc())
-                .limit(1)
-            )
-        ).scalars().first()
+        off = await resolve_offer_for_mail_card(
+            session,
+            user_id=int(user_id),
+            from_email=_canon_email(seller_email),
+            resolved_offer_id=None,
+            subject=subject or "",
+            from_name=from_name or "",
+            body_text=body_text or "",
+        )
         if off:
-            title = (off.title or "").strip()
-            price = _format_chf_price((off.price or "").strip())
-            photo = (off.photo or "").strip()
+            title = (offer_effective_title(off) or "").strip()
+            price = _format_chf_price(offer_effective_price(off, default=""))
+            photo = (offer_effective_photo(off) or "").strip()
+        elif subject_is_informative(subject) and subj_norm:
+            title = subj_norm
     except Exception:
         pass
 

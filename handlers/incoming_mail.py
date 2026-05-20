@@ -1034,13 +1034,6 @@ async def _resolve_gag_from_incoming_mail(
         body_text=body_text,
     )
     url = (off.link or "").strip() if off else ""
-    if not url and off is None:
-        url = (
-            await _offer_link_by_sender_email(
-                session, int(user_id), from_email, subject=subject
-            )
-            or ""
-        ).strip()
     return off, url
 
 
@@ -1075,11 +1068,8 @@ async def _offer_link_by_sender_email(
         )
         if off and (off.link or "").strip():
             return str(off.link).strip()
-        offers = await list_offers_for_seller_email(
-            session, user_id=int(user_id), from_email=from_email
-        )
-        if len(offers) > 1:
-            return None
+        # Тема есть, но лот не найден — не подставляем «последний» оффер по email.
+        return None
 
     if not user_id or not from_email or "@" not in from_email:
         return None
@@ -2146,6 +2136,10 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
             except Exception:
                 pass
 
+            mail_subj = (getattr(mail_row, "subject", None) or subject_raw or "").strip()
+            mail_body = (getattr(mail_row, "body", None) or "").strip() if mail_row else ""
+            mail_from_name = (getattr(mail_row, "from_name", None) or "").strip() if mail_row else ""
+
             link = await resolve_gag_link_for_reply(
                 session,
                 int(user.id),
@@ -2153,7 +2147,15 @@ async def cb_mail_reply_html_send(callback: CallbackQuery, state: FSMContext):
                 seller_email=to_email,
                 mail_generated_link=mail_gen_link,
             )
-            ctx = await build_offer_html_ctx(session, int(user.id), to_email, link=link)
+            ctx = await build_offer_html_ctx(
+                session,
+                int(user.id),
+                to_email,
+                link=link,
+                subject=mail_subj,
+                from_name=mail_from_name,
+                body_text=mail_body,
+            )
             html_body = await prepare_html_body(_apply_link(raw_html, link), session, user)
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
@@ -2361,6 +2363,10 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
             except Exception:
                 pass
 
+            mail_subj = (getattr(mail_row, "subject", None) or subject_raw or "").strip()
+            mail_body = (getattr(mail_row, "body", None) or "").strip() if mail_row else ""
+            mail_from_name = (getattr(mail_row, "from_name", None) or "").strip() if mail_row else ""
+
             link = await resolve_gag_link_for_reply(
                 session,
                 int(user.id),
@@ -2368,7 +2374,15 @@ async def mail_reply_custom_html(message: Message, state: FSMContext):
                 seller_email=to_email,
                 mail_generated_link=mail_gen_link,
             )
-            ctx = await build_offer_html_ctx(session, int(user.id), to_email, link=link)
+            ctx = await build_offer_html_ctx(
+                session,
+                int(user.id),
+                to_email,
+                link=link,
+                subject=mail_subj,
+                from_name=mail_from_name,
+                body_text=mail_body,
+            )
             html_body = await prepare_html_body(_apply_link(html_text, link), session, user)
             if html_signature:
                 html_body = html_body.replace("{{SIGNATURE}}", str(html_signature))
@@ -2634,7 +2648,8 @@ async def _gag_generate_link_for_offer(session, user: User, offer: Offer, price:
     if not gag_key:
         raise GAGError("GAG API ключ не установлен")
 
-    service = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
+    user_svc = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
+    service = gag_service_from_offer_link((offer.link or "").strip(), user_fallback=user_svc) or ""
     if not is_valid_gag_service(service):
         raise GAGError("Не выбран сервис GAG")
 
@@ -2720,6 +2735,7 @@ async def _regenerate_gag_link_after_price(
                 contact_email=contact_email,
                 ad_url=ad_url or None,
                 generated_link=gag_url,
+                pinned_offer_id=int(offer.id),
             )
 
         await session.execute(
@@ -2738,7 +2754,11 @@ async def _regenerate_gag_link_after_price(
                 await get_user_setting(session, user, GAG_PROFILE_TITLE_KEY) or ""
             ).strip()
             or None,
-            "service_code": (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip(),
+            "service_code": gag_service_from_offer_link(
+                (offer.link or "").strip(),
+                user_fallback=(await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip(),
+            )
+            or "",
             "link": gag_url,
             "offer_id": int(offer.id),
             "inbox_label": (getattr(user, "sender_name", None) or "").strip() or None,
