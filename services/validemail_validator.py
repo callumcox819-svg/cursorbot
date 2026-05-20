@@ -70,6 +70,9 @@ def _pick_first_last_alpha_tokens(name: str) -> tuple[str, str]:
 def _name_is_usable(name: str, *, require_first_and_last: bool) -> bool:
     if not seller_name_eligible_for_validation(name):
         return False
+    # Ники Semiuel2421 / Andora01 — local-part из handle, без буквенных tokens.
+    if pick_handle_locals(name):
+        return True
     tokens = _pick_alpha_tokens(name)
     if require_first_and_last:
         return len(tokens) >= 2
