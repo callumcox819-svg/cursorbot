@@ -604,8 +604,20 @@ async def resolve_offer_for_incoming_mail(
                 .limit(1)
             )
         ).scalars().first()
-        if off and offer_matches_incoming_subject(off, subj):
-            return off
+        if off:
+            from services.offer_storage import offer_effective_title
+
+            if offer_matches_incoming_subject(off, subj):
+                return off
+            if not subject_is_informative(subj):
+                return off
+            title = offer_effective_title(off)
+            if title and not _subject_title_conflicts(subj, title):
+                seller_offers = await list_offers_for_seller_email(
+                    session, user_id=int(user_id), from_email=from_email
+                )
+                if len(seller_offers) <= 1:
+                    return off
 
     if subject_is_informative(subj):
         off = await resolve_best_offer_by_subject(
@@ -627,6 +639,17 @@ async def resolve_offer_for_incoming_mail(
         )
         if off:
             return off
+
+        from services.offer_storage import offer_effective_title
+
+        seller_offers = await list_offers_for_seller_email(
+            session, user_id=int(user_id), from_email=from_email
+        )
+        if len(seller_offers) == 1:
+            only = seller_offers[0]
+            title = offer_effective_title(only)
+            if title and not _subject_title_conflicts(subj, title):
+                return only
         return None
 
     oid, _ = await resolve_offer_for_incoming(

@@ -1019,21 +1019,34 @@ async def _resolve_gag_from_incoming_mail(
     from_name: str = "",
     body_text: str = "",
     ad_url: str | None = None,
+    resolved_offer_id: int | None = None,
+    inbox_email: str | None = None,
 ) -> tuple[Offer | None, str]:
     """Один оффер и ad_url строго под это входящее письмо (как на карточке)."""
     from services.incoming_mail_worker import resolve_offer_for_mail_card
+    from services.offer_storage import find_offer_by_link
 
     off = await resolve_offer_for_mail_card(
         session,
         user_id=int(user_id),
         from_email=from_email,
-        resolved_offer_id=None,
+        resolved_offer_id=resolved_offer_id,
         ad_url=ad_url,
+        inbox_email=inbox_email,
         subject=subject,
         from_name=from_name,
         body_text=body_text,
     )
     url = (off.link or "").strip() if off else ""
+    if not url:
+        url = (
+            await _offer_link_by_sender_email(
+                session, int(user_id), from_email, subject=subject
+            )
+            or ""
+        ).strip()
+        if url and not off:
+            off = await find_offer_by_link(session, user_id=int(user_id), ad_url=url)
     return off, url
 
 
@@ -1046,6 +1059,7 @@ async def _offer_link_by_sender_email(
 ) -> str | None:
     """Offer.link по email отправителя; при нескольких лотах — по теме письма."""
     from services.offer_matching import (
+        _subject_title_conflicts,
         list_offers_for_seller_email,
         resolve_best_offer_by_subject,
         resolve_best_offer_by_subject_global,
@@ -1068,8 +1082,17 @@ async def _offer_link_by_sender_email(
         )
         if off and (off.link or "").strip():
             return str(off.link).strip()
-        # Тема есть, но лот не найден — не подставляем «последний» оффер по email.
-        return None
+        offers = await list_offers_for_seller_email(
+            session, user_id=int(user_id), from_email=from_email
+        )
+        if len(offers) == 1 and (offers[0].link or "").strip():
+            from services.offer_storage import offer_effective_title
+
+            title = offer_effective_title(offers[0])
+            if not title or not _subject_title_conflicts(subject, title):
+                return str(offers[0].link).strip()
+        if len(offers) > 1:
+            return None
 
     if not user_id or not from_email or "@" not in from_email:
         return None
@@ -1390,6 +1413,8 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
             from_name=(getattr(mail, "from_name", "") or ""),
             body_text=(getattr(mail, "body", "") or ""),
             ad_url=(getattr(mail, "ad_url", "") or "").strip() or None,
+            resolved_offer_id=getattr(mail, "resolved_offer_id", None),
+            inbox_email=inbox_email,
         )
         if offer:
             mail.resolved_offer_id = int(offer.id)
@@ -1580,6 +1605,8 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
             from_name=(getattr(mail_pre, "from_name", "") or meta.get("from_name") or "").strip(),
             body_text=(getattr(mail_pre, "body", "") or meta.get("body") or "").strip() if mail_pre else "",
             ad_url=(getattr(mail_pre, "ad_url", "") or "").strip() if mail_pre else None,
+            resolved_offer_id=getattr(mail_pre, "resolved_offer_id", None) if mail_pre else None,
+            inbox_email=inbox_email,
         )
         if offer_pre and mail_pre:
             mail_pre.resolved_offer_id = int(offer_pre.id)

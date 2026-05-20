@@ -864,10 +864,42 @@ async def resolve_offer_for_mail_card(
     if off:
         return off
 
+    from services.offer_matching import _subject_title_conflicts, subject_is_informative
+    from services.offer_storage import offer_effective_title
+
+    def _offer_ok_for_subject(o: Offer) -> bool:
+        if not subject_is_informative(subject):
+            return True
+        title = offer_effective_title(o)
+        if title and _subject_title_conflicts(subject, title):
+            return False
+        return offer_matches_incoming_subject(o, subject) or not title
+
+    extra_urls: list[str] = []
     mail_url = (ad_url or "").strip()
     if mail_url:
-        by_url = await find_offer_by_link(session, user_id=int(user_id), ad_url=mail_url)
-        if by_url and offer_matches_incoming_subject(by_url, subject):
+        extra_urls.append(mail_url)
+    if inbox and contact:
+        conv = (
+            await session.execute(
+                sa_select(ConversationLink)
+                .where(ConversationLink.user_id == int(user_id))
+                .where(func.lower(ConversationLink.account_email) == inbox)
+                .where(func.lower(ConversationLink.from_email) == contact)
+                .limit(1)
+            )
+        ).scalars().first()
+        if conv and (conv.ad_url or "").strip():
+            extra_urls.append((conv.ad_url or "").strip())
+
+    seen_u: set[str] = set()
+    for u in extra_urls:
+        lk = u.strip().lower()
+        if not lk or lk in seen_u:
+            continue
+        seen_u.add(lk)
+        by_url = await find_offer_by_link(session, user_id=int(user_id), ad_url=u)
+        if by_url and _offer_ok_for_subject(by_url):
             return by_url
 
     return None
