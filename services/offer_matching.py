@@ -26,6 +26,8 @@ def _norm_subject(subject: str) -> str:
     s = (subject or "").strip()
     if not s:
         return ""
+    for ch in ("\u2013", "\u2014", "\u2012", "–", "—", "−"):
+        s = s.replace(ch, "-")
     return re.sub(r"^(re|aw|fw|fwd)\s*:\s*", "", s, flags=re.I).strip()
 
 
@@ -74,8 +76,56 @@ _SUBJECT_STOP = frozenset(
 
 
 def _subject_tokens(subj: str) -> list[str]:
-    parts = re.findall(r"[a-z0-9]{3,}", (subj or "").lower())
+    parts = re.findall(r"[a-z0-9]{3,}", _norm_subject(subj).lower())
     return [p for p in parts if p not in _SUBJECT_STOP]
+
+
+def _subject_significant_tokens(subj: str) -> list[str]:
+    """Слова из темы для поиска лота (Couchtisch, Vintage, …)."""
+    return [t for t in _subject_tokens(subj) if len(t) >= 4]
+
+
+async def resolve_offer_by_subject_tokens(
+    session,
+    *,
+    user_id: int,
+    subject: str,
+    candidate_offers: list[Offer] | None = None,
+) -> Offer | None:
+    """Фолбэк: ≥2 значимых слова темы в названии оффера (или 1 длинное ≥8)."""
+    from services.offer_storage import offer_effective_title
+
+    toks = _subject_significant_tokens(subject)
+    if not toks:
+        return None
+
+    offers = candidate_offers
+    if offers is None:
+        offers = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.user_id == int(user_id))
+                .order_by(Offer.id.desc())
+                .limit(800)
+            )
+        ).scalars().all()
+
+    best: Offer | None = None
+    best_hits = 0
+    for off in offers:
+        title = offer_effective_title(off).lower()
+        if not title:
+            continue
+        if _subject_title_conflicts(subject, title):
+            continue
+        hits = sum(1 for t in toks if t in title)
+        need = 2
+        if len(toks) == 1 and len(toks[0]) >= 7:
+            need = 1
+        if hits >= need and hits > best_hits:
+            best_hits = hits
+            best = off
+    return best
 
 
 def score_offer(
@@ -359,10 +409,38 @@ def _subject_title_conflicts(subj: str, title: str) -> bool:
     if subj_free and title_priced and not any(w in title_l for w in free_words):
         return True
 
-    significant = [t for t in _subject_tokens(subj) if len(t) >= 5 and t not in ("stuhle", "stuhl", "chair", "chairs")]
+    subj_toks = set(_subject_tokens(subj))
+    title_toks = set(_subject_tokens(title_l))
+    # Re: полное название лота + пара уточняющих слов в теме — не конфликт.
+    if len(title_toks) >= 2 and title_toks <= subj_toks:
+        return False
+
+    sig_min = 5
+    significant = [
+        t
+        for t in _subject_tokens(subj)
+        if len(t) >= sig_min and t not in ("stuhle", "stuhl", "chair", "chairs")
+    ]
+    title_sig = [
+        t
+        for t in _subject_tokens(title_l)
+        if len(t) >= sig_min and t not in ("stuhle", "stuhl", "chair", "chairs")
+    ]
+    if title_sig:
+        extra_in_title = sum(1 for t in title_sig if t not in subj)
+        if extra_in_title >= 2:
+            return True
     if significant:
         missing = sum(1 for t in significant if t not in title_l)
-        if missing >= 2 or (len(significant) >= 2 and missing >= 1 and "wohnzimmer" in subj and "wohnzimmer" not in title_l):
+        if missing >= 3:
+            return True
+        if (
+            missing >= 2
+            and len(title_toks) >= 2
+            and not title_toks <= subj_toks
+            and "wohnzimmer" in subj
+            and "wohnzimmer" not in title_l
+        ):
             return True
     return False
 
