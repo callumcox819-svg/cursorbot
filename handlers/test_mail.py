@@ -28,15 +28,6 @@ EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 TEST_MAIL_BLOB = "test_mail_recipients"
 MAX_TEST_RECIPIENTS = 20
 
-TEST_SUBJECTS = [
-    "Test message – Order update",
-    "Test message – Please confirm",
-    "Test message – Action required",
-    "Test message – Status notification",
-    "Test message – Delivery check",
-]
-
-
 class TestMailStates(StatesGroup):
     waiting_add = State()
     waiting_oneoff = State()
@@ -95,7 +86,7 @@ def _menu_text(emails: List[str]) -> str:
     return (
         "🧪 <b>Тест маил</b>\n\n"
         f"<b>Сохранённые адреса ({len(emails)}):</b>\n{lines}\n\n"
-        "Отправка — случайный активный аккаунт + умный пресет (как в рассылке)."
+        "Отправка как в /send: тема <code>OFFER</code> → название товара, умный пресет, свой аккаунт на каждое письмо."
     )
 
 
@@ -158,7 +149,9 @@ async def _pick_send_context(tg_id: int) -> tuple[int, EmailAccount, str, str, s
         ).first()
         offer_title = title_row[0] if title_row and title_row[0] else ""
 
-    subject = random.choice(TEST_SUBJECTS)
+    from services.subject_offer import subject_for_offer
+
+    subject = subject_for_offer(offer_title or "")
     body = await pick_random_smart_preset(tg_id, offer_title)
     if not (body or "").strip():
         body = await pick_random_first_sms(tg_id, offer_title)
@@ -251,22 +244,21 @@ async def _run_test_batch(
     targets: List[str],
     status_message: Message,
 ) -> None:
-    ctx = await _pick_send_context(tg_id)
-    if not ctx:
-        await status_message.edit_text(
-            "❌ Нет активных аккаунтов или шаблонов для теста.",
-            parse_mode="HTML",
-        )
-        return
-
-    user_id, account, subject, body, offer_title = ctx
     ok_n = 0
     fail_n = 0
     lines: List[str] = []
+    last_subject = ""
 
     for i, to_email in enumerate(targets):
         if i > 0:
-            await asyncio.sleep(2)
+            await asyncio.sleep(4)
+        ctx = await _pick_send_context(tg_id)
+        if not ctx:
+            fail_n += 1
+            lines.append(f"❌ {to_email}: нет аккаунта/шаблона")
+            continue
+        user_id, account, subject, body, offer_title = ctx
+        last_subject = subject
         ok, line = await _send_test_one(
             bot=bot,
             chat_id=chat_id,
@@ -293,7 +285,7 @@ async def _run_test_batch(
 
     summary = (
         f"<b>Тест завершён</b> — OK: {ok_n}, ошибок: {fail_n}\n"
-        f"Тема: {html.escape(subject)}\n\n"
+        f"Тема (как в рассылке): <code>{html.escape(last_subject or '—')}</code>\n\n"
         + "\n".join(lines)
     )
     try:
