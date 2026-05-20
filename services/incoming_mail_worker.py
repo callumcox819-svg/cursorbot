@@ -895,7 +895,18 @@ async def resolve_offer_for_mail_card(
         if off:
             if subject_is_informative(subject):
                 sm = subject_match_score(subject, off)
-                if sm < 25.0:
+                if sm < 45.0:
+                    better = await resolve_best_offer_by_subject_global(
+                        session,
+                        user_id=int(user_id),
+                        subject=subject,
+                        from_name=from_name,
+                        body_text=body_text,
+                    )
+                    if better:
+                        return better
+                    return None
+                if sm < 55.0:
                     better = await resolve_best_offer_by_subject_global(
                         session,
                         user_id=int(user_id),
@@ -943,6 +954,7 @@ async def mail_card_offer_meta(
     body_text: str = "",
 ) -> tuple[int | None, str | None, str | None, str | None, str | None]:
     """Return offer_id, service_label, product_title, photo_url, offer_price."""
+    from services.offer_matching import normalized_reply_subject, subject_is_informative, subject_match_score
     from services.offer_storage import offer_effective_price, offer_effective_photo, offer_effective_title
 
     offer_id = resolved_offer_id
@@ -959,15 +971,23 @@ async def mail_card_offer_meta(
             from_name=from_name,
             body_text=body_text,
         )
+        subj_norm = normalized_reply_subject(subject)
         if off:
             offer_id = int(off.id)
-            t = offer_effective_title(off)
-            product_title = t or None
-            service_label = _service_label_from_link((off.link or "").strip())
-            ph = offer_effective_photo(off)
-            photo_url = ph or None
-            p = offer_effective_price(off, default="")
-            offer_price = p or None
+            eff_title = offer_effective_title(off)
+            sm = subject_match_score(subject, off) if subject_is_informative(subject) else 100.0
+            if sm >= 45.0:
+                product_title = eff_title or None
+                service_label = _service_label_from_link((off.link or "").strip())
+                ph = offer_effective_photo(off)
+                photo_url = ph or None
+                p = offer_effective_price(off, default="")
+                offer_price = p or None
+            elif subject_is_informative(subject) and subj_norm:
+                product_title = subj_norm
+                service_label = _service_label_from_link((off.link or "").strip())
+        elif subject_is_informative(subject) and subj_norm:
+            product_title = subj_norm
     except Exception:
         logger.exception("mail_card_offer_meta failed")
     return offer_id, service_label, product_title, photo_url, offer_price
@@ -995,6 +1015,11 @@ async def build_mail_card_from_mail(
         user_id=int(mail.user_id),
         from_email=str(getattr(mail, "from_email", "") or ""),
         resolved_offer_id=getattr(mail, "resolved_offer_id", None),
+        ad_url=str(getattr(mail, "ad_url", "") or "").strip() or None,
+        inbox_email=str(getattr(mail, "account_email", "") or ""),
+        subject=str(getattr(mail, "subject", "") or ""),
+        from_name=str(getattr(mail, "from_name", "") or ""),
+        body_text=(getattr(mail, "body", None) or "").strip(),
     )
 
     generated_link = (getattr(mail, "generated_link", None) or "").strip()

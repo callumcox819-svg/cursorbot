@@ -195,6 +195,20 @@ def _score_raw_json_fields(
     return extra
 
 
+async def _offer_email_id_for_offer(session, user_id: int, offer_id: int) -> int | None:
+    row = (
+        await session.execute(
+            sa_select(OfferEmail.id)
+            .join(Offer, Offer.id == OfferEmail.offer_id)
+            .where(Offer.user_id == int(user_id))
+            .where(OfferEmail.offer_id == int(offer_id))
+            .order_by(OfferEmail.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return int(row) if row else None
+
+
 async def resolve_offer_for_incoming(
     session,
     *,
@@ -204,7 +218,33 @@ async def resolve_offer_for_incoming(
     from_name: str,
     body_text: str = "",
 ) -> tuple[int | None, int | None]:
-    """Найти Offer: сначала email, затем скоринг по всем полям."""
+    """Найти Offer: при информативной теме — сначала по теме, затем email + скоринг."""
+    subj_strong = subject_is_informative(subject)
+
+    if subj_strong:
+        off_g = await resolve_best_offer_by_subject_global(
+            session,
+            user_id=int(user_id),
+            subject=subject,
+            from_name=from_name,
+            body_text=body_text,
+        )
+        if off_g and subject_match_score(subject, off_g) >= 52.0:
+            oe_id = await _offer_email_id_for_offer(session, int(user_id), int(off_g.id))
+            return int(off_g.id), oe_id
+
+        off_e = await resolve_best_offer_by_subject(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            subject=subject,
+            from_name=from_name,
+            body_text=body_text,
+        )
+        if off_e and subject_match_score(subject, off_e) >= 48.0:
+            oe_id = await _offer_email_id_for_offer(session, int(user_id), int(off_e.id))
+            return int(off_e.id), oe_id
+
     fe_raw = (from_email or "").strip().lower()
     fe_can = _canon_email(fe_raw)
 
@@ -268,9 +308,11 @@ async def resolve_offer_for_incoming(
     best_email_id: int | None = None
     best_score = -1.0
 
-    subj_strong = subject_is_informative(subject)
-
     for off, oe, email_hit in candidates.values():
+        if subj_strong and email_hit:
+            sm_pre = subject_match_score(subject, off)
+            if sm_pre < 45.0:
+                continue
         sc = score_offer(
             off,
             from_email=from_email,
@@ -281,9 +323,7 @@ async def resolve_offer_for_incoming(
         )
         if subj_strong and email_hit:
             sm = subject_match_score(subject, off)
-            if sm < 28.0:
-                sc -= 95.0
-            elif sm >= 70.0:
+            if sm >= 70.0:
                 sc += 40.0
         if sc > best_score:
             best_score = sc
@@ -295,6 +335,36 @@ async def resolve_offer_for_incoming(
     if best_offer_id is not None and best_score >= min_score:
         return best_offer_id, best_email_id
     return None, None
+
+
+def _subject_title_conflicts(subj: str, title: str) -> bool:
+    """Явное противоречие темы ответа и названия оффера (6 Stühle Gratis vs 4 Stühle 80.-)."""
+    subj = _norm_subject(subj).lower()
+    title_l = (title or "").strip().lower()
+    if not subj or not title_l:
+        return False
+
+    subj_num = re.match(r"^(\d+)\b", subj)
+    title_num = re.match(r"^(\d+)\b", title_l) or re.search(r"\b(\d+)\s*st", title_l)
+    if subj_num and title_num and subj_num.group(1) != title_num.group(1):
+        return True
+
+    free_words = ("gratis", "free", "kostenlos", "gratuit")
+    subj_free = any(w in subj for w in free_words)
+    title_priced = bool(re.search(r"\d+\s*\.?\s*-", title_l)) or "chf" in title_l or "eur" in title_l
+    if subj_free and title_priced and not any(w in title_l for w in free_words):
+        return True
+
+    significant = [t for t in _subject_tokens(subj) if len(t) >= 5 and t not in ("stuhle", "stuhl", "chair", "chairs")]
+    if significant:
+        missing = sum(1 for t in significant if t not in title_l)
+        if missing >= 2 or (len(significant) >= 2 and missing >= 1 and "wohnzimmer" in subj and "wohnzimmer" not in title_l):
+            return True
+    return False
+
+
+def normalized_reply_subject(subject: str) -> str:
+    return _norm_subject(subject)
 
 
 def subject_is_informative(subject: str) -> bool:
@@ -318,9 +388,13 @@ def subject_match_score(subject: str, off: Offer) -> float:
     subj = _norm_subject(subject)
     if len(subj) < 6:
         return 0.0
-    title = offer_effective_title(off).lower()
+    title = offer_effective_title(off)
     if not title:
         return 0.0
+    if _subject_title_conflicts(subj, title):
+        return 0.0
+
+    title = title.lower()
 
     score = 75.0 * _ratio(subj, title)
     if subj.lower() in title or title in subj.lower():
@@ -427,6 +501,10 @@ def _pick_best_offer_by_subject_scores(
 
     if best is None:
         return None
+    from services.offer_storage import offer_effective_title
+
+    if _subject_title_conflicts(subject, offer_effective_title(best)):
+        return None
     if best_sc >= min_score:
         return best
     if subject_token_hits(subject, best) >= 3 and best_sc >= 48.0:
@@ -453,7 +531,7 @@ async def resolve_best_offer_by_subject(
         subject=subject,
         from_name=from_name,
         body_text=body_text,
-        min_score=58.0 if multi else 42.0,
+        min_score=58.0 if multi else 50.0,
     )
 
 
