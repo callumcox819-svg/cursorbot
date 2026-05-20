@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import html
+import logging
 import os
 import re
+
+logger = logging.getLogger(__name__)
 from dataclasses import dataclass, field
 
 from aiogram import Router, F
@@ -1023,31 +1026,19 @@ async def _resolve_gag_from_incoming_mail(
     inbox_email: str | None = None,
 ) -> tuple[Offer | None, str]:
     """Один оффер и ad_url строго под это входящее письмо (как на карточке)."""
-    from services.incoming_mail_worker import resolve_offer_for_mail_card
-    from services.offer_storage import find_offer_by_link
+    from services.offer_matching import resolve_offer_for_aqua_link
 
-    off = await resolve_offer_for_mail_card(
+    return await resolve_offer_for_aqua_link(
         session,
         user_id=int(user_id),
         from_email=from_email,
-        resolved_offer_id=resolved_offer_id,
-        ad_url=ad_url,
-        inbox_email=inbox_email,
         subject=subject,
         from_name=from_name,
         body_text=body_text,
+        ad_url=ad_url,
+        resolved_offer_id=resolved_offer_id,
+        inbox_email=inbox_email,
     )
-    url = (off.link or "").strip() if off else ""
-    if not url:
-        url = (
-            await _offer_link_by_sender_email(
-                session, int(user_id), from_email, subject=subject
-            )
-            or ""
-        ).strip()
-        if url and not off:
-            off = await find_offer_by_link(session, user_id=int(user_id), ad_url=url)
-    return off, url
 
 
 async def _offer_link_by_sender_email(
@@ -1058,41 +1049,13 @@ async def _offer_link_by_sender_email(
     subject: str = "",
 ) -> str | None:
     """Offer.link по email отправителя; при нескольких лотах — по теме письма."""
-    from services.offer_matching import (
-        _subject_title_conflicts,
-        list_offers_for_seller_email,
-        resolve_best_offer_by_subject,
-        resolve_best_offer_by_subject_global,
-        subject_is_informative,
+    from services.offer_matching import offer_link_for_seller
+
+    link = await offer_link_for_seller(
+        session, user_id=int(user_id), from_email=from_email, subject=subject
     )
-
-    if subject_is_informative(subject):
-        off = await resolve_best_offer_by_subject(
-            session,
-            user_id=int(user_id),
-            from_email=from_email,
-            subject=subject,
-        )
-        if off and (off.link or "").strip():
-            return str(off.link).strip()
-        off = await resolve_best_offer_by_subject_global(
-            session,
-            user_id=int(user_id),
-            subject=subject,
-        )
-        if off and (off.link or "").strip():
-            return str(off.link).strip()
-        offers = await list_offers_for_seller_email(
-            session, user_id=int(user_id), from_email=from_email
-        )
-        if len(offers) == 1 and (offers[0].link or "").strip():
-            from services.offer_storage import offer_effective_title
-
-            title = offer_effective_title(offers[0])
-            if not title or not _subject_title_conflicts(subject, title):
-                return str(offers[0].link).strip()
-        if len(offers) > 1:
-            return None
+    if link:
+        return link
 
     if not user_id or not from_email or "@" not in from_email:
         return None
@@ -1369,7 +1332,7 @@ async def cb_create_goo_link_from_db(callback: CallbackQuery):
         return await callback.answer("Неверные данные", show_alert=True)
 
     uid = callback.from_user.id
-    if bg_is_running(uid, "gag_link"):
+    if bg_is_running(uid, "aqua_link"):
         return await callback.answer("⏳ Ссылка уже создаётся…", show_alert=True)
     try:
         await callback.answer("⏳ Создаю ссылку…", show_alert=False)
@@ -1377,13 +1340,23 @@ async def cb_create_goo_link_from_db(callback: CallbackQuery):
         pass
 
     async def _link_job() -> None:
-        await _create_gag_link_from_db_work(callback, mail_id)
+        try:
+            await _create_aqua_link_from_db_work(callback, mail_id)
+        except Exception as e:
+            logger.exception("aqua_link mail_id=%s failed", mail_id)
+            try:
+                await callback.bot.send_message(
+                    int(callback.message.chat.id),
+                    f"❌ Ошибка при создании ссылки: {_e(str(e))[:400]}",
+                )
+            except Exception:
+                pass
 
-    if not bg_start(uid, "gag_link", _link_job()):
+    if not bg_start(uid, "aqua_link", _link_job()):
         return await callback.answer("⏳ Ссылка уже создаётся…", show_alert=True)
 
 
-async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -> None:
+async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) -> None:
     async with Session() as session:
         # Ensure the telegram user is the owner in our DB
         tg_user = await get_or_create_user(session, int(callback.from_user.id))
@@ -1405,7 +1378,9 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
         contact_email = _canon_email(mail.from_email or "")
 
         subj = (getattr(mail, "subject", "") or "").strip()
-        offer, url = await _resolve_gag_from_incoming_mail(
+        from services.offer_matching import resolve_offer_for_aqua_link
+
+        offer, url = await resolve_offer_for_aqua_link(
             session,
             user_id=int(tg_user.id),
             from_email=contact_email,
@@ -1563,7 +1538,7 @@ async def cb_create_goo_link(callback: CallbackQuery):
         return await callback.answer("Письмо устарело", show_alert=True)
 
     uid_tg = callback.from_user.id
-    if bg_is_running(uid_tg, "gag_link"):
+    if bg_is_running(uid_tg, "aqua_link"):
         return await callback.answer("⏳ Ссылка уже создаётся…", show_alert=True)
     try:
         await callback.answer("⏳ Создаю ссылку…", show_alert=False)
@@ -1573,7 +1548,7 @@ async def cb_create_goo_link(callback: CallbackQuery):
     async def _link_job() -> None:
         await _create_gag_link_work(callback, acc_id, uid, meta)
 
-    if not bg_start(uid_tg, "gag_link", _link_job()):
+    if not bg_start(uid_tg, "aqua_link", _link_job()):
         return await callback.answer("⏳ Ссылка уже создаётся…", show_alert=True)
 
 
@@ -1597,7 +1572,9 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
         ).scalars().first()
 
         subj_pre = (getattr(mail_pre, "subject", "") or meta.get("subject") or "").strip()
-        offer_pre, url = await _resolve_gag_from_incoming_mail(
+        from services.offer_matching import resolve_offer_for_aqua_link
+
+        offer_pre, url = await resolve_offer_for_aqua_link(
             session,
             user_id=int(owner_user_id),
             from_email=contact_email,

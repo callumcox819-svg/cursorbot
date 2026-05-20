@@ -670,3 +670,103 @@ async def resolve_offer_for_incoming_mail(
     if off and offer_matches_incoming_subject(off, subj):
         return off
     return None
+
+
+async def offer_link_for_seller(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+    subject: str = "",
+) -> str | None:
+    """Offer.link по email; при информативной теме — матч по теме или один лот продавца."""
+    if subject_is_informative(subject):
+        off = await resolve_best_offer_by_subject(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            subject=subject,
+        )
+        if off and (off.link or "").strip():
+            return str(off.link).strip()
+        off = await resolve_best_offer_by_subject_global(
+            session,
+            user_id=int(user_id),
+            subject=subject,
+        )
+        if off and (off.link or "").strip():
+            return str(off.link).strip()
+        seller_offers = await list_offers_for_seller_email(
+            session, user_id=int(user_id), from_email=from_email
+        )
+        if len(seller_offers) == 1 and (seller_offers[0].link or "").strip():
+            from services.offer_storage import offer_effective_title
+
+            title = offer_effective_title(seller_offers[0])
+            if not title or not _subject_title_conflicts(subject, title):
+                return str(seller_offers[0].link).strip()
+        if len(seller_offers) > 1:
+            return None
+
+    if not user_id or not from_email or "@" not in from_email:
+        return None
+
+    fe = from_email.strip().lower()
+    row = (
+        await session.execute(
+            sa_select(Offer.link)
+            .select_from(OfferEmail)
+            .join(Offer, Offer.id == OfferEmail.offer_id)
+            .where(Offer.user_id == int(user_id))
+            .where(func.lower(OfferEmail.email) == fe)
+            .where(Offer.link.is_not(None))
+            .order_by(Offer.id.desc())
+            .limit(1)
+        )
+    ).first()
+    if row and row[0]:
+        return str(row[0]).strip()
+    return None
+
+
+async def resolve_offer_for_aqua_link(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+    subject: str,
+    from_name: str = "",
+    body_text: str = "",
+    resolved_offer_id: int | None = None,
+    ad_url: str | None = None,
+    inbox_email: str | None = None,
+) -> tuple[Offer | None, str]:
+    """Оффер + ad_url для «Создать ссылку» (AQUA/GAG) — без битых kwargs в global-поиске."""
+    from services.incoming_mail_worker import resolve_offer_for_mail_card
+    from services.offer_storage import find_offer_by_link
+
+    off = await resolve_offer_for_mail_card(
+        session,
+        user_id=int(user_id),
+        from_email=from_email,
+        resolved_offer_id=resolved_offer_id,
+        ad_url=ad_url,
+        inbox_email=inbox_email,
+        subject=subject,
+        from_name=from_name,
+        body_text=body_text,
+    )
+    url = (off.link or "").strip() if off else ""
+    if not url:
+        url = (
+            await offer_link_for_seller(
+                session,
+                user_id=int(user_id),
+                from_email=from_email,
+                subject=subject,
+            )
+            or ""
+        ).strip()
+        if url and not off:
+            off = await find_offer_by_link(session, user_id=int(user_id), ad_url=url)
+    return off, url
