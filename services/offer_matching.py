@@ -367,6 +367,12 @@ def normalized_reply_subject(subject: str) -> str:
     return _norm_subject(subject)
 
 
+def offer_matches_incoming_subject(off: Offer, subject: str, *, min_score: float = 45.0) -> bool:
+    if not subject_is_informative(subject):
+        return True
+    return subject_match_score(subject, off) >= float(min_score)
+
+
 def subject_is_informative(subject: str) -> bool:
     subj = _norm_subject(subject)
     return len(subj) >= 8 or len(_subject_tokens(subj)) >= 2

@@ -1019,14 +1019,43 @@ async def _upsert_convlink(
     await session.commit()
 
 
-async def _offer_link_by_sender_email(session, user_id: int, from_email: str) -> str | None:
-    """Попробовать найти Offer.link по email отправителя.
+async def _offer_link_by_sender_email(
+    session,
+    user_id: int,
+    from_email: str,
+    *,
+    subject: str = "",
+) -> str | None:
+    """Offer.link по email отправителя; при нескольких лотах — по теме письма."""
+    from services.offer_matching import (
+        list_offers_for_seller_email,
+        resolve_best_offer_by_subject,
+        resolve_best_offer_by_subject_global,
+        subject_is_informative,
+    )
 
-    Правила:
-    - single-name НЕ обрабатываем (нужен first.last)
-    - сначала exact match OfferEmail.email == from_email
-    - если нет, то first.last@gmail.com -> ищем OfferEmail.email LIKE 'first.last@%'
-    """
+    if subject_is_informative(subject):
+        off = await resolve_best_offer_by_subject(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            subject=subject,
+        )
+        if off and (off.link or "").strip():
+            return str(off.link).strip()
+        off = await resolve_best_offer_by_subject_global(
+            session,
+            user_id=int(user_id),
+            subject=subject,
+        )
+        if off and (off.link or "").strip():
+            return str(off.link).strip()
+        offers = await list_offers_for_seller_email(
+            session, user_id=int(user_id), from_email=from_email
+        )
+        if len(offers) > 1:
+            return None
+
     if not user_id or not from_email or "@" not in from_email:
         return None
 
@@ -1338,97 +1367,30 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
         contact_email = _canon_email(mail.from_email or "")
 
         # Сначала оффер по теме письма (не «последний лот» продавца)
+        subj = (getattr(mail, "subject", "") or "").strip()
         offer = await resolve_offer_for_mail_card(
             session,
             user_id=int(tg_user.id),
             from_email=contact_email,
-            resolved_offer_id=getattr(mail, "resolved_offer_id", None),
+            resolved_offer_id=None,
             ad_url=(getattr(mail, "ad_url", "") or "").strip() or None,
             inbox_email=inbox_email,
-            subject=(getattr(mail, "subject", "") or ""),
+            subject=subj,
             from_name=(getattr(mail, "from_name", "") or ""),
             body_text=(getattr(mail, "body", "") or ""),
         )
         if offer:
             mail.resolved_offer_id = int(offer.id)
 
-        # Resolve url (ad_url) строго из БД (по ТЗ: не ищем ссылку в теле письма)
-        delays = [0.0, 0.6, 1.2, 2.0]
         url = (offer.link or "").strip() if offer else ""
         reasons: list[str] = []
 
-        for d in delays:
-            if d:
-                await asyncio.sleep(d)
-            reasons = []
-
-            # 1) incoming_mails.ad_url (самый точный источник по конкретному письму)
-            url = (getattr(mail, "ad_url", "") or "").strip()
-            if url:
-                break
-            reasons.append("incoming_mails.ad_url пустой")
-
-            # 2) linked Offer (preferred)
-            if getattr(mail, "resolved_offer_id", None):
-                off_link = (
-                    await session.execute(
-                        sa_select(Offer.link)
-                        .where(Offer.id == int(mail.resolved_offer_id))
-                        .where(Offer.user_id == int(tg_user.id))
-                        .limit(1)
-                    )
-                ).scalar_one_or_none()
-                if off_link and str(off_link).strip():
-                    url = str(off_link).strip()
-                    break
-                reasons.append("resolved_offer_id есть, но Offer.link пустой")
-            else:
-                reasons.append("resolved_offer_id не найден")
-
-            # 3) existing convlink
-            conv = await _get_convlink(
-                session,
-                user_id=int(tg_user.id),
-                inbox_email=inbox_email,
-                contact_email=contact_email,
-            )
-            if conv and conv.ad_url and str(conv.ad_url).strip():
-                url = str(conv.ad_url).strip()
-                break
-            reasons.append("conversation_links.ad_url пустой/нет")
-
-            # 4) Offer.link by sender email (OfferEmail)
-            url = (await _offer_link_by_sender_email(session, int(tg_user.id), contact_email)) or ""
-            if url.strip():
-                url = url.strip()
-                break
-            reasons.append("не найден Offer.link по OfferEmail")
-
-            # 5) поиск по title / price / имени / raw_json (все поля из парсера)
-            oid, _ = await resolve_offer_for_incoming(
-                session,
-                user_id=int(tg_user.id),
-                from_email=contact_email,
-                subject=(getattr(mail, "subject", "") or ""),
-                from_name=(getattr(mail, "from_name", "") or ""),
-                body_text=(getattr(mail, "body", "") or ""),
-            )
-            if oid:
-                off_link = (
-                    await session.execute(
-                        sa_select(Offer.link)
-                        .where(Offer.id == int(oid))
-                        .where(Offer.user_id == int(tg_user.id))
-                        .limit(1)
-                    )
-                ).scalar_one_or_none()
-                if off_link and str(off_link).strip():
-                    url = str(off_link).strip()
-                    if not mail.resolved_offer_id:
-                        mail.resolved_offer_id = int(oid)
-                        await session.commit()
-                    break
-            reasons.append("не найден Offer по title/price/имени")
+        if not url:
+            url = (await _offer_link_by_sender_email(
+                session, int(tg_user.id), contact_email, subject=subj
+            )) or ""
+        if not url:
+            reasons.append("нет Offer.link по теме/email (не используем старый conv/resolved)")
 
         if not url:
             reason_text = "\n".join([f"• { _e(r) }" for r in (reasons or ["не удалось получить ссылку из БД"])])
@@ -1475,10 +1437,12 @@ async def _create_gag_link_from_db_work(callback: CallbackQuery, mail_id: int) -
 
         offer_id = int(offer.id) if offer else None
 
-        offer_title = offer_effective_title(offer) or None
-        offer_image = offer_effective_photo(offer) or None
-        title = offer_title or (mail.subject or "").strip()
-        price = offer_effective_price(offer)
+        from services.offer_matching import normalized_reply_subject, subject_is_informative
+
+        offer_title = offer_effective_title(offer) if offer else None
+        offer_image = offer_effective_photo(offer) if offer else None
+        title = offer_title or normalized_reply_subject(subj) or subj
+        price = offer_effective_price(offer) if offer else ""
         if not title:
             await callback.message.answer("❌ Нет названия объявления (title).")
             await callback.answer()
@@ -1580,81 +1544,6 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
     inbox_email = _canon_email((meta.get("account_email") or ""))
     contact_email = _canon_email((meta.get("from_email") or ""))
 
-    async def _get_ad_url_db_with_retries(session, *, owner_user_id: int) -> tuple[str, list[str]]:
-        """Стабильно получаем ad_url ТОЛЬКО из БД (по ТЗ), с ретраями и причинами."""
-
-        delays = [0.0, 0.6, 1.2, 2.0]
-        last_reasons: list[str] = []
-
-        for i, d in enumerate(delays, start=1):
-            if d:
-                await asyncio.sleep(d)
-
-            reasons: list[str] = []
-            url: str = ""
-
-            # 1) url из meta (если уже был записан ранее)
-            url = (meta.get("ad_url") or "").strip()
-            if url:
-                return url, []
-            reasons.append("meta.ad_url пустой")
-
-            # 2) url из IncomingMail (самый надёжный источник по конкретному письму)
-            mail = (
-                await session.execute(
-                    sa_select(IncomingMail)
-                    .where(IncomingMail.account_id == int(acc_id))
-                    .where(IncomingMail.imap_uid == int(uid))
-                    .where(IncomingMail.user_id == int(owner_user_id))
-                    .limit(1)
-                )
-            ).scalars().first()
-            if mail:
-                m_url = (getattr(mail, "ad_url", "") or "").strip()
-                if m_url:
-                    return m_url, []
-                reasons.append("incoming_mails.ad_url пустой")
-
-                # 2.1) если письмо уже связано с Offer — берём Offer.link
-                roid = getattr(mail, "resolved_offer_id", None)
-                if roid:
-                    off_link = (
-                        await session.execute(
-                            sa_select(Offer.link)
-                            .where(Offer.id == int(roid))
-                            .where(Offer.user_id == int(owner_user_id))
-                            .limit(1)
-                        )
-                    ).scalar_one_or_none()
-                    if off_link and str(off_link).strip():
-                        return str(off_link).strip(), []
-                    reasons.append("resolved_offer_id есть, но Offer.link пустой")
-                else:
-                    reasons.append("resolved_offer_id не найден")
-            else:
-                reasons.append("incoming_mails запись не найдена")
-
-            # 3) url из conversation_links
-            conv = await _get_convlink(
-                session,
-                user_id=owner_user_id,
-                inbox_email=inbox_email,
-                contact_email=contact_email,
-            )
-            if conv and conv.ad_url and str(conv.ad_url).strip():
-                return str(conv.ad_url).strip(), []
-            reasons.append("conversation_links.ad_url пустой/нет")
-
-            # 4) url из Offer.link по OfferEmail (валидированные данные в БД)
-            off_by_email = (await _offer_link_by_sender_email(session, owner_user_id, contact_email)) or ""
-            if off_by_email.strip():
-                return off_by_email.strip(), []
-            reasons.append("не найден Offer.link по OfferEmail")
-
-            last_reasons = reasons
-
-        return "", last_reasons
-
     async with Session() as session:
         owner_user_id = await _get_acc_owner_user_id(session, acc_id)
         if not owner_user_id:
@@ -1675,7 +1564,7 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
             session,
             user_id=int(owner_user_id),
             from_email=contact_email,
-            resolved_offer_id=getattr(mail_pre, "resolved_offer_id", None) if mail_pre else None,
+            resolved_offer_id=None,
             ad_url=(getattr(mail_pre, "ad_url", "") or "").strip() if mail_pre else None,
             inbox_email=inbox_email,
             subject=subj_pre,
@@ -1687,9 +1576,14 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
 
         url = (offer_pre.link or "").strip() if offer_pre else ""
         if not url:
-            url, reasons = await _get_ad_url_db_with_retries(session, owner_user_id=owner_user_id)
-        else:
-            reasons = []
+            url = (
+                await _offer_link_by_sender_email(
+                    session, int(owner_user_id), contact_email, subject=subj_pre
+                )
+            ) or ""
+        reasons: list[str] = []
+        if not url:
+            reasons = ["нет Offer.link по теме/email (не используем старый conv/resolved)"]
 
         if not url:
             reason_text = "\n".join([f"• { _e(r) }" for r in (reasons or ["не удалось получить ссылку из БД"])])
@@ -1735,10 +1629,12 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
         offer = offer_pre
         offer_id = int(offer.id) if offer else None
 
-        offer_title = offer_effective_title(offer) or None
-        offer_image = offer_effective_photo(offer) or None
-        title = offer_title or ((mail.subject or "").strip() if mail else "")
-        price = offer_effective_price(offer)
+        from services.offer_matching import normalized_reply_subject
+
+        offer_title = offer_effective_title(offer) if offer else None
+        offer_image = offer_effective_photo(offer) if offer else None
+        title = offer_title or normalized_reply_subject(subj_pre) or subj_pre
+        price = offer_effective_price(offer) if offer else ""
         if not title:
             await callback.message.answer("❌ Нет названия объявления (title).")
             return await callback.answer()

@@ -833,6 +833,7 @@ async def resolve_offer_for_mail_card(
 ) -> Offer | None:
     """Карточка/GAG: тема письма → ссылка этого письма → conv ad_url → resolved_offer_id → скоринг."""
     from services.offer_matching import (
+        offer_matches_incoming_subject,
         resolve_best_offer_by_subject,
         resolve_best_offer_by_subject_global,
         subject_is_informative,
@@ -873,14 +874,14 @@ async def resolve_offer_for_mail_card(
     mail_url = (ad_url or "").strip()
     if mail_url:
         off = await find_offer_by_link(session, user_id=int(user_id), ad_url=mail_url)
-        if off:
+        if off and offer_matches_incoming_subject(off, subject):
             return off
 
     if conv and (conv.ad_url or "").strip():
         off = await find_offer_by_link(
             session, user_id=int(user_id), ad_url=(conv.ad_url or "").strip()
         )
-        if off:
+        if off and offer_matches_incoming_subject(off, subject):
             return off
 
     if resolved_offer_id:
@@ -937,6 +938,9 @@ async def resolve_offer_for_mail_card(
         ).scalars().first()
         if off:
             return off
+
+    if subject_is_informative(subject):
+        return None
 
     return await _find_offer_if_unique_email(session, user_id=int(user_id), from_email=from_email)
 
