@@ -6,7 +6,6 @@ import email
 import html
 import imaplib
 import logging
-import os
 import re
 import select as pyselect
 import threading
@@ -465,12 +464,7 @@ def _imap_fetch_new_sync_raw(
     password: str,
     last_uid: Optional[int],
 ) -> tuple[List[Tuple[str, str, str, str, str, str]], Optional[int]]:
-    """Fetch new mails from INBOX and (for GMX only) from Spam/Junk.
-
-    - INBOX: uses UID > last_uid (first run returns empty and sets last_uid=max_uid).
-    - GMX Spam/Junk: fetches UNSEEN only, marks them as \\Seen to avoid repeats,
-      and prefixes uid as 'S:<uid>' so the async layer can filter/handle separately.
-    """
+    """Только INBOX: письма с UID > last_uid (первый опрос — без старых, last_uid=max)."""
     M = None
 
     def _fetch_uids(uids_list: list[int], *, uid_prefix: str = "") -> list[Tuple[str, str, str, str, str, str]]:
@@ -540,52 +534,13 @@ def _imap_fetch_new_sync_raw(
         if last_uid is None and max_uid is not None:
             updated_last_uid = int(max_uid)
 
-        # --- GMX Spam/Junk (UNSEEN only) ---
-        spam_mails: list[Tuple[str, str, str, str, str, str]] = []
-        is_gmx = ("gmx" in (host or "").lower()) or ("gmx" in (email_addr or "").lower())
-        if is_gmx:
-            spam_box_candidates = ["Spam", "Junk", "SPAM", "JUNK", "INBOX.Spam", "INBOX.Junk"]
-            selected = False
-            for box in spam_box_candidates:
-                try:
-                    typ_sel, _ = M.select(box)
-                    if typ_sel == "OK":
-                        selected = True
-                        break
-                except Exception:
-                    continue
-
-            if selected:
-                try:
-                    typ_s, data_s = M.uid("search", None, "UNSEEN")
-                    if typ_s == "OK" and data_s and data_s[0]:
-                        spam_uids = [int(x) for x in data_s[0].split() if x.isdigit()]
-                        if spam_uids:
-                            spam_mails = _fetch_uids(sorted(spam_uids)[-DEFAULT_MAX_PER_ACCOUNT:], uid_prefix="S:")
-                            # mark seen to avoid re-processing forever
-                            for su in spam_uids:
-                                try:
-                                    M.uid("store", str(su), "+FLAGS", r"(\\Seen)")
-                                except Exception:
-                                    pass
-                finally:
-                    # return to INBOX for consistency
-                    try:
-                        M.select("INBOX")
-                    except Exception:
-                        pass
-
-        mails = inbox_mails + spam_mails
-
-        # If first run and no inbox new mails, we still return spam matches (if any)
         if last_uid is None:
-            return mails, (int(max_uid) if max_uid is not None else last_uid)
+            return inbox_mails, (int(max_uid) if max_uid is not None else last_uid)
 
-        # If no inbox new mails and no spam mails
-        if not mails:
+        if not inbox_mails:
             return [], (int(max_uid) if max_uid is not None else last_uid)
 
-        return mails, (int(max_uid) if max_uid is not None else last_uid)
+        return inbox_mails, (int(max_uid) if max_uid is not None else last_uid)
 
     finally:
         try:
@@ -593,177 +548,6 @@ def _imap_fetch_new_sync_raw(
                 M.logout()
         except Exception:
             pass
-
-
-def _spam_folder_candidates(host: str, email_addr: str) -> list[str]:
-    el = (email_addr or "").strip().lower()
-    h = (host or "").strip().lower()
-    if "gmx" in h or "gmx" in el:
-        return ["Spam", "Junk", "SPAM", "JUNK", "INBOX.Spam", "INBOX.Junk"]
-    if "gmail" in h or "google" in el or el.endswith("@gmail.com") or el.endswith("@googlemail.com"):
-        return ["[Gmail]/Spam", "[Google Mail]/Spam", "Spam"]
-    return ["Spam", "Junk", "[Gmail]/Spam", "[Google Mail]/Spam"]
-
-
-def _imap_fetch_spam_manual_sync(
-    *,
-    host: str,
-    port: int,
-    email_addr: str,
-    password: str,
-    max_messages: int = 25,
-) -> list[tuple[str, str, str, str, str, str, str]]:
-    """Ручной /Check_spam: UNSEEN + последние письма из Spam/Junk, uid с префиксом S:."""
-    M: imaplib.IMAP4_SSL | None = None
-    max_messages = max(5, min(50, int(max_messages)))
-
-    def _fetch_uids(uids_list: list[int]) -> list[tuple[str, str, str, str, str, str, str]]:
-        out: list[tuple[str, str, str, str, str, str, str]] = []
-        for uid in uids_list:
-            typ2, msg_data = M.uid("fetch", str(uid), "(RFC822)")
-            if typ2 != "OK" or not msg_data:
-                continue
-            raw = None
-            for item in msg_data:
-                if isinstance(item, tuple) and item[1]:
-                    raw = item[1]
-                    break
-            if not raw:
-                continue
-            msg = email.message_from_bytes(raw)
-            from_raw = _decode_mime_words(msg.get("From", ""))
-            subject = _decode_mime_words(msg.get("Subject", ""))
-            date_str = msg.get("Date", "") or ""
-            name, addr = parseaddr(from_raw)
-            from_email = (addr or "").strip().lower()
-            from_name = (name or "").strip()
-            body = _extract_text_from_msg(msg)
-            inline_img = _extract_first_inline_image_b64(msg)
-            out.append(
-                (f"S:{uid}", from_email, from_name, subject, date_str, body, inline_img or "")
-            )
-        return out
-
-    try:
-        M = imaplib.IMAP4_SSL(host, port)
-        M.login(email_addr, password)
-
-        selected = False
-        for box in _spam_folder_candidates(host, email_addr):
-            try:
-                typ_sel, _ = M.select(box)
-                if typ_sel == "OK":
-                    selected = True
-                    break
-            except Exception:
-                continue
-
-        if not selected:
-            return []
-
-        uid_set: set[int] = set()
-        try:
-            typ_s, data_s = M.uid("search", None, "UNSEEN")
-            if typ_s == "OK" and data_s and data_s[0]:
-                uid_set.update(int(x) for x in data_s[0].split() if x.isdigit())
-        except Exception:
-            pass
-        try:
-            typ_a, data_a = M.uid("search", None, "ALL")
-            if typ_a == "OK" and data_a and data_a[0]:
-                all_uids = [int(x) for x in data_a[0].split() if x.isdigit()]
-                if all_uids:
-                    uid_set.update(sorted(all_uids)[-max_messages:])
-        except Exception:
-            pass
-
-        if not uid_set:
-            return []
-
-        pick = sorted(uid_set)[-max_messages:]
-        return _fetch_uids(pick)
-    finally:
-        try:
-            if M is not None:
-                M.logout()
-        except Exception:
-            pass
-
-
-async def _spam_mail_should_process(
-    session,
-    *,
-    user_id: int,
-    account_email: str,
-    from_email: str,
-    from_name: str,
-    subject: str,
-    body: str,
-    manual: bool,
-) -> bool:
-    """Фильтр писем из Spam: GMX в авто-опросе; Gmail и др. — при /Check_spam (manual)."""
-    from services.offer_matching import resolve_offer_for_incoming_mail
-
-    if _is_mailer_daemon_notice(from_email, subject or ""):
-        return True
-
-    if not manual:
-        if "gmx" not in (account_email or "").lower():
-            return False
-        subj_norm = _normalize_subject(subject)
-        if len(subj_norm) < 4:
-            return False
-        hit = (
-            await session.execute(
-                sa_select(Offer.id).where(Offer.title.ilike(f"%{subj_norm}%")).limit(1)
-            )
-        ).scalar()
-        return bool(hit)
-
-    if _is_google_system_mail(from_email, from_name or "", subject or ""):
-        return False
-
-    subj_norm = _normalize_subject(subject)
-    if len(subj_norm) >= 4:
-        hit = (
-            await session.execute(
-                sa_select(Offer.id)
-                .where(Offer.user_id == int(user_id))
-                .where(Offer.title.ilike(f"%{subj_norm}%"))
-                .limit(1)
-            )
-        ).scalar()
-        if hit:
-            return True
-
-    off = await resolve_offer_for_incoming_mail(
-        session,
-        user_id=int(user_id),
-        from_email=(from_email or "").strip().lower(),
-        subject=subject or "",
-        from_name=from_name or "",
-        body_text=(body or "").strip(),
-        stored_offer_id=None,
-        inbox_email=(account_email or "").strip().lower(),
-    )
-    if off:
-        return True
-
-    canon = _canon_email(from_email)
-    if canon and "@" in canon:
-        oe = (
-            await session.execute(
-                sa_select(OfferEmail.id)
-                .join(Offer, Offer.id == OfferEmail.offer_id)
-                .where(Offer.user_id == int(user_id))
-                .where(func.lower(OfferEmail.email) == canon)
-                .limit(1)
-            )
-        ).scalar()
-        if oe:
-            return True
-
-    return False
 
 
 def _strip_html_to_text(text: str) -> str:
@@ -1338,7 +1122,6 @@ async def _process_mails_for_account(
     mails: List[Tuple[str, str, str, str, str, str]],
     max_per_account: int,
     last_uid: Optional[int],
-    manual_spam: bool = False,
 ) -> int:
     return await _process_mails_for_account_impl(
         bot,
@@ -1349,7 +1132,6 @@ async def _process_mails_for_account(
         mails=mails,
         max_per_account=max_per_account,
         last_uid=last_uid,
-        manual_spam=manual_spam,
     )
 
 
@@ -1363,7 +1145,6 @@ async def _process_mails_for_account_impl(
     mails: List[Tuple[str, str, str, str, str, str]],
     max_per_account: int,
     last_uid: Optional[int],
-    manual_spam: bool = False,
 ) -> int:
     forwarded = 0
 
@@ -1389,53 +1170,17 @@ async def _process_mails_for_account_impl(
             uid, from_email, from_name, subject, date_str, body = row[:6]
             inline_b64 = ""
         uid_key = uid
-        is_spam_box = False
-        uid_num = None
-        if isinstance(uid, str) and uid.startswith("S:"):
-            is_spam_box = True
-            try:
-                uid_num = int(uid.split(":", 1)[1])
-            except Exception:
-                continue
-        else:
-            try:
-                uid_num = int(uid)
-            except Exception:
-                continue
-
-        if is_spam_box:
-            try:
-                async with _imap_db_session() as _s:
-                    if not await _spam_mail_should_process(
-                        _s,
-                        user_id=int(user_id),
-                        account_email=account_email,
-                        from_email=from_email,
-                        from_name=from_name or "",
-                        subject=subject or "",
-                        body=body or "",
-                        manual=bool(manual_spam),
-                    ):
-                        continue
-            except Exception:
-                logger.exception("Failed spam filter acc=%s uid=%s", acc_id, uid)
-                continue
-
-        db_imap_uid = -int(uid_num) if (is_spam_box and manual_spam) else int(uid_num)
-        # Только явный Gmail block / 5.7.1 — не любой DSN об недоставке получателю.
-        smtp_block_bounce = _is_smtp_block_bounce(from_email, subject, body)
-
-        if (not is_spam_box) and _looks_like_spam(from_email, from_name, subject, body):
+        try:
+            uid_num = int(uid.split(":", 1)[1]) if isinstance(uid, str) and ":" in str(uid) else int(uid)
+        except Exception:
             continue
+
+        db_imap_uid = int(uid_num)
+        smtp_block_bounce = _is_smtp_block_bounce(from_email, subject, body)
 
         try:
             body_clean = (body or "").strip()
             from_email_clean = (from_email or "").strip().lower()
-            skip_telegram_notify = _is_google_system_mail(
-                from_email_clean, from_name or "", subject or ""
-            )
-            if smtp_block_bounce or _is_mailer_daemon_notice(from_email_clean, subject or ""):
-                skip_telegram_notify = False
             inbox_email_clean = (account_email or "").strip().lower()
 
             FULL_BODIES[(acc_id, uid_key)] = body_clean
@@ -1520,16 +1265,7 @@ async def _process_mails_for_account_impl(
             except Exception:
                 logger.exception("Failed to persist IncomingMail acc=%s uid=%s", acc_id, uid)
 
-            if skip_telegram_notify:
-                forwarded += 1
-                continue
-
             if already_notified_tg:
-                forwarded += 1
-                continue
-
-            # Повторные Message blocked на уже снятом с SMTP ящике — не спамим карточками.
-            if smtp_block_bounce and account_already_smtp_blocked:
                 forwarded += 1
                 continue
 
@@ -1654,7 +1390,6 @@ async def _process_mails_for_account_impl(
                 try:
                     async with _imap_db_session() as _s_pin:
                         from services.offer_storage import offer_effective_link
-                        from services.offer_matching import offer_acceptable_for_subject
 
                         off_pin = (
                             await _s_pin.execute(
@@ -1664,11 +1399,7 @@ async def _process_mails_for_account_impl(
                                 .limit(1)
                             )
                         ).scalars().first()
-                        if off_pin and not offer_acceptable_for_subject(
-                            off_pin, subject or ""
-                        ):
-                            offer_id = None
-                        elif off_pin:
+                        if off_pin:
                             pin_url = (
                                 offer_effective_link(off_pin) or ad_url or ""
                             ).strip() or None
@@ -2252,89 +1983,6 @@ async def _idle_manager_loop(bot: Bot, *, poll_seconds: int) -> None:
             logger.exception("Incoming mail manager loop error")
 
         await asyncio.sleep(max(5, cycle_pause))
-
-
-async def run_manual_spam_check(
-    bot: Bot,
-    *,
-    tg_id: int,
-    user_id: int,
-    accounts: list[EmailAccount],
-) -> dict[str, Any]:
-    """
-    /Check_spam: опрос Spam/Junk на ящиках пользователя, карточки как у INBOX.
-    """
-    max_accounts = max(1, min(120, int(os.getenv("CHECK_SPAM_MAX_ACCOUNTS", "80"))))
-    max_per_box = max(5, min(50, int(os.getenv("CHECK_SPAM_MAX_PER_BOX", "25"))))
-    concurrent = max(1, min(8, int(os.getenv("CHECK_SPAM_CONCURRENT", "4"))))
-
-    accs = list(accounts)[:max_accounts]
-    result: dict[str, Any] = {
-        "accounts_total": len(accounts),
-        "accounts_scanned": 0,
-        "messages_in_spam": 0,
-        "cards_sent": 0,
-        "errors": [],
-    }
-    if not accs:
-        return result
-
-    sem = asyncio.Semaphore(concurrent)
-
-    async def _one(acc: EmailAccount) -> None:
-        async with sem:
-            acc_id = int(acc.id)
-            email_addr = str(acc.email or "")
-            password = str(acc.password or "")
-            provider = str(getattr(acc, "provider", "") or "")
-            host, port = _imap_connect(provider, email_addr)
-
-            slot = _imap_slot_sem()
-            await slot.acquire()
-            try:
-                mails = await asyncio.to_thread(
-                    _imap_fetch_spam_manual_sync,
-                    host=host,
-                    port=port,
-                    email_addr=email_addr,
-                    password=password,
-                    max_messages=max_per_box,
-                )
-            except Exception as e:
-                err = str(e).strip()[:120] or type(e).__name__
-                if len(result["errors"]) < 8:
-                    result["errors"].append((email_addr, err))
-                logger.warning("Check_spam IMAP acc=%s: %s", acc_id, err)
-                return
-            finally:
-                slot.release()
-
-            result["accounts_scanned"] = int(result["accounts_scanned"]) + 1
-            if not mails:
-                return
-
-            result["messages_in_spam"] = int(result["messages_in_spam"]) + len(mails)
-            try:
-                n = await _process_mails_for_account(
-                    bot,
-                    acc_id=acc_id,
-                    tg_id=int(tg_id),
-                    user_id=int(user_id),
-                    account_email=email_addr,
-                    mails=mails,
-                    max_per_account=max_per_box,
-                    last_uid=None,
-                    manual_spam=True,
-                )
-                result["cards_sent"] = int(result["cards_sent"]) + int(n)
-            except Exception as e:
-                err = str(e).strip()[:120] or type(e).__name__
-                if len(result["errors"]) < 8:
-                    result["errors"].append((email_addr, err))
-                logger.exception("Check_spam process acc=%s", acc_id)
-
-    await asyncio.gather(*[_one(a) for a in accs], return_exceptions=True)
-    return result
 
 
 def incoming_mail_diag_snapshot() -> dict[str, Any]:

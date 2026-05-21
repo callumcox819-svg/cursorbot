@@ -106,7 +106,7 @@ def _bind_priority_dispatcher_handlers(dp: Dispatcher) -> None:
         spoof_name_menu,
     )
     from handlers.stopsend import cmd_stopsend
-    from handlers.status import cmd_check_spam, cmd_imap_diag, cmd_statussend
+    from handlers.status import cmd_imap_diag, cmd_statussend
     from handlers.templates import presets_menu
 
     async def _dp_settings_message(message: Message, state: FSMContext) -> None:
@@ -128,7 +128,6 @@ def _bind_priority_dispatcher_handlers(dp: Dispatcher) -> None:
     dp.message.register(cmd_statussend, Command("stat", "status", "statussend"))
     dp.message.register(cmd_statussend, F.text == "📊 Статус рассылки")
     dp.message.register(cmd_imap_diag, Command("imap_diag"))
-    dp.message.register(cmd_check_spam, Command("check_spam"))
     dp.message.register(
         quick_gmail_from_main_menu,
         F.text.in_({"⚡ Быстрое добавление", "⚡ Быстрое добавление (Gmail)"}),
