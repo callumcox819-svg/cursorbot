@@ -106,7 +106,7 @@ def _bind_priority_dispatcher_handlers(dp: Dispatcher) -> None:
         spoof_name_menu,
     )
     from handlers.stopsend import cmd_stopsend
-    from handlers.status import cmd_imap_diag, cmd_statussend
+    from handlers.status import cmd_check_spam, cmd_imap_diag, cmd_statussend
     from handlers.templates import presets_menu
 
     async def _dp_settings_message(message: Message, state: FSMContext) -> None:
@@ -128,6 +128,7 @@ def _bind_priority_dispatcher_handlers(dp: Dispatcher) -> None:
     dp.message.register(cmd_statussend, Command("stat", "status", "statussend"))
     dp.message.register(cmd_statussend, F.text == "📊 Статус рассылки")
     dp.message.register(cmd_imap_diag, Command("imap_diag"))
+    dp.message.register(cmd_check_spam, Command("check_spam"))
     dp.message.register(
         quick_gmail_from_main_menu,
         F.text.in_({"⚡ Быстрое добавление", "⚡ Быстрое добавление (Gmail)"}),
@@ -298,6 +299,18 @@ async def main() -> None:
         "✅ БД готова (%s). Пользователи/аккаунты/офферы — в БД; пресеты — в Postgres при DATABASE_URL.",
         _db_engine.dialect.name,
     )
+
+    try:
+        from services.mailing_active_db import clear_stale_mailing_active_flags
+
+        cleared = await clear_stale_mailing_active_flags()
+        if cleared:
+            logger.warning(
+                "Сброшен зависший флаг mailing_active для tg=%s (рестарт бота, рассылка не шла)",
+                ",".join(str(x) for x in cleared[:10]),
+            )
+    except Exception:
+        logger.exception("clear_stale_mailing_active_flags failed")
 
     dp = Dispatcher()
     dp.startup.register(_on_startup)

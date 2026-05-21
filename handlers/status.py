@@ -210,6 +210,78 @@ async def _collect_db_stats(tg_user_id: int) -> tuple[int, int, int, int]:
         )
 
 
+@router.message(Command("check_spam"))
+async def cmd_check_spam(message: Message) -> None:
+    """Ручной опрос Spam/Junk на всех ящиках пользователя (Gmail, GMX и др.)."""
+    tg_user_id = message.from_user.id
+    wait_msg = await message.answer(
+        "⏳ Сканирую папки <b>Spam/Junk</b> на ваших ящиках…\n"
+        "<i>Это может занять 1–3 мин при большом числе аккаунтов.</i>",
+        parse_mode="HTML",
+    )
+
+    async with db_session() as session:
+        user = await get_or_create_user(session, tg_user_id)
+        accs = (
+            await session.execute(
+                select(EmailAccount).where(EmailAccount.user_id == int(user.id))
+            )
+        ).scalars().all()
+
+    from services.incoming_mail_worker import run_manual_spam_check
+
+    pollable = [
+        a
+        for a in accs
+        if (a.status or "").strip().lower()
+        in ("", "active", "enabled", "proxy_error", "smtp_blocked")
+        or a.status is None
+    ]
+
+    try:
+        stats = await run_manual_spam_check(
+            message.bot,
+            tg_id=int(tg_user_id),
+            user_id=int(user.id),
+            accounts=pollable,
+        )
+    except Exception as e:
+        logger.exception("check_spam failed tg=%s", tg_user_id)
+        err_text = f"❌ Ошибка проверки Spam: <code>{str(e)[:200]}</code>"
+        try:
+            await wait_msg.edit_text(err_text, parse_mode="HTML")
+        except Exception:
+            await message.answer(err_text, parse_mode="HTML")
+        return
+
+    lines = [
+        "<b>📬 Проверка Spam</b>",
+        f"Ящиков в аккаунте: <b>{stats.get('accounts_total', 0)}</b>",
+        f"Опрошено: <b>{stats.get('accounts_scanned', 0)}</b>",
+        f"Писем в Spam (отобрано): <b>{stats.get('messages_in_spam', 0)}</b>",
+        f"Новых карточек в Telegram: <b>{stats.get('cards_sent', 0)}</b>",
+        "",
+        "<i>Показываем ответы продавцов: тема/лот в БД, известный email или совпадение с рассылкой. "
+        "Системные письма Google пропускаем.</i>",
+    ]
+    errs = stats.get("errors") or []
+    if errs:
+        lines.append("\n<b>Ошибки IMAP:</b>")
+        for em, err in errs[:6]:
+            lines.append(f"• <code>{em}</code> — <i>{err}</i>")
+    if int(stats.get("cards_sent", 0)) == 0 and not errs:
+        lines.append(
+            "\n💡 Если ответы есть в веб-Gmail в Spam, но здесь 0 — проверьте, что продавец в валидации "
+            "и тема письма похожа на название лота."
+        )
+
+    text = "\n".join(lines)
+    try:
+        await wait_msg.edit_text(text, parse_mode="HTML")
+    except Exception:
+        await message.answer(text, parse_mode="HTML")
+
+
 @router.message(Command("imap_diag"))
 async def cmd_imap_diag(message: Message) -> None:
     """Проверка: жив ли IMAP-воркер и есть ли входящие в БД."""
@@ -218,6 +290,11 @@ async def cmd_imap_diag(message: Message) -> None:
     from services.incoming_mail_worker import incoming_mail_diag_snapshot
 
     snap = incoming_mail_diag_snapshot()
+    from services.mailing_active_db import mailing_telegram_ids_from_db
+    from services.sending_state import active_mailing_telegram_ids
+
+    db_mailing = await mailing_telegram_ids_from_db()
+    mem_mailing = active_mailing_telegram_ids()
     async with db_session() as session:
         user = await get_or_create_user(session, tg_user_id)
         accs = (
@@ -242,6 +319,16 @@ async def cmd_imap_diag(message: Message) -> None:
         f"Параллельно: <b>{snap.get('max_concurrent', '—')}</b>, опрос ~<b>{snap.get('poll_fallback_sec', 20)}</b> с",
         f"Входящих в БД (всего): <b>{incoming_total}</b>",
     ]
+    if db_mailing and not mem_mailing:
+        lines.append(
+            "\n⚠️ <b>Зависший флаг рассылки в БД</b> (mailing_active=1, а /send не идёт). "
+            "При <code>IMAP_MAILING_PAUSE=per_user</code> входящие не читаются. "
+            "Перезапустите сервис <b>cursorbot</b> — флаг сбросится при старте."
+        )
+    elif tg_user_id in db_mailing:
+        lines.append(
+            "\n📤 Флаг рассылки в БД активен — при <code>per_user</code> ваши ящики на паузе IMAP."
+        )
     if snap.get("backoff_sec_by_account"):
         lines.append(
             f"⚠️ Пауза после ошибок IMAP (acc_id→сек): <code>{snap['backoff_sec_by_account']}</code>"
@@ -277,7 +364,7 @@ async def cmd_imap_diag(message: Message) -> None:
     lines.append(
         "\n<i>Тест: ответьте на письмо рассылки → ~30 с карточка в TG. "
         "mailer-daemon (Message blocked) — карточка в TG + ящик smtp_blocked. "
-        "Gmail Spam не читаем.</i>"
+        "авто-опрос INBOX; Spam — команда /check_spam.</i>"
     )
     text = "\n".join(lines)
     try:

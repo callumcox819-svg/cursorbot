@@ -42,3 +42,24 @@ async def mailing_telegram_ids_from_db() -> frozenset[int]:
         if tid is not None:
             out.add(int(tid))
     return frozenset(out)
+
+
+async def clear_stale_mailing_active_flags() -> list[int]:
+    """
+    Сброс флага рассылки в БД после рестарта бота.
+    Если процесс упал во время /send, mailing_active=1 остаётся в Postgres:
+    при IMAP_MAILING_PAUSE=per_user входящие для пользователя не опрашиваются.
+    """
+    from services.sending_state import active_mailing_telegram_ids
+
+    still_running = active_mailing_telegram_ids()
+    stale = await mailing_telegram_ids_from_db()
+    to_clear = [tid for tid in stale if tid not in still_running]
+    if not to_clear:
+        return []
+
+    async with db_session() as session:
+        for tid in to_clear:
+            user = await get_or_create_user(session, int(tid))
+            await set_user_setting(session, user, MAILING_ACTIVE_KEY, "0")
+    return to_clear
