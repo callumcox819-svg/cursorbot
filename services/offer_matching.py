@@ -80,7 +80,10 @@ _SUBJECT_NUM_RE = re.compile(r"\d{2,}")
 
 
 def _fold_de(s: str) -> str:
-    return (s or "").lower().translate(str.maketrans("äöüß", "aeouss"))
+    s = (s or "").lower()
+    for src, dst in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        s = s.replace(src, dst)
+    return s
 
 
 def _subject_tokens(subj: str) -> list[str]:
