@@ -476,6 +476,7 @@ async def find_offer_by_incoming_signals(
         _canon_email,
         _fold_match_text,
         _ratio,
+        _subject_distinct_tokens,
         _subject_title_conflicts,
         _subject_tokens,
         list_offers_for_incoming_contact,
@@ -487,10 +488,25 @@ async def find_offer_by_incoming_signals(
         subject_match_score,
     )
 
+    from services.offer_matching import offer_acceptable_for_subject
+
     fe_can = _canon_email(from_email)
     subj_norm = normalized_reply_subject(subject)
     title_hint = (product_title or subj_norm or "").strip()
     email_offer_ids = await _offer_ids_with_email(session, int(user_id), fe_can) if fe_can else set()
+
+    if subj_norm and subject_is_informative(subject):
+        off_subj = await find_offer_by_incoming_subject(
+            session,
+            user_id=int(user_id),
+            subject=subject,
+            from_name=from_name,
+        )
+        if off_subj and offer_acceptable_for_subject(off_subj, subject):
+            if not fe_can or int(off_subj.id) in email_offer_ids or offer_has_contact_email(
+                off_subj, fe_can
+            ):
+                return off_subj
 
     candidates: list[Offer] = []
     seen: set[int] = set()
@@ -521,28 +537,24 @@ async def find_offer_by_incoming_signals(
 
     if len(candidates) == 1:
         only = candidates[0]
-        title = offer_effective_title(only)
-        if title and subj_norm and _subject_title_conflicts(subject, title):
+        if not offer_acceptable_for_subject(only, subject):
             return None
-        if fe_can and (
-            int(only.id) in email_offer_ids or offer_has_contact_email(only, fe_can)
-        ):
-            return only
-        fn = (from_name or "").strip()
-        pn = (only.person_name or "").strip()
-        if fn and pn and _ratio(fn, pn) >= 0.72:
-            return only
-        if not subj_norm or not subject_is_informative(subject):
-            return only
+        return only
 
     best: Offer | None = None
     best_sc = -1.0
     url_lk = link_key(ad_url or "")
 
+    distinct = _subject_distinct_tokens(subj_norm) if subj_norm else []
+
     for off in candidates:
         title = offer_effective_title(off)
-        if title and subj_norm and _subject_title_conflicts(subject, title):
+        if not offer_acceptable_for_subject(off, subject):
             continue
+        if distinct:
+            tf = _fold_match_text(title)
+            if not all(t in tf for t in distinct):
+                continue
 
         email_hit = bool(
             fe_can

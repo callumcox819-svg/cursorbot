@@ -1499,14 +1499,28 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
 
         offer_id = int(offer.id) if offer else None
 
-        from services.offer_matching import normalized_reply_subject
+        from services.offer_matching import gag_title_for_mail, offer_acceptable_for_subject
 
+        if offer and not offer_acceptable_for_subject(offer, subj):
+            offer = None
+            url = ""
         offer_title = offer_effective_title(offer) if offer else None
         offer_image = offer_effective_photo(offer) if offer else None
-        title = offer_title or normalized_reply_subject(subj) or subj
+        title = gag_title_for_mail(offer=offer, subject=subj)
         price = offer_effective_price(offer) if offer else ""
         if not title:
             await callback.message.answer("❌ Нет названия объявления (title).")
+            await callback.answer()
+            return
+        if not url:
+            subj_hint = (subj or "")[:120]
+            await callback.message.answer(
+                "❌ <b>Лот в БД не совпадает с темой письма</b>\n\n"
+                f"<b>Тема:</b> <code>{_e(subj_hint)}</code>\n\n"
+                "В базе нет объявления с таким названием на этого продавца. "
+                "Загрузите JSON с этим лотом и прогоните валидацию, затем /send с этой темой.",
+                parse_mode="HTML",
+            )
             await callback.answer()
             return
 
@@ -1713,14 +1727,23 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
         offer = offer_pre
         offer_id = int(offer.id) if offer else None
 
-        from services.offer_matching import normalized_reply_subject
+        from services.offer_matching import gag_title_for_mail, offer_acceptable_for_subject
 
+        if offer and not offer_acceptable_for_subject(offer, subj_pre):
+            offer = None
+            url = ""
         offer_title = offer_effective_title(offer) if offer else None
         offer_image = offer_effective_photo(offer) if offer else None
-        title = offer_title or normalized_reply_subject(subj_pre) or subj_pre
+        title = gag_title_for_mail(offer=offer, subject=subj_pre)
         price = offer_effective_price(offer) if offer else ""
         if not title:
             await callback.message.answer("❌ Нет названия объявления (title).")
+            return await callback.answer()
+        if not url:
+            await callback.message.answer(
+                f"❌ Лот в БД не совпадает с темой «{(subj_pre or '')[:80]}». "
+                "Нужен JSON + валидация + /send с этой темой.",
+            )
             return await callback.answer()
 
         api_service = gag_service_for_api(service)

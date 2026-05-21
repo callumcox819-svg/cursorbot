@@ -74,6 +74,28 @@ _SUBJECT_STOP = frozenset(
     }
 )
 
+# Общие слова в теме Re: — не считаем совпадением лота (Porte bébé ≠ Baignoire bébé).
+_SUBJECT_WEAK = frozenset(
+    {
+        "bebe",
+        "baby",
+        "fb",
+        "neu",
+        "neuf",
+        "bon",
+        "etat",
+        "sehr",
+        "gut",
+        "avec",
+        "pour",
+        "sale",
+        "sold",
+        "neu",
+        "chf",
+        "eur",
+    }
+)
+
 # Разные категории товара в теме и в названии лота (Sofa vs Télévision samsung).
 _PRODUCT_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"sofa", "couch", "sectional", "divan", "canape", "canapee", "ecksofa", "sessel"}),
@@ -105,9 +127,29 @@ _SUBJECT_NUM_RE = re.compile(r"\d{2,}")
 
 def _fold_de(s: str) -> str:
     s = (s or "").lower()
-    for src, dst in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+    for src, dst in (
+        ("ä", "ae"),
+        ("ö", "oe"),
+        ("ü", "ue"),
+        ("ß", "ss"),
+        ("é", "e"),
+        ("è", "e"),
+        ("ê", "e"),
+        ("ë", "e"),
+        ("à", "a"),
+        ("â", "a"),
+        ("ô", "o"),
+        ("û", "u"),
+        ("ç", "c"),
+    ):
         s = s.replace(src, dst)
     return s
+
+
+def _subject_distinct_tokens(subj: str) -> list[str]:
+    """Слова-товар из темы (Porte, Baignoire, Skechers), без bebe/baby."""
+    base = _fold_match_text(subj)
+    return [t for t in _subject_tokens(base) if len(t) >= 4 and t not in _SUBJECT_WEAK]
 
 
 def _fold_match_text(s: str) -> str:
@@ -460,6 +502,14 @@ def _subject_title_conflicts(subj: str, title: str) -> bool:
     if len(title_toks) >= 2 and title_toks <= subj_toks:
         return False
 
+    distinct = _subject_distinct_tokens(subj)
+    if distinct:
+        if not all(t in title_l for t in distinct):
+            return True
+        title_distinct = [t for t in _subject_tokens(title_l) if len(t) >= 4 and t not in _SUBJECT_WEAK]
+        if title_distinct and not all(t in subj for t in title_distinct):
+            return True
+
     sig_min = 5
     significant = [
         t
@@ -508,7 +558,38 @@ def normalized_reply_subject(subject: str) -> str:
 def offer_matches_incoming_subject(off: Offer, subject: str, *, min_score: float = 45.0) -> bool:
     if not subject_is_informative(subject):
         return True
+    from services.offer_storage import offer_effective_title
+
+    title = offer_effective_title(off)
+    if title and _subject_title_conflicts(subject, title):
+        return False
     return subject_match_score(subject, off) >= float(min_score)
+
+
+def offer_acceptable_for_subject(off: Offer | None, subject: str) -> bool:
+    """Лот можно показывать в карточке / GAG только если тема письма совпадает с названием."""
+    if not off:
+        return False
+    from services.offer_storage import offer_effective_title
+
+    if not subject_is_informative(subject):
+        return True
+    title = offer_effective_title(off)
+    if title and _subject_title_conflicts(subject, title):
+        return False
+    if not title:
+        return True
+    return offer_matches_incoming_subject(off, subject, min_score=38.0)
+
+
+def gag_title_for_mail(*, offer: Offer | None, subject: str) -> str:
+    """Название для GAG: тема письма важнее чужого лота в БД."""
+    subj = normalized_reply_subject(subject) or (subject or "").strip()
+    if not offer or not offer_acceptable_for_subject(offer, subject):
+        return subj
+    from services.offer_storage import offer_effective_title
+
+    return offer_effective_title(offer) or subj
 
 
 def subject_is_informative(subject: str) -> bool:
@@ -1192,4 +1273,21 @@ async def resolve_offer_for_aqua_link(
             url = offer_effective_link(off_sig) or ""
     if off and not url:
         url = offer_effective_link(off)
+
+    if off and subject_is_informative(subject) and not offer_acceptable_for_subject(off, subject):
+        from services.offer_storage import find_offer_by_incoming_subject
+
+        off_subj = await find_offer_by_incoming_subject(
+            session,
+            user_id=int(user_id),
+            subject=subject,
+            from_name=from_name,
+        )
+        if off_subj and offer_acceptable_for_subject(off_subj, subject):
+            off = off_subj
+            url = (offer_effective_link(off_subj) or "").strip()
+        else:
+            off = None
+            url = ""
+
     return off, url

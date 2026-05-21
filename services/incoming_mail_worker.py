@@ -897,11 +897,10 @@ async def resolve_offer_for_mail_card(
     from services.offer_matching import _subject_title_conflicts, subject_is_informative
     from services.offer_storage import offer_effective_title
 
+    from services.offer_matching import offer_acceptable_for_subject
+
     def _pinned_ok(o: Offer) -> bool:
-        title = offer_effective_title(o)
-        if title and subject_is_informative(subject) and _subject_title_conflicts(subject, title):
-            return False
-        return True
+        return offer_acceptable_for_subject(o, subject)
 
     def _offer_ok_for_subject(o: Offer) -> bool:
         if not _pinned_ok(o):
