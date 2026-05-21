@@ -86,6 +86,10 @@ def _fold_de(s: str) -> str:
     return s
 
 
+def _fold_match_text(s: str) -> str:
+    return _fold_de(_norm_subject(s))
+
+
 def _subject_tokens(subj: str) -> list[str]:
     base = _fold_de(_norm_subject(subj))
     parts = _SUBJECT_WORD_RE.findall(base)
@@ -130,10 +134,10 @@ async def resolve_offer_by_subject_tokens(
     best: Offer | None = None
     best_hits = 0
     for off in offers:
-        title = offer_effective_title(off).lower()
+        title = _fold_match_text(offer_effective_title(off))
         if not title:
             continue
-        if _subject_title_conflicts(subject, title):
+        if _subject_title_conflicts(subject, offer_effective_title(off)):
             continue
         hits = sum(1 for t in toks if t in title)
         need = 2
@@ -410,8 +414,8 @@ async def resolve_offer_for_incoming(
 
 def _subject_title_conflicts(subj: str, title: str) -> bool:
     """Явное противоречие темы ответа и названия оффера (6 Stühle Gratis vs 4 Stühle 80.-)."""
-    subj = _norm_subject(subj).lower()
-    title_l = (title or "").strip().lower()
+    subj = _fold_match_text(subj)
+    title_l = _fold_match_text(title)
     if not subj or not title_l:
         return False
 
@@ -480,7 +484,7 @@ def subject_is_informative(subject: str) -> bool:
 def subject_token_hits(subject: str, off: Offer) -> int:
     from services.offer_storage import offer_effective_title
 
-    title_l = offer_effective_title(off).lower()
+    title_l = _fold_match_text(offer_effective_title(off))
     if not title_l:
         return 0
     return sum(1 for tok in _subject_tokens(subject) if tok in title_l)
@@ -490,25 +494,25 @@ def subject_match_score(subject: str, off: Offer) -> float:
     """Сильный матч темы письма к названию оффера (для продавцов с несколькими лотами)."""
     from services.offer_storage import offer_effective_title
 
-    subj = _norm_subject(subject)
+    subj = _fold_match_text(subject)
     if len(subj) < 6:
         return 0.0
-    title = offer_effective_title(off)
-    if not title:
+    raw_title = offer_effective_title(off)
+    if not raw_title:
         return 0.0
-    if _subject_title_conflicts(subj, title):
+    if _subject_title_conflicts(subject, raw_title):
         return 0.0
 
-    title = title.lower()
+    title = _fold_match_text(raw_title)
 
     score = 75.0 * _ratio(subj, title)
-    if subj.lower() in title or title in subj.lower():
+    if subj in title or title in subj:
         score += 55.0
 
-    subj_l = subj.lower()
-    title_l = title.lower()
+    subj_l = subj
+    title_l = title
     tok_hits = 0
-    for tok in _subject_tokens(subj):
+    for tok in _subject_tokens(subject):
         if tok in title_l:
             tok_hits += 1
             score += 24.0

@@ -871,6 +871,29 @@ async def resolve_offer_for_mail_card(
     if off:
         return off
 
+    from services.offer_storage import (
+        find_offer_by_inbox_pinned_subject,
+        find_offer_by_incoming_subject,
+    )
+
+    off = await find_offer_by_incoming_subject(
+        session,
+        user_id=int(user_id),
+        subject=subject,
+        from_name=from_name,
+    )
+    if off:
+        return off
+    if inbox:
+        off = await find_offer_by_inbox_pinned_subject(
+            session,
+            user_id=int(user_id),
+            inbox_email=inbox,
+            subject=subject,
+        )
+        if off:
+            return off
+
     from services.offer_matching import _subject_title_conflicts, subject_is_informative
     from services.offer_storage import offer_effective_title
 

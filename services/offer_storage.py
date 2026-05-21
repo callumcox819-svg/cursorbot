@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any
 
-from sqlalchemy import select as sa_select
+from sqlalchemy import func, or_ as sa_or, select as sa_select
 
 from models import Offer, OfferEmail
 
@@ -138,6 +138,7 @@ async def find_offer_by_incoming_subject(
 
     from services.offer_matching import (
         _subject_title_conflicts,
+        _subject_tokens,
         list_offers_for_seller_name,
         normalized_reply_subject,
         subject_is_informative,
@@ -196,8 +197,85 @@ async def find_offer_by_incoming_subject(
             best_key = score
             best = off
 
-    if best and best_key >= 72.0:
+    if best and best_key >= 50.0:
         return best
+
+    # SQL-префильтр по первому слову темы (gabel, couch, …)
+    word_toks = [t for t in _subject_tokens(subj_norm) if len(t) >= 4 and not t.isdigit()]
+    if word_toks:
+        pat = f"%{word_toks[0]}%"
+        sql_rows = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.user_id == int(user_id))
+                .where(
+                    sa_or(
+                        func.lower(Offer.title).like(pat),
+                        func.lower(Offer.raw_json).like(pat),
+                    )
+                )
+                .order_by(Offer.id.desc())
+                .limit(40)
+            )
+        ).scalars().all()
+        for off in sql_rows:
+            title = offer_effective_title(off)
+            if not title or _subject_title_conflicts(subj_norm, title):
+                continue
+            tc = _title_compact(title)
+            if not tc:
+                continue
+            if tc == subj_compact or tc in subj_compact or subj_compact in tc:
+                return off
+
+    return None
+
+
+async def find_offer_by_inbox_pinned_subject(
+    session,
+    *,
+    user_id: int,
+    inbox_email: str,
+    subject: str,
+) -> Offer | None:
+    """
+    Лот, на который уже писали с этого ящика (pinned в другом диалоге),
+    если продавец ответил с другого email (Gmail vs валидированный).
+    """
+    from models import ConversationLink
+    from services.offer_matching import (
+        _subject_title_conflicts,
+        normalized_reply_subject,
+        subject_is_informative,
+    )
+
+    if not subject_is_informative(subject):
+        return None
+    inbox = (inbox_email or "").strip().lower()
+    if not inbox:
+        return None
+    subj_norm = normalized_reply_subject(subject)
+
+    rows = (
+        await session.execute(
+            sa_select(Offer)
+            .join(ConversationLink, ConversationLink.pinned_offer_id == Offer.id)
+            .where(ConversationLink.user_id == int(user_id))
+            .where(func.lower(ConversationLink.account_email) == inbox)
+            .where(ConversationLink.pinned_offer_id.is_not(None))
+            .order_by(ConversationLink.id.desc())
+            .limit(50)
+        )
+    ).scalars().all()
+
+    subj_c = _title_compact(subj_norm)
+    for off in rows:
+        title = offer_effective_title(off)
+        if not title or _subject_title_conflicts(subj_norm, title):
+            continue
+        tc = _title_compact(title)
+        if tc and (tc == subj_c or tc in subj_c or subj_c in tc):
+            return off
     return None
 
 
