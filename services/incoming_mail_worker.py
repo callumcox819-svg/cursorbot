@@ -849,6 +849,17 @@ async def _find_offer_if_unique_email(
     ).scalars().first()
 
 
+async def _load_offer_by_id(session, *, user_id: int, oid: int) -> Offer | None:
+    return (
+        await session.execute(
+            sa_select(Offer)
+            .where(Offer.id == int(oid))
+            .where(Offer.user_id == int(user_id))
+            .limit(1)
+        )
+    ).scalars().first()
+
+
 async def resolve_offer_for_mail_card(
     session,
     *,
