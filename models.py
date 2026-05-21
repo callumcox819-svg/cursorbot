@@ -247,6 +247,24 @@ class SentEmail(Base):
     sent_count = Column(Integer, default=1)
 
 
+class MailingSend(Base):
+    """Каждое письмо рассылки: offer_id + тема + ящик (для ответов с другого email продавца)."""
+
+    __tablename__ = "mailing_sends"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    offer_id = Column(ForeignKey("offers.id", ondelete="CASCADE"), nullable=False, index=True)
+    offer_email_id = Column(Integer, nullable=True, index=True)
+
+    inbox_email = Column(String, nullable=False, index=True)
+    to_email = Column(String, nullable=False, index=True)
+    subject = Column(Text, nullable=True)
+    title_snapshot = Column(Text, nullable=True)
+
+    sent_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class GlobalSentEmail(Base):
     __tablename__ = "global_sent_emails"
     __table_args__ = (UniqueConstraint("email", name="uq_global_sent_email_email"),)

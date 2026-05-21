@@ -768,12 +768,35 @@ async def resolve_offer_for_incoming_mail(
     from_name: str = "",
     body_text: str = "",
     stored_offer_id: int | None = None,
+    inbox_email: str | None = None,
+    offer_email_id: int | None = None,
 ) -> Offer | None:
     """
-    Оффер строго под ЭТО входящее письмо: тема важнее email и старых conv/resolved.
-    При информативной теме не возвращаем чужой лот того же продавца.
+    Оффер под ЭТО письмо: сначала журнал рассылки (offer_id), затем тема, затем email.
     """
     subj = (subject or "").strip()
+
+    if offer_email_id:
+        from services.mailing_send_log import find_offer_by_offer_email_id
+
+        off_oe = await find_offer_by_offer_email_id(
+            session, user_id=int(user_id), offer_email_id=int(offer_email_id)
+        )
+        if off_oe:
+            return off_oe
+
+    if (inbox_email or "").strip():
+        from services.mailing_send_log import find_offer_by_mailing_log
+
+        off_log = await find_offer_by_mailing_log(
+            session,
+            user_id=int(user_id),
+            inbox_email=inbox_email or "",
+            subject=subj,
+            from_email=from_email,
+        )
+        if off_log:
+            return off_log
 
     if stored_offer_id:
         off = (
@@ -973,6 +996,7 @@ async def resolve_offer_for_aqua_link(
     from_name: str = "",
     body_text: str = "",
     resolved_offer_id: int | None = None,
+    resolved_offer_email_id: int | None = None,
     ad_url: str | None = None,
     inbox_email: str | None = None,
 ) -> tuple[Offer | None, str]:
@@ -985,6 +1009,7 @@ async def resolve_offer_for_aqua_link(
         user_id=int(user_id),
         from_email=from_email,
         resolved_offer_id=resolved_offer_id,
+        resolved_offer_email_id=resolved_offer_email_id,
         ad_url=ad_url,
         inbox_email=inbox_email,
         subject=subject,

@@ -1404,6 +1404,7 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
             body_text=(getattr(mail, "body", "") or ""),
             ad_url=(getattr(mail, "ad_url", "") or "").strip() or None,
             resolved_offer_id=getattr(mail, "resolved_offer_id", None),
+            resolved_offer_email_id=getattr(mail, "resolved_offer_email_id", None),
             inbox_email=inbox_email,
         )
         if offer:
@@ -1420,10 +1421,18 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
                 )
             else:
                 from services.offer_storage import diagnose_subject_match
+                from models import MailingSend
 
                 diag = await diagnose_subject_match(
                     session, user_id=int(tg_user.id), subject=subj
                 )
+                mail_log_n = (
+                    await session.execute(
+                        sa_select(func.count(MailingSend.id))
+                        .where(MailingSend.user_id == int(tg_user.id))
+                        .where(func.lower(MailingSend.inbox_email) == inbox_email)
+                    )
+                ).scalar() or 0
                 words = diag.get("words") or []
                 w_hint = "+".join(words) if words else "—"
                 reasons.append(
@@ -1434,7 +1443,11 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
                 if samples:
                     reasons.append("похожие названия: " + "; ".join(samples[:3]))
                 reasons.append(
-                    "загрузите JSON с этим лотом и прогоните валидацию (email 42/79)"
+                    f"журнал рассылки с ящика {inbox_email or '—'}: {int(mail_log_n)} записей "
+                    "(нужна хотя бы одна /send после деплоя — пишем offer_id+тему)"
+                )
+                reasons.append(
+                    "или загрузите JSON с этим лотом и прогоните валидацию"
                 )
 
         if not url:

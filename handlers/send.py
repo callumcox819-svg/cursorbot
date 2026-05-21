@@ -606,21 +606,38 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     state.last_status = "NORMAL"
                     account_send_counts[int(acc.id)] = account_send_counts.get(int(acc.id), 0) + 1
                     offer_sent = getattr(tgt, "offer", None)
-                    offer_link = (getattr(offer_sent, "link", None) or "").strip()
-                    if offer_sent and offer_link:
+                    if offer_sent:
                         try:
+                            from services.offer_storage import (
+                                offer_effective_link,
+                                offer_effective_title,
+                            )
+                            from services.mailing_send_log import record_mailing_send
                             from services.incoming_mail_worker import _upsert_convlink
 
-                            await _upsert_convlink(
+                            offer_link = (offer_effective_link(offer_sent) or "").strip()
+                            await record_mailing_send(
+                                session,
                                 user_id=int(db_user_id),
+                                offer_id=int(offer_sent.id),
+                                offer_email_id=int(tgt.id),
                                 inbox_email=(acc.email or "").strip().lower(),
-                                contact_email=to_addr.lower(),
-                                ad_url=offer_link,
-                                pinned_offer_id=int(offer_sent.id),
+                                to_email=to_addr.lower(),
+                                subject=subject,
+                                title_snapshot=offer_effective_title(offer_sent),
                             )
+                            await session.commit()
+                            if offer_link:
+                                await _upsert_convlink(
+                                    user_id=int(db_user_id),
+                                    inbox_email=(acc.email or "").strip().lower(),
+                                    contact_email=to_addr.lower(),
+                                    ad_url=offer_link,
+                                    pinned_offer_id=int(offer_sent.id),
+                                )
                         except Exception:
                             logger.exception(
-                                "convlink pin after send to=%s offer=%s",
+                                "mailing_send_log / convlink after send to=%s offer=%s",
                                 to_addr,
                                 getattr(offer_sent, "id", None),
                             )

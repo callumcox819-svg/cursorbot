@@ -832,6 +832,7 @@ async def resolve_offer_for_mail_card(
     user_id: int,
     from_email: str,
     resolved_offer_id: int | None = None,
+    resolved_offer_email_id: int | None = None,
     ad_url: str | None = None,
     inbox_email: str | None = None,
     subject: str = "",
@@ -867,6 +868,8 @@ async def resolve_offer_for_mail_card(
         from_name=from_name,
         body_text=body_text,
         stored_offer_id=stored_id,
+        inbox_email=inbox_email,
+        offer_email_id=resolved_offer_email_id,
     )
     if off:
         return off
@@ -952,6 +955,7 @@ async def mail_card_offer_meta(
     user_id: int,
     from_email: str,
     resolved_offer_id: int | None = None,
+    resolved_offer_email_id: int | None = None,
     ad_url: str | None = None,
     inbox_email: str | None = None,
     subject: str = "",
@@ -970,6 +974,7 @@ async def mail_card_offer_meta(
             user_id=int(user_id),
             from_email=from_email,
             resolved_offer_id=resolved_offer_id,
+            resolved_offer_email_id=resolved_offer_email_id,
             ad_url=ad_url,
             inbox_email=inbox_email,
             subject=subject,
@@ -1014,6 +1019,7 @@ async def build_mail_card_from_mail(
         user_id=int(mail.user_id),
         from_email=str(getattr(mail, "from_email", "") or ""),
         resolved_offer_id=getattr(mail, "resolved_offer_id", None),
+        resolved_offer_email_id=getattr(mail, "resolved_offer_email_id", None),
         ad_url=str(getattr(mail, "ad_url", "") or "").strip() or None,
         inbox_email=str(getattr(mail, "account_email", "") or ""),
         subject=str(getattr(mail, "subject", "") or ""),
@@ -1214,6 +1220,7 @@ async def _process_mails_for_account_impl(
                         from_name=from_name or "",
                         body_text=body_clean or "",
                         stored_offer_id=None,
+                        inbox_email=inbox_email_clean,
                     )
                     if off_mail:
                         resolved_offer_id = int(off_mail.id)
@@ -1377,6 +1384,7 @@ async def _process_mails_for_account_impl(
                         user_id=int(user_id),
                         from_email=from_email_clean,
                         resolved_offer_id=resolved_offer_id,
+                        resolved_offer_email_id=resolved_offer_email_id,
                         ad_url=(FULL_META.get((acc_id, uid_key), {}).get("ad_url") or ad_url or "").strip() or None,
                         inbox_email=inbox_email_clean,
                         subject=subject or "",
