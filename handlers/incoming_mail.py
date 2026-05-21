@@ -1424,9 +1424,11 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
                 diag = await diagnose_subject_match(
                     session, user_id=int(tg_user.id), subject=subj
                 )
+                words = diag.get("words") or []
+                w_hint = "+".join(words) if words else "—"
                 reasons.append(
-                    f"нет Offer в БД по теме «{subj_hint}» (всего лотов: {diag.get('total', 0)}, "
-                    f"похожих по слову: {diag.get('near', 0)})"
+                    f"нет Offer в БД по теме «{subj_hint}» (лотов: {diag.get('total', 0)}, "
+                    f"с словами {w_hint}: {diag.get('near', 0)})"
                 )
                 samples = diag.get("samples") or []
                 if samples:

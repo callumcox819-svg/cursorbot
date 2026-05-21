@@ -148,6 +148,7 @@ async def find_offer_by_incoming_subject(
     from difflib import SequenceMatcher
 
     from services.offer_matching import (
+        _fold_match_text,
         _subject_title_conflicts,
         _subject_tokens,
         list_offers_for_seller_name,
@@ -210,6 +211,28 @@ async def find_offer_by_incoming_subject(
 
     if best and best_key >= 50.0:
         return best
+
+    word_toks = [t for t in _subject_tokens(subj_norm) if len(t) >= 4]
+    all_rows = (
+        await session.execute(
+            sa_select(Offer)
+            .where(Offer.user_id == int(user_id))
+            .order_by(Offer.id.desc())
+            .limit(500)
+        )
+    ).scalars().all()
+    for off in all_rows:
+        title = offer_effective_title(off)
+        if not title or _subject_title_conflicts(subj_norm, title):
+            continue
+        tf = _fold_match_text(title)
+        if word_toks and not all(w in tf for w in word_toks):
+            continue
+        tc = _title_compact(title)
+        if tc and (tc == subj_compact or tc in subj_compact or subj_compact in tc):
+            return off
+        if word_toks and len(word_toks) >= 2:
+            return off
 
     # SQL-префильтр по первому слову темы (gabel, couch, …)
     word_toks = [t for t in _subject_tokens(subj_norm) if len(t) >= 4 and not t.isdigit()]
@@ -311,11 +334,12 @@ async def find_offer_by_subject_aggressive(
         return None
     subj_norm = normalized_reply_subject(subject)
     toks = [t for t in _subject_tokens(subj_norm) if len(t) >= 3]
-    if not toks:
+    word_toks = [t for t in toks if len(t) >= 4]
+    if not word_toks:
         return None
 
     stmt = sa_select(Offer).where(Offer.user_id == int(user_id))
-    for t in toks[:5]:
+    for t in word_toks[:4]:
         pat = f"%{t}%"
         stmt = stmt.where(
             sa_or(
@@ -328,7 +352,11 @@ async def find_offer_by_subject_aggressive(
         pool = await list_offers_for_seller_name(
             session, user_id=int(user_id), from_name=from_name
         )
-        rows = [o for o in pool if all(t in _fold_match_text(offer_effective_title(o)) for t in toks[:3])]
+        rows = [
+            o
+            for o in pool
+            if all(w in _fold_match_text(offer_effective_title(o)) for w in word_toks)
+        ]
 
     subj_c = _title_compact(subj_norm)
     best: Offer | None = None
@@ -338,8 +366,7 @@ async def find_offer_by_subject_aggressive(
         if not title or _subject_title_conflicts(subj_norm, title):
             continue
         tf = _fold_match_text(title)
-        hits = sum(1 for t in toks if t in tf)
-        if hits < max(2, len(toks) - 1):
+        if not all(w in tf for w in word_toks):
             continue
         tc = _title_compact(title)
         sc = float(hits) * 20.0
@@ -358,7 +385,7 @@ async def diagnose_subject_match(
     subject: str,
 ) -> dict[str, Any]:
     """Подсказка в ошибке: есть ли похожие лоты в БД."""
-    from services.offer_matching import normalized_reply_subject, _subject_tokens
+    from services.offer_matching import _fold_match_text, normalized_reply_subject, _subject_tokens
 
     total = (
         await session.execute(
@@ -366,24 +393,32 @@ async def diagnose_subject_match(
         )
     ).scalar() or 0
     subj_norm = normalized_reply_subject(subject)
-    toks = [t for t in _subject_tokens(subj_norm) if len(t) >= 4][:2]
+    word_toks = [t for t in _subject_tokens(subj_norm) if len(t) >= 4]
     near = 0
     samples: list[str] = []
-    if toks:
-        pat = f"%{toks[0]}%"
-        rows = (
-            await session.execute(
-                sa_select(Offer.title, Offer.link)
-                .where(Offer.user_id == int(user_id))
-                .where(func.lower(Offer.title).like(pat))
-                .order_by(Offer.id.desc())
-                .limit(5)
-            )
-        ).all()
-        near = len(rows)
-        for t, lk in rows:
-            samples.append((t or "—")[:50])
-    return {"total": int(total), "near": int(near), "samples": samples}
+    rows = (
+        await session.execute(
+            sa_select(Offer)
+            .where(Offer.user_id == int(user_id))
+            .order_by(Offer.id.desc())
+            .limit(500)
+        )
+    ).scalars().all()
+    for off in rows:
+        title = offer_effective_title(off)
+        if not title:
+            continue
+        tf = _fold_match_text(title)
+        if word_toks and all(w in tf for w in word_toks):
+            near += 1
+            if len(samples) < 3:
+                samples.append(title[:50])
+    return {
+        "total": int(total),
+        "near": int(near),
+        "samples": samples,
+        "words": word_toks[:4],
+    }
 
 
 async def find_offer_by_link(session, *, user_id: int, ad_url: str) -> Offer | None:
