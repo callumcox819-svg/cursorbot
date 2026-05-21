@@ -234,6 +234,7 @@ async def _upsert_convlink(
     ad_url: str | None = None,
     generated_link: str | None = None,
     tg_message_id: int | None = None,
+    pinned_offer_id: int | None = None,
 ) -> None:
     inbox = (inbox_email or "").strip().lower()
     contact = (contact_email or "").strip().lower()
@@ -255,8 +256,10 @@ async def _upsert_convlink(
                     user_id=int(user_id),
                     account_email=inbox,
                     from_email=contact,
+                    ad_url=(ad_url or None),
                     generated_link=(generated_link or None),
                     tg_message_id=int(tg_message_id) if tg_message_id is not None else None,
+                    pinned_offer_id=int(pinned_offer_id) if pinned_offer_id else None,
                 )
                 session.add(row)
             else:
@@ -264,9 +267,13 @@ async def _upsert_convlink(
                     row.ad_url = ad_url
                 if generated_link:
                     row.generated_link = generated_link
+                if pinned_offer_id:
+                    row.pinned_offer_id = int(pinned_offer_id)
                 # Запоминаем anchor message_id только если его ещё нет, либо если явно передали.
                 if tg_message_id is not None:
                     row.tg_message_id = int(tg_message_id)
+            if pinned_offer_id and row.pinned_offer_id is None:
+                row.pinned_offer_id = int(pinned_offer_id)
 
             await _db_commit_retry(session)
     except Exception:
@@ -1282,6 +1289,7 @@ async def _process_mails_for_account_impl(
                 inbox_email=_canon_email(inbox_email_clean),
                 contact_email=_canon_email(from_email_clean),
                 ad_url=(ad_url or None),
+                pinned_offer_id=int(resolved_offer_id) if resolved_offer_id else None,
             )
 
             conv = await _load_convlink(

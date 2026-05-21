@@ -115,6 +115,92 @@ def offer_effective_title(offer: Offer | None) -> str:
     )
 
 
+def _title_compact(s: str) -> str:
+    """Сравнение темы Re: и названия лота (umlauts, пробелы, /)."""
+    from services.offer_matching import _fold_de, _norm_subject
+
+    s = _fold_de(_norm_subject(s))
+    return re.sub(r"[\s\-–—/\\.,:;!?+|]+", "", s)
+
+
+async def find_offer_by_incoming_subject(
+    session,
+    *,
+    user_id: int,
+    subject: str,
+    from_name: str = "",
+) -> Offer | None:
+    """
+    Прямой матч темы ответа к Offer.title / raw_json (Re: «Gabel-Schlüssel 32 / 36»).
+    Нужен, когда продавец отвечает с реального Gmail, а в OfferEmail — валидированный адрес.
+    """
+    from difflib import SequenceMatcher
+
+    from services.offer_matching import (
+        _subject_title_conflicts,
+        list_offers_for_seller_name,
+        normalized_reply_subject,
+        subject_is_informative,
+    )
+
+    if not subject_is_informative(subject):
+        return None
+
+    subj_norm = normalized_reply_subject(subject)
+    subj_compact = _title_compact(subj_norm)
+    if len(subj_compact) < 8:
+        return None
+
+    name_offs: list[Offer] = []
+    if (from_name or "").strip():
+        name_offs = await list_offers_for_seller_name(
+            session, user_id=int(user_id), from_name=from_name
+        )
+    pool = name_offs if name_offs else (
+        await session.execute(
+            sa_select(Offer)
+            .where(Offer.user_id == int(user_id))
+            .order_by(Offer.id.desc())
+            .limit(1200)
+        )
+    ).scalars().all()
+
+    best: Offer | None = None
+    best_key = 0.0
+
+    for off in pool:
+        title = offer_effective_title(off)
+        if not title or _subject_title_conflicts(subj_norm, title):
+            continue
+        title_compact = _title_compact(title)
+        if not title_compact:
+            continue
+
+        score = 0.0
+        if subj_compact == title_compact:
+            score = 200.0
+        elif title_compact in subj_compact or subj_compact in title_compact:
+            score = 150.0 + min(len(title_compact), len(subj_compact)) * 0.1
+        else:
+            ratio = SequenceMatcher(None, subj_compact, title_compact).ratio()
+            if ratio < 0.72:
+                continue
+            score = 80.0 * ratio
+
+        subj_l = subj_norm.lower()
+        title_l = title.lower()
+        if subj_l in title_l or title_l in subj_l:
+            score += 40.0
+
+        if score > best_key:
+            best_key = score
+            best = off
+
+    if best and best_key >= 72.0:
+        return best
+    return None
+
+
 async def find_offer_by_link(session, *, user_id: int, ad_url: str) -> Offer | None:
     """Offer по ссылке объявления (нормализованный link_key)."""
     lk = link_key(ad_url)

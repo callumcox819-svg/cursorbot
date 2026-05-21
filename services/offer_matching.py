@@ -75,9 +75,23 @@ _SUBJECT_STOP = frozenset(
 )
 
 
+_SUBJECT_WORD_RE = re.compile(r"[^\W\d_]{3,}", flags=re.UNICODE)
+_SUBJECT_NUM_RE = re.compile(r"\d{2,}")
+
+
+def _fold_de(s: str) -> str:
+    return (s or "").lower().translate(str.maketrans("äöüß", "aeouss"))
+
+
 def _subject_tokens(subj: str) -> list[str]:
-    parts = re.findall(r"[a-z0-9]{3,}", _norm_subject(subj).lower())
-    return [p for p in parts if p not in _SUBJECT_STOP]
+    base = _fold_de(_norm_subject(subj))
+    parts = _SUBJECT_WORD_RE.findall(base)
+    nums = _SUBJECT_NUM_RE.findall(base)
+    out = [p for p in parts if p not in _SUBJECT_STOP]
+    for n in nums:
+        if n not in out:
+            out.append(n)
+    return out
 
 
 def _subject_significant_tokens(subj: str) -> list[str]:
@@ -824,6 +838,27 @@ async def resolve_offer_for_incoming_mail(
             title = offer_effective_title(only)
             if title and not _subject_title_conflicts(subj, title):
                 return only
+
+        from services.offer_storage import find_offer_by_incoming_subject
+
+        off_db = await find_offer_by_incoming_subject(
+            session,
+            user_id=int(user_id),
+            subject=subj,
+            from_name=from_name,
+        )
+        if off_db:
+            return off_db
+
+        off_tok = await resolve_offer_by_subject_tokens(
+            session,
+            user_id=int(user_id),
+            subject=subj,
+            candidate_offers=seller_offs or None,
+        )
+        if off_tok:
+            return off_tok
+
         return None
 
     oid, _ = await resolve_offer_for_incoming(
