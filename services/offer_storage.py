@@ -623,6 +623,134 @@ async def find_offer_by_incoming_signals(
     return best
 
 
+async def resolve_offer_from_saved_context(
+    session,
+    *,
+    user_id: int,
+    inbox_email: str,
+    contact_email: str,
+    subject: str = "",
+    from_name: str = "",
+    resolved_offer_id: int | None = None,
+    ad_url: str | None = None,
+) -> tuple[Offer | None, str]:
+    """
+    Уже сохранённый контекст: /send, pinned диалог, ad_url письма — без угадывания по 32 лотам.
+    """
+    from models import ConversationLink
+    from services.offer_matching import (
+        _canon_email,
+        _ratio,
+        offer_acceptable_for_subject,
+    )
+
+    def _pair(off: Offer | None, url: str) -> tuple[Offer | None, str]:
+        if not off:
+            return None, ""
+        u = (url or offer_effective_link(off) or "").strip()
+        if not u:
+            return None, ""
+        if subject and not offer_acceptable_for_subject(off, subject):
+            return None, ""
+        return off, u
+
+    if resolved_offer_id:
+        off = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.id == int(resolved_offer_id))
+                .where(Offer.user_id == int(user_id))
+                .limit(1)
+            )
+        ).scalars().first()
+        got = _pair(off, (ad_url or "").strip())
+        if got[0]:
+            return got
+
+    mail_url = (ad_url or "").strip()
+    if mail_url:
+        by_url = await find_offer_by_link(session, user_id=int(user_id), ad_url=mail_url)
+        got = _pair(by_url, mail_url)
+        if got[0]:
+            return got
+
+    inbox = _canon_email(inbox_email)
+    contact = _canon_email(contact_email)
+    if inbox and contact:
+        conv = (
+            await session.execute(
+                sa_select(ConversationLink)
+                .where(ConversationLink.user_id == int(user_id))
+                .where(func.lower(ConversationLink.account_email) == inbox)
+                .where(func.lower(ConversationLink.from_email) == contact)
+                .limit(1)
+            )
+        ).scalars().first()
+        if conv:
+            if getattr(conv, "pinned_offer_id", None):
+                off = (
+                    await session.execute(
+                        sa_select(Offer)
+                        .where(Offer.id == int(conv.pinned_offer_id))
+                        .where(Offer.user_id == int(user_id))
+                        .limit(1)
+                    )
+                ).scalars().first()
+                got = _pair(off, (conv.ad_url or "").strip())
+                if got[0]:
+                    return got
+            if (conv.ad_url or "").strip():
+                cu = (conv.ad_url or "").strip()
+                by_url = await find_offer_by_link(session, user_id=int(user_id), ad_url=cu)
+                got = _pair(by_url, cu)
+                if got[0]:
+                    return got
+
+        fn = (from_name or "").strip().lower()
+        if fn:
+            conv_rows = (
+                await session.execute(
+                    sa_select(ConversationLink)
+                    .where(ConversationLink.user_id == int(user_id))
+                    .where(func.lower(ConversationLink.account_email) == inbox)
+                    .where(ConversationLink.pinned_offer_id.is_not(None))
+                    .order_by(ConversationLink.id.desc())
+                    .limit(20)
+                )
+            ).scalars().all()
+            for conv in conv_rows:
+                off = (
+                    await session.execute(
+                        sa_select(Offer)
+                        .where(Offer.id == int(conv.pinned_offer_id))
+                        .where(Offer.user_id == int(user_id))
+                        .limit(1)
+                    )
+                ).scalars().first()
+                if not off:
+                    continue
+                pn = (off.person_name or "").strip().lower()
+                if pn and (_ratio(fn, pn) >= 0.72 or fn in pn or pn in fn):
+                    got = _pair(off, (conv.ad_url or "").strip())
+                    if got[0]:
+                        return got
+
+    from services.mailing_send_log import find_offer_by_mailing_log
+
+    off_log = await find_offer_by_mailing_log(
+        session,
+        user_id=int(user_id),
+        inbox_email=inbox_email,
+        subject=subject,
+        from_email=contact_email,
+        from_name=from_name,
+    )
+    if off_log:
+        return _pair(off_log, offer_effective_link(off_log) or "")
+
+    return None, ""
+
+
 async def find_offer_by_link(session, *, user_id: int, ad_url: str) -> Offer | None:
     """Offer по ссылке объявления (нормализованный link_key)."""
     lk = link_key(ad_url)

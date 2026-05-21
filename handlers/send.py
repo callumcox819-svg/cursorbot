@@ -618,21 +618,25 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                             from services.incoming_mail_worker import _upsert_convlink
 
                             offer_link = (offer_effective_link(offer_sent) or "").strip()
+                            from services.offer_matching import _canon_email
+
+                            inbox_c = _canon_email(acc.email or "")
+                            contact_c = _canon_email(to_addr)
                             await record_mailing_send(
                                 session,
                                 user_id=int(db_user_id),
                                 offer_id=int(offer_sent.id),
                                 offer_email_id=int(tgt.id),
-                                inbox_email=(acc.email or "").strip().lower(),
-                                to_email=to_addr.lower(),
+                                inbox_email=inbox_c,
+                                to_email=contact_c,
                                 subject=subject,
                                 title_snapshot=offer_effective_title(offer_sent),
                             )
                             if offer_link:
                                 await _upsert_convlink(
                                     user_id=int(db_user_id),
-                                    inbox_email=(acc.email or "").strip().lower(),
-                                    contact_email=to_addr.lower(),
+                                    inbox_email=inbox_c,
+                                    contact_email=contact_c,
                                     ad_url=offer_link,
                                     pinned_offer_id=int(offer_sent.id),
                                 )

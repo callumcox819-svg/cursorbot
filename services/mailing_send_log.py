@@ -6,6 +6,8 @@ from sqlalchemy import func, select as sa_select
 
 from models import MailingSend, Offer
 from services.offer_matching import (
+    _canon_email,
+    _ratio,
     normalized_reply_subject,
     offer_matches_incoming_subject,
     subject_is_informative,
@@ -29,8 +31,8 @@ async def record_mailing_send(
         user_id=int(user_id),
         offer_id=int(offer_id),
         offer_email_id=int(offer_email_id) if offer_email_id else None,
-        inbox_email=(inbox_email or "").strip().lower(),
-        to_email=(to_email or "").strip().lower(),
+        inbox_email=_canon_email(inbox_email),
+        to_email=_canon_email(to_email),
         subject=(subject or "").strip() or None,
         title_snapshot=(title_snapshot or "").strip() or None,
     )
@@ -44,6 +46,7 @@ async def find_offer_by_mailing_log(
     inbox_email: str,
     subject: str,
     from_email: str = "",
+    from_name: str = "",
 ) -> Offer | None:
     """
     Лот по факту рассылки: с какого ящика, какая тема, какой offer_id ушёл на to_email.
@@ -55,7 +58,8 @@ async def find_offer_by_mailing_log(
 
     subj_norm = normalized_reply_subject(subject)
     subj_c = _title_compact(subj_norm) if subj_norm else ""
-    contact = (from_email or "").strip().lower()
+    contact = _canon_email(from_email)
+    fn = (from_name or "").strip().lower()
     subj_strong = subject_is_informative(subject)
 
     rows = (
@@ -83,13 +87,9 @@ async def find_offer_by_mailing_log(
             rank += 200
         elif title_match:
             rank += 150
-        if subj_strong:
-            if rank < 150:
-                continue
-        elif contact and (row.to_email or "").strip().lower() == contact:
-            rank += 50
-        if rank <= 0:
-            continue
+        row_to = _canon_email(row.to_email or "")
+        if contact and row_to == contact:
+            rank += 80
         off = (
             await session.execute(
                 sa_select(Offer)
@@ -100,10 +100,34 @@ async def find_offer_by_mailing_log(
         ).scalars().first()
         if not off:
             continue
+        snap = (row.title_snapshot or "").strip()
+        if snap and subj_norm and not _subject_title_conflicts(subject, snap):
+            sc = _title_compact(snap)
+            if sc and (sc == subj_c or sc in subj_c or subj_c in sc):
+                rank += 190
+        pn = (off.person_name or "").strip().lower()
+        if fn and pn and (_ratio(fn, pn) >= 0.72 or fn in pn or pn in fn):
+            rank += 70
+        if subj_strong:
+            if rank < 120:
+                continue
+        elif rank <= 0:
+            continue
         lot_title = offer_effective_title(off)
         if lot_title and _subject_title_conflicts(subject, lot_title):
             continue
-        if subj_strong and not offer_matches_incoming_subject(off, subject):
+        snap_ok = bool(
+            snap
+            and subj_norm
+            and not _subject_title_conflicts(subject, snap)
+            and _title_compact(snap)
+            and (
+                _title_compact(snap) == subj_c
+                or _title_compact(snap) in subj_c
+                or subj_c in _title_compact(snap)
+            )
+        )
+        if subj_strong and not snap_ok and not offer_matches_incoming_subject(off, subject):
             continue
         if rank > best_rank:
             best_rank = rank

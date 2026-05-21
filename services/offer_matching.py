@@ -1006,6 +1006,7 @@ async def resolve_offer_for_incoming_mail(
             inbox_email=inbox_email or "",
             subject=subj,
             from_email=from_email,
+            from_name=from_name,
         )
         if _incoming_offer_ok(off_log):
             return off_log
@@ -1239,7 +1240,20 @@ async def resolve_offer_for_aqua_link(
 ) -> tuple[Offer | None, str]:
     """Оффер + ad_url для «Создать ссылку» (AQUA/GAG) — без битых kwargs в global-поиске."""
     from services.incoming_mail_worker import resolve_offer_for_mail_card
-    from services.offer_storage import find_offer_by_link
+    from services.offer_storage import find_offer_by_link, resolve_offer_from_saved_context
+
+    off, url = await resolve_offer_from_saved_context(
+        session,
+        user_id=int(user_id),
+        inbox_email=inbox_email or "",
+        contact_email=from_email,
+        subject=subject,
+        from_name=from_name,
+        resolved_offer_id=resolved_offer_id,
+        ad_url=ad_url,
+    )
+    if off and url:
+        return off, url
 
     off = await resolve_offer_for_mail_card(
         session,
