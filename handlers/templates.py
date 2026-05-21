@@ -160,17 +160,12 @@ async def save_smart_texts(tg_id: int, texts: List[str]) -> None:
 
 
 async def _mailing_text_pool(tg_id: int) -> List[str]:
-    """Умные пресеты + тексты из пресетов с названием (как в подсказке UI)."""
-    pool = list(await load_smart_texts(int(tg_id)))
-    for it in await load_templates(int(tg_id)):
-        body = (it.text or "").strip()
-        if body:
-            pool.append(body)
-    return pool
+    """Только 📄 Умные пресеты (рассылка /send и тест-почта). 🧾 Пресеты — для ответа на письмо."""
+    return list(await load_smart_texts(int(tg_id)))
 
 
 async def pick_random_smart_preset(tg_id: int, offer_title: str) -> str:
-    """Случайный текст: пресет → спинтакс {a|b} → OFFER = название товара."""
+    """Случайный умный пресет: спинтакс {a|b} → OFFER = название товара."""
     import random
 
     from services.offer_text import apply_offer_to_text

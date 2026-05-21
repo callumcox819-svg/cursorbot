@@ -157,6 +157,9 @@ async def _pick_send_context(tg_id: int) -> tuple[int, EmailAccount, str, str, s
         body = await pick_random_first_sms(tg_id, offer_title)
     if not (body or "").strip():
         return None
+    from services.text_ascii import fold_plain_mail_text
+
+    body = fold_plain_mail_text(body)
 
     account = random.choice(accs)
     return user_id, account, subject, body, offer_title

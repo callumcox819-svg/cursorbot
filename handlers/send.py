@@ -213,6 +213,9 @@ async def _build_message_for_target(session: AsyncSession, tg_user_id: int, tgt:
             base_text = ("Hello! Is this item still available? " + (item_title or "OFFER")).strip()
 
     body = apply_placeholders(base_text, link=link, ctx=ctx)
+    from services.text_ascii import fold_plain_mail_text
+
+    body = fold_plain_mail_text(body)
 
     # ==========================
     # Тема письма (глобально OFFER из config)

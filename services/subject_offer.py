@@ -32,4 +32,7 @@ def render_subject_with_offer(subject_template: str, offer_title: str) -> str:
 
 
 def subject_for_offer(offer_title: str) -> str:
-    return render_subject_with_offer(global_subject_template(), offer_title)
+    from services.text_ascii import fold_plain_mail_text
+
+    subj = render_subject_with_offer(global_subject_template(), offer_title)
+    return fold_plain_mail_text(subj)
