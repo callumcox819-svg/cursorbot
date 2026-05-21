@@ -115,6 +115,17 @@ def offer_effective_title(offer: Offer | None) -> str:
     )
 
 
+def offer_effective_link(offer: Offer | None) -> str:
+    """Ссылка объявления: Offer.link, иначе item_link/link из raw_json."""
+    if not offer:
+        return ""
+    lk = str(getattr(offer, "link", None) or "").strip()
+    if lk:
+        return lk
+    raw = parse_offer_raw(getattr(offer, "raw_json", None))
+    return _first_raw_str(raw, ("item_link", "link", "url", "ad_url"))
+
+
 def _title_compact(s: str) -> str:
     """Сравнение темы Re: и названия лота (umlauts, пробелы, /)."""
     from services.offer_matching import _fold_de, _norm_subject
@@ -277,6 +288,102 @@ async def find_offer_by_inbox_pinned_subject(
         if tc and (tc == subj_c or tc in subj_c or subj_c in tc):
             return off
     return None
+
+
+async def find_offer_by_subject_aggressive(
+    session,
+    *,
+    user_id: int,
+    subject: str,
+    from_name: str = "",
+) -> Offer | None:
+    """Жёсткий поиск: все значимые слова темы должны быть в title или raw_json."""
+    from services.offer_matching import (
+        _fold_match_text,
+        _subject_title_conflicts,
+        _subject_tokens,
+        list_offers_for_seller_name,
+        normalized_reply_subject,
+        subject_is_informative,
+    )
+
+    if not subject_is_informative(subject):
+        return None
+    subj_norm = normalized_reply_subject(subject)
+    toks = [t for t in _subject_tokens(subj_norm) if len(t) >= 3]
+    if not toks:
+        return None
+
+    stmt = sa_select(Offer).where(Offer.user_id == int(user_id))
+    for t in toks[:5]:
+        pat = f"%{t}%"
+        stmt = stmt.where(
+            sa_or(
+                func.lower(Offer.title).like(pat),
+                func.lower(Offer.raw_json).like(pat),
+            )
+        )
+    rows = (await session.execute(stmt.order_by(Offer.id.desc()).limit(15))).scalars().all()
+    if not rows and (from_name or "").strip():
+        pool = await list_offers_for_seller_name(
+            session, user_id=int(user_id), from_name=from_name
+        )
+        rows = [o for o in pool if all(t in _fold_match_text(offer_effective_title(o)) for t in toks[:3])]
+
+    subj_c = _title_compact(subj_norm)
+    best: Offer | None = None
+    best_sc = 0.0
+    for off in rows:
+        title = offer_effective_title(off)
+        if not title or _subject_title_conflicts(subj_norm, title):
+            continue
+        tf = _fold_match_text(title)
+        hits = sum(1 for t in toks if t in tf)
+        if hits < max(2, len(toks) - 1):
+            continue
+        tc = _title_compact(title)
+        sc = float(hits) * 20.0
+        if tc and (tc == subj_c or tc in subj_c or subj_c in tc):
+            sc += 100.0
+        if sc > best_sc:
+            best_sc = sc
+            best = off
+    return best
+
+
+async def diagnose_subject_match(
+    session,
+    *,
+    user_id: int,
+    subject: str,
+) -> dict[str, Any]:
+    """Подсказка в ошибке: есть ли похожие лоты в БД."""
+    from services.offer_matching import normalized_reply_subject, _subject_tokens
+
+    total = (
+        await session.execute(
+            sa_select(func.count(Offer.id)).where(Offer.user_id == int(user_id))
+        )
+    ).scalar() or 0
+    subj_norm = normalized_reply_subject(subject)
+    toks = [t for t in _subject_tokens(subj_norm) if len(t) >= 4][:2]
+    near = 0
+    samples: list[str] = []
+    if toks:
+        pat = f"%{toks[0]}%"
+        rows = (
+            await session.execute(
+                sa_select(Offer.title, Offer.link)
+                .where(Offer.user_id == int(user_id))
+                .where(func.lower(Offer.title).like(pat))
+                .order_by(Offer.id.desc())
+                .limit(5)
+            )
+        ).all()
+        near = len(rows)
+        for t, lk in rows:
+            samples.append((t or "—")[:50])
+    return {"total": int(total), "near": int(near), "samples": samples}
 
 
 async def find_offer_by_link(session, *, user_id: int, ad_url: str) -> Offer | None:

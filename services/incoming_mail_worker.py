@@ -894,6 +894,17 @@ async def resolve_offer_for_mail_card(
         if off:
             return off
 
+    from services.offer_storage import find_offer_by_subject_aggressive
+
+    off = await find_offer_by_subject_aggressive(
+        session,
+        user_id=int(user_id),
+        subject=subject,
+        from_name=from_name,
+    )
+    if off:
+        return off
+
     from services.offer_matching import _subject_title_conflicts, subject_is_informative
     from services.offer_storage import offer_effective_title
 
@@ -1290,16 +1301,18 @@ async def _process_mails_for_account_impl(
             if (not ad_url) and resolved_offer_id:
                 try:
                     async with _imap_db_session() as session:
-                        off_link = (
+                        from services.offer_storage import offer_effective_link
+
+                        off_row = (
                             await session.execute(
-                                sa_select(Offer.link)
+                                sa_select(Offer)
                                 .where(Offer.id == int(resolved_offer_id))
                                 .where(Offer.user_id == int(user_id))
                                 .limit(1)
                             )
-                        ).scalar_one_or_none()
-                        if off_link:
-                            ad_url = (off_link or "").strip()
+                        ).scalars().first()
+                        if off_row:
+                            ad_url = (offer_effective_link(off_row) or "").strip()
                 except Exception:
                     logger.exception("Failed to load Offer.link for resolved_offer_id=%s", resolved_offer_id)
 

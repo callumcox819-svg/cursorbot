@@ -864,6 +864,17 @@ async def resolve_offer_for_incoming_mail(
         if off_tok:
             return off_tok
 
+        from services.offer_storage import find_offer_by_subject_aggressive
+
+        off_agg = await find_offer_by_subject_aggressive(
+            session,
+            user_id=int(user_id),
+            subject=subj,
+            from_name=from_name,
+        )
+        if off_agg:
+            return off_agg
+
         return None
 
     oid, _ = await resolve_offer_for_incoming(
@@ -894,6 +905,8 @@ async def offer_link_for_seller(
     subject: str = "",
 ) -> str | None:
     """Offer.link по email; при информативной теме — матч по теме или один лот продавца."""
+    from services.offer_storage import offer_effective_link
+
     if subject_is_informative(subject):
         off = await resolve_best_offer_by_subject(
             session,
@@ -901,16 +914,16 @@ async def offer_link_for_seller(
             from_email=from_email,
             subject=subject,
         )
-        if off and (off.link or "").strip():
-            return str(off.link).strip()
+        if off and offer_effective_link(off):
+            return offer_effective_link(off)
         off = await resolve_best_offer_by_subject_global(
             session,
             user_id=int(user_id),
             subject=subject,
             from_email=from_email,
         )
-        if off and (off.link or "").strip():
-            return str(off.link).strip()
+        if off and offer_effective_link(off):
+            return offer_effective_link(off)
         seller_offers = await list_offers_for_seller_email(
             session, user_id=int(user_id), from_email=from_email
         )
@@ -918,14 +931,14 @@ async def offer_link_for_seller(
             picked = _pick_best_offer_by_subject_scores(
                 seller_offers, subject=subject, min_score=32.0
             )
-            if picked and (picked.link or "").strip():
-                return str(picked.link).strip()
-        if len(seller_offers) == 1 and (seller_offers[0].link or "").strip():
+            if picked and offer_effective_link(picked):
+                return offer_effective_link(picked)
+        if len(seller_offers) == 1 and offer_effective_link(seller_offers[0]):
             from services.offer_storage import offer_effective_title
 
             title = offer_effective_title(seller_offers[0])
             if not title or not _subject_title_conflicts(subject, title):
-                return str(seller_offers[0].link).strip()
+                return offer_effective_link(seller_offers[0])
 
     if not user_id or not from_email or "@" not in from_email:
         return None
@@ -978,7 +991,9 @@ async def resolve_offer_for_aqua_link(
         from_name=from_name,
         body_text=body_text,
     )
-    url = (off.link or "").strip() if off else ""
+    from services.offer_storage import offer_effective_link
+
+    url = offer_effective_link(off) if off else ""
     if not url:
         url = (
             await offer_link_for_seller(
@@ -991,4 +1006,6 @@ async def resolve_offer_for_aqua_link(
         ).strip()
         if url and not off:
             off = await find_offer_by_link(session, user_id=int(user_id), ad_url=url)
+    if off and not url:
+        url = offer_effective_link(off)
     return off, url

@@ -695,6 +695,10 @@ def _e(s: str) -> str:
     return html.escape(s or "", quote=False)
 
 
+def _deploy_build_id() -> str:
+    return (os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("GIT_COMMIT") or "local")[:8]
+
+
 def _format_aqua_link_error(err: BaseException) -> str:
     msg = str(err).strip()
     low = msg.lower()
@@ -1409,10 +1413,27 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
         reasons: list[str] = []
         if not url:
             subj_hint = (subj or "")[:120]
-            reasons.append(
-                f"нет Offer в БД по теме «{subj_hint}» и email продавца — "
-                "проверьте, что JSON с этим лотом загружен и валидирован (email 42/79)"
-            )
+            if offer:
+                reasons.append(
+                    f"лот найден (id {offer.id}), но нет ссылки item_link в БД — "
+                    "перезалейте JSON с полем item_link"
+                )
+            else:
+                from services.offer_storage import diagnose_subject_match
+
+                diag = await diagnose_subject_match(
+                    session, user_id=int(tg_user.id), subject=subj
+                )
+                reasons.append(
+                    f"нет Offer в БД по теме «{subj_hint}» (всего лотов: {diag.get('total', 0)}, "
+                    f"похожих по слову: {diag.get('near', 0)})"
+                )
+                samples = diag.get("samples") or []
+                if samples:
+                    reasons.append("похожие названия: " + "; ".join(samples[:3]))
+                reasons.append(
+                    "загрузите JSON с этим лотом и прогоните валидацию (email 42/79)"
+                )
 
         if not url:
             reason_text = "\n".join([f"• { _e(r) }" for r in (reasons or ["не удалось получить ссылку из БД"])])
@@ -1422,7 +1443,8 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
                 f"<b>inbox:</b> <code>{_e(inbox_email) or '—'}</code>\n\n"
                 "<b>Причины:</b>\n"
                 f"{reason_text}\n\n"
-                "По ТЗ ссылка берётся только из БД (Offer/OfferEmail/ConversationLink).",
+                "По ТЗ ссылка берётся только из БД (Offer/OfferEmail/ConversationLink).\n"
+                f"<i>build {(_deploy_build_id())}</i>",
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
