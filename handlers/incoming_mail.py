@@ -1443,12 +1443,46 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
                 samples = diag.get("samples") or []
                 if samples:
                     reasons.append("похожие названия: " + "; ".join(samples[:3]))
+                log_rows = (
+                    await session.execute(
+                        sa_select(MailingSend)
+                        .where(MailingSend.user_id == int(tg_user.id))
+                        .where(func.lower(MailingSend.inbox_email) == inbox_email)
+                        .order_by(MailingSend.id.desc())
+                        .limit(5)
+                    )
+                ).scalars().all()
+                if log_rows:
+                    bits = []
+                    for lr in log_rows[:3]:
+                        bits.append(
+                            f"to={_e((lr.to_email or '')[:40])} subj={_e((lr.subject or '')[:35])} "
+                            f"snap={_e((lr.title_snapshot or '')[:35])} offer_id={lr.offer_id}"
+                        )
+                    reasons.append("журнал /send: " + " | ".join(bits))
+                else:
+                    reasons.append(
+                        f"журнал рассылки с ящика {inbox_email or '—'}: 0 записей "
+                        "(сделайте /send на caroline.osmonaj@icloud.com с темой Porte bébé)"
+                    )
+                conv_hint = (
+                    await session.execute(
+                        sa_select(ConversationLink)
+                        .where(ConversationLink.user_id == int(tg_user.id))
+                        .where(func.lower(ConversationLink.from_email) == contact_email)
+                        .limit(3)
+                    )
+                ).scalars().all()
+                if conv_hint:
+                    reasons.append(
+                        "conv: "
+                        + " | ".join(
+                            f"pin={c.pinned_offer_id} ad={'да' if c.ad_url else 'нет'}"
+                            for c in conv_hint
+                        )
+                    )
                 reasons.append(
-                    f"журнал рассылки с ящика {inbox_email or '—'}: {int(mail_log_n)} записей "
-                    "(нужна хотя бы одна /send после деплоя — пишем offer_id+тему)"
-                )
-                reasons.append(
-                    "или загрузите JSON с этим лотом и прогоните валидацию"
+                    "или загрузите JSON с лотом Porte bébé + валидация + /send с той же темой"
                 )
 
         if not url:

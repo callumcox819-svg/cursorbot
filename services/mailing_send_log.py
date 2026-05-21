@@ -52,7 +52,7 @@ async def find_offer_by_mailing_log(
     Лот по факту рассылки: с какого ящика, какая тема, какой offer_id ушёл на to_email.
     Работает, когда продавец отвечает с другого Gmail, чем валидированный адрес.
     """
-    inbox = (inbox_email or "").strip().lower()
+    inbox = _canon_email(inbox_email)
     if not inbox:
         return None
 
@@ -61,7 +61,6 @@ async def find_offer_by_mailing_log(
     contact = _canon_email(from_email)
     fn = (from_name or "").strip().lower()
     subj_strong = subject_is_informative(subject)
-
     rows = (
         await session.execute(
             sa_select(MailingSend)
@@ -71,6 +70,46 @@ async def find_offer_by_mailing_log(
             .limit(300)
         )
     ).scalars().all()
+
+    # Писали на этот же адрес, с которого пришёл ответ — берём offer_id из журнала /send.
+    if contact:
+        contact_rows = [r for r in rows if _canon_email(r.to_email or "") == contact]
+        if len(contact_rows) == 1:
+            row = contact_rows[0]
+            off = (
+                await session.execute(
+                    sa_select(Offer)
+                    .where(Offer.id == int(row.offer_id))
+                    .where(Offer.user_id == int(user_id))
+                    .limit(1)
+                )
+            ).scalars().first()
+            if off and offer_effective_link(off):
+                snap = (row.title_snapshot or offer_effective_title(off) or "").strip()
+                if not snap or not _subject_title_conflicts(subject, snap):
+                    return off
+                subj_c = _title_compact(subj_norm) if subj_norm else ""
+                sc = _title_compact(snap)
+                if sc and subj_c and (sc == subj_c or sc in subj_c or subj_c in sc):
+                    return off
+        elif len(contact_rows) > 1:
+            subj_c = _title_compact(subj_norm) if subj_norm else ""
+            for row in contact_rows:
+                snap = (row.title_snapshot or "").strip()
+                if not snap or not subj_norm:
+                    continue
+                sc = _title_compact(snap)
+                if sc and subj_c and (sc == subj_c or sc in subj_c or subj_c in sc):
+                    off = (
+                        await session.execute(
+                            sa_select(Offer)
+                            .where(Offer.id == int(row.offer_id))
+                            .where(Offer.user_id == int(user_id))
+                            .limit(1)
+                        )
+                    ).scalars().first()
+                    if off and offer_effective_link(off):
+                        return off
 
     best: Offer | None = None
     best_rank = -1

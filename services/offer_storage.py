@@ -644,13 +644,15 @@ async def resolve_offer_from_saved_context(
         offer_acceptable_for_subject,
     )
 
-    def _pair(off: Offer | None, url: str) -> tuple[Offer | None, str]:
+    def _pair_saved(off: Offer | None, url: str) -> tuple[Offer | None, str]:
+        """Pin / журнал /send — доверяем сохранённому offer_id, не перескориваем по 32 лотам."""
         if not off:
             return None, ""
         u = (url or offer_effective_link(off) or "").strip()
         if not u:
             return None, ""
-        if subject and not offer_acceptable_for_subject(off, subject):
+        title = offer_effective_title(off)
+        if subject and title and _subject_title_conflicts(subject, title):
             return None, ""
         return off, u
 
@@ -663,14 +665,14 @@ async def resolve_offer_from_saved_context(
                 .limit(1)
             )
         ).scalars().first()
-        got = _pair(off, (ad_url or "").strip())
+        got = _pair_saved(off, (ad_url or "").strip())
         if got[0]:
             return got
 
     mail_url = (ad_url or "").strip()
     if mail_url:
         by_url = await find_offer_by_link(session, user_id=int(user_id), ad_url=mail_url)
-        got = _pair(by_url, mail_url)
+        got = _pair_saved(by_url, mail_url)
         if got[0]:
             return got
 
@@ -696,13 +698,13 @@ async def resolve_offer_from_saved_context(
                         .limit(1)
                     )
                 ).scalars().first()
-                got = _pair(off, (conv.ad_url or "").strip())
+                got = _pair_saved(off, (conv.ad_url or "").strip())
                 if got[0]:
                     return got
             if (conv.ad_url or "").strip():
                 cu = (conv.ad_url or "").strip()
                 by_url = await find_offer_by_link(session, user_id=int(user_id), ad_url=cu)
-                got = _pair(by_url, cu)
+                got = _pair_saved(by_url, cu)
                 if got[0]:
                     return got
 
@@ -731,7 +733,7 @@ async def resolve_offer_from_saved_context(
                     continue
                 pn = (off.person_name or "").strip().lower()
                 if pn and (_ratio(fn, pn) >= 0.72 or fn in pn or pn in fn):
-                    got = _pair(off, (conv.ad_url or "").strip())
+                    got = _pair_saved(off, (conv.ad_url or "").strip())
                     if got[0]:
                         return got
 
@@ -746,7 +748,7 @@ async def resolve_offer_from_saved_context(
         from_name=from_name,
     )
     if off_log:
-        return _pair(off_log, offer_effective_link(off_log) or "")
+        return _pair_saved(off_log, offer_effective_link(off_log) or "")
 
     return None, ""
 
