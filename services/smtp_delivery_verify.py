@@ -83,20 +83,13 @@ def verify_message_in_sent_sync(
     if not email or not pwd:
         return False, "Нет email/пароля для IMAP-проверки"
 
-    domain = email.rsplit("@", 1)[-1].lower()
-    _imap = {
-        "gmail.com": "imap.gmail.com",
-        "googlemail.com": "imap.gmail.com",
-        "gmx.com": "imap.gmx.com",
-        "gmx.net": "imap.gmx.com",
-        "gmx.de": "imap.gmx.net",
-        "web.de": "imap.web.de",
-        "icloud.com": "imap.mail.me.com",
-        "outlook.com": "outlook.office365.com",
-        "hotmail.com": "outlook.office365.com",
-        "live.com": "outlook.office365.com",
-    }
-    host = _imap.get(domain, f"imap.{domain}")
+    try:
+        from services.mail_providers import imap_host_port
+
+        host, _port = imap_host_port(email, "")
+    except ValueError:
+        domain = email.rsplit("@", 1)[-1].lower()
+        host = f"imap.{domain}"
     M: imaplib.IMAP4_SSL | None = None
     try:
         M = imaplib.IMAP4_SSL(host, 993)

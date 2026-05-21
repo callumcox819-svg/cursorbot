@@ -52,6 +52,12 @@ def _looks_like_html(body: str) -> bool:
 
 
 def _smtp_host_port(provider: str, email: str) -> tuple[str, int]:
+    try:
+        from services.mail_providers import smtp_host_port
+
+        return smtp_host_port(email or "", provider or "")
+    except ValueError:
+        pass
     p = (provider or "").strip().lower()
     if p in SMTP_BY_PROVIDER:
         return SMTP_BY_PROVIDER[p]

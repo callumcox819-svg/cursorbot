@@ -53,14 +53,6 @@ class AccountsQuickGmailStates(StatesGroup):
 # Helpers
 # ===========================
 
-IMAP_SERVERS: dict[str, Tuple[str, str]] = {
-    "gmail.com": ("imap.gmail.com", "gmail"),
-    "googlemail.com": ("imap.gmail.com", "gmail"),
-    "gmx.com": ("imap.gmx.com", "gmx"),
-    "gmx.net": ("imap.gmx.com", "gmx"),
-    "icloud.com": ("imap.mail.me.com", "icloud"),
-}
-
 PAGE_SIZE = 10  # как на скрине
 
 async def get_user(session: Session, telegram_id: int) -> Optional[User]:
@@ -68,13 +60,9 @@ async def get_user(session: Session, telegram_id: int) -> Optional[User]:
     return result.scalar_one_or_none()
 
 def detect_imap_server(email: str) -> Tuple[str, str]:
-    match = re.search(r"@([^@]+)$", email)
-    if not match:
-        raise ValueError("Некорректный email")
-    domain = match.group(1).lower()
-    if domain in IMAP_SERVERS:
-        return IMAP_SERVERS[domain]
-    raise ValueError(f"Неизвестный домен: {domain}")
+    from services.mail_providers import detect_imap_server as _detect
+
+    return _detect(email)
 
 def check_imap_credentials(email: str, password: str) -> Tuple[bool, Optional[str], Optional[str]]:
     try:
@@ -218,6 +206,8 @@ async def _bulk_add_accounts(
         if not res.ok:
             fail_count += 1
             err_txt = _e(res.err or ("ошибка IMAP" if gmail_only else "ошибка при входе"))
+            if (res.provider or "") == "gmx":
+                err_txt += " · проверьте пароль и что в GMX включён IMAP (POP3/IMAP)"
             details.append(f"❌ <code>{_e(res.work.email)}</code> — {err_txt}")
         else:
             work = res.work
@@ -363,8 +353,8 @@ async def render_accounts_menu(message_or_cb, telegram_id: int, page: int = 1, s
         text = (
             "📬 <b>Почтовые аккаунты</b>\n\n"
             "У тебя пока нет добавленных аккаунтов.\n"
-            "Формат для импорта: <code>email:app_password</code> (APP PASSWORD).\n"
-            "Поддерживаются: Gmail, iCloud, GMX."
+            "Формат: <code>email:пароль</code> (каждый с новой строки).\n"
+            "Gmail/iCloud — пароль приложения; GMX — обычный пароль (IMAP в настройках GMX)."
         )
 
     kb = accounts_menu_kb(page_accounts, page, total_pages, status_filter)
@@ -789,10 +779,12 @@ async def start_add_accounts(callback: CallbackQuery, state: FSMContext) -> None
     await state.set_state(AccountsAddStates.waiting_for_accounts_input)
     text = (
         "Введи список почтовых аккаунтов в формате:\n"
-        "<code>email:app_password</code>\n\n"
+        "<code>email:пароль</code>\n\n"
         "Каждый аккаунт — с новой строки.\n"
-        "Поддерживаются: Gmail, iCloud, GMX.\n\n"
-        "<b>app_password</b> = APP PASSWORD (пароль приложения IMAP/SMTP)."
+        "<b>Gmail / iCloud</b> — пароль приложения (App Password).\n"
+        "<b>GMX</b> (gmx.de, gmx.ch, gmx.com, gmx.net…) — обычный пароль; "
+        "в веб-почте GMX: Настройки → POP3/IMAP → включить IMAP.\n\n"
+        "При добавлении проверяется вход по IMAP (логин + пароль)."
     )
     await callback.message.edit_text(text, parse_mode="HTML")
     await callback.answer()

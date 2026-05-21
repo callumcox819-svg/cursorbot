@@ -303,13 +303,11 @@ async def _load_convlink(
 
 
 def _imap_connect(provider: str, email_addr: str) -> tuple[str, int]:
-    """Хост IMAP по домену (как при добавлении аккаунта в handlers/accounts.py)."""
+    """Хост IMAP по домену (как при добавлении аккаунта)."""
     try:
-        from handlers.accounts import detect_imap_server
+        from services.mail_providers import imap_host_port
 
-        host, _prov = detect_imap_server((email_addr or "").strip())
-        if host:
-            return host, 993
+        return imap_host_port((email_addr or "").strip(), provider or "")
     except Exception:
         pass
     p = (provider or "").strip().lower()
