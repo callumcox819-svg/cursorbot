@@ -74,6 +74,30 @@ _SUBJECT_STOP = frozenset(
     }
 )
 
+# Разные категории товара в теме и в названии лота (Sofa vs Télévision samsung).
+_PRODUCT_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"sofa", "couch", "sectional", "divan", "canape", "canapee", "ecksofa", "sessel"}),
+    frozenset({"tv", "fernseher", "television", "televisor", "monitor", "bildschirm"}),
+    frozenset({"bike", "fahrrad", "velo", "bicycle", "ebike", "e-bike"}),
+    frozenset({"table", "tisch", "desk", "schreibtisch"}),
+    frozenset({"chair", "stuhl", "stuhle", "stuehle", "chairs"}),
+    frozenset({"fridge", "kuehlschrank", "kühlschrank", "refrigerator", "gefrierschrank"}),
+    frozenset({"washer", "waschmaschine", "washing", "trockner", "dryer"}),
+    frozenset({"phone", "iphone", "samsung", "handy", "smartphone"}),
+)
+
+
+def _product_group_hits(text: str) -> set[int]:
+    folded = _fold_match_text(text)
+    if not folded:
+        return set()
+    toks = set(_subject_tokens(folded))
+    hits: set[int] = set()
+    for i, group in enumerate(_PRODUCT_GROUPS):
+        if any(g in folded or g in toks for g in group):
+            hits.add(i)
+    return hits
+
 
 _SUBJECT_WORD_RE = re.compile(r"[^\W\d_]{3,}", flags=re.UNICODE)
 _SUBJECT_NUM_RE = re.compile(r"\d{2,}")
@@ -463,6 +487,17 @@ def _subject_title_conflicts(subj: str, title: str) -> bool:
             and "wohnzimmer" not in title_l
         ):
             return True
+
+    subj_groups = _product_group_hits(subj)
+    title_groups = _product_group_hits(title_l)
+    if subj_groups and title_groups and not (subj_groups & title_groups):
+        return True
+
+    # Re: Sofa — один короткий токен-товар, в лоте другая категория.
+    short_subj = [t for t in _subject_tokens(subj) if 3 <= len(t) <= 5]
+    if len(short_subj) == 1 and title_sig and short_subj[0] not in title_l:
+        if any(t not in subj for t in title_sig):
+            return True
     return False
 
 
@@ -477,8 +512,20 @@ def offer_matches_incoming_subject(off: Offer, subject: str, *, min_score: float
 
 
 def subject_is_informative(subject: str) -> bool:
+    """Re: Sofa / Re: TV — короткая тема с названием товара тоже информативна."""
     subj = _norm_subject(subject)
-    return len(subj) >= 8 or len(_subject_tokens(subj)) >= 2
+    if not subj:
+        return False
+    if len(subj) >= 8:
+        return True
+    toks = _subject_tokens(subj)
+    if len(toks) >= 2:
+        return True
+    if len(toks) == 1 and len(toks[0]) >= 3:
+        return True
+    if _product_group_hits(subj):
+        return True
+    return len(subj) >= 4
 
 
 def subject_token_hits(subject: str, off: Offer) -> int:
@@ -531,6 +578,78 @@ def subject_match_score(subject: str, off: Offer) -> float:
             score -= 50.0
 
     return score
+
+
+def offer_has_contact_email(off: Offer, email: str) -> bool:
+    """Валидированный email в raw_json или совпадение с OfferEmail (проверяется снаружи)."""
+    from services.offer_storage import parse_offer_raw
+
+    fe = _canon_email(email)
+    if not fe:
+        return False
+    raw = parse_offer_raw(getattr(off, "raw_json", None))
+    for em in raw.get("validated_emails") or []:
+        if _canon_email(str(em or "")) == fe:
+            return True
+    for key in (
+        "email",
+        "seller_email",
+        "contact_email",
+        "from_email",
+        "owner_email",
+        "account_email",
+    ):
+        if _canon_email(str(raw.get(key) or "")) == fe:
+            return True
+    return False
+
+
+async def list_offers_for_incoming_contact(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+    from_name: str = "",
+) -> list[Offer]:
+    """Все лоты продавца: OfferEmail + validated_emails в raw_json + имя."""
+    seen: set[int] = set()
+    out: list[Offer] = []
+
+    def _add(off: Offer | None) -> None:
+        if not off:
+            return
+        oid = int(off.id)
+        if oid in seen:
+            return
+        seen.add(oid)
+        out.append(off)
+
+    for off in await list_offers_for_seller_email(
+        session, user_id=int(user_id), from_email=from_email
+    ):
+        _add(off)
+
+    fe_can = _canon_email(from_email)
+    if fe_can:
+        recent = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.user_id == int(user_id))
+                .order_by(Offer.id.desc())
+                .limit(800)
+            )
+        ).scalars().all()
+        for off in recent:
+            if offer_has_contact_email(off, fe_can):
+                _add(off)
+
+    if (from_name or "").strip():
+        for off in await list_offers_for_seller_name(
+            session, user_id=int(user_id), from_name=from_name
+        ):
+            _add(off)
+
+    return out
 
 
 async def list_offers_for_seller_email(
@@ -776,13 +895,25 @@ async def resolve_offer_for_incoming_mail(
     """
     subj = (subject or "").strip()
 
+    def _incoming_offer_ok(off: Offer | None) -> bool:
+        if not off:
+            return False
+        from services.offer_storage import offer_effective_title
+
+        title = offer_effective_title(off)
+        if title and _subject_title_conflicts(subj, title):
+            return False
+        if subject_is_informative(subj) and not offer_matches_incoming_subject(off, subj):
+            return False
+        return True
+
     if offer_email_id:
         from services.mailing_send_log import find_offer_by_offer_email_id
 
         off_oe = await find_offer_by_offer_email_id(
             session, user_id=int(user_id), offer_email_id=int(offer_email_id)
         )
-        if off_oe:
+        if _incoming_offer_ok(off_oe):
             return off_oe
 
     if (inbox_email or "").strip():
@@ -795,8 +926,18 @@ async def resolve_offer_for_incoming_mail(
             subject=subj,
             from_email=from_email,
         )
-        if off_log:
+        if _incoming_offer_ok(off_log):
             return off_log
+
+    def _pinned_incoming_ok(off: Offer | None) -> bool:
+        if not off:
+            return False
+        from services.offer_storage import offer_effective_title
+
+        title = offer_effective_title(off)
+        if title and subject_is_informative(subj) and _subject_title_conflicts(subj, title):
+            return False
+        return True
 
     if stored_offer_id:
         off = (
@@ -807,9 +948,22 @@ async def resolve_offer_for_incoming_mail(
                 .limit(1)
             )
         ).scalars().first()
-        if off:
-            if not subject_is_informative(subj) or offer_matches_incoming_subject(off, subj):
-                return off
+        if off and _pinned_incoming_ok(off):
+            return off
+
+    if (from_email or "").strip() and "@" in from_email:
+        from services.offer_storage import find_offer_by_incoming_signals
+
+        off_sig = await find_offer_by_incoming_signals(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            subject=subj,
+            from_name=from_name,
+            body_text=body_text,
+        )
+        if _incoming_offer_ok(off_sig):
+            return off_sig
 
     if subject_is_informative(subj):
         from services.offer_storage import find_offer_by_incoming_subject, offer_effective_title
@@ -886,6 +1040,19 @@ async def resolve_offer_for_incoming_mail(
         )
         if off_agg:
             return off_agg
+
+        from services.offer_storage import find_offer_by_incoming_signals
+
+        off_sig = await find_offer_by_incoming_signals(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            subject=subj,
+            from_name=from_name,
+            body_text=body_text,
+        )
+        if _incoming_offer_ok(off_sig):
+            return off_sig
 
         return None
 
@@ -1008,18 +1175,21 @@ async def resolve_offer_for_aqua_link(
     from services.offer_storage import offer_effective_link
 
     url = offer_effective_link(off) if off else ""
-    if not url:
-        url = (
-            await offer_link_for_seller(
-                session,
-                user_id=int(user_id),
-                from_email=from_email,
-                subject=subject,
-            )
-            or ""
-        ).strip()
-        if url and not off:
-            off = await find_offer_by_link(session, user_id=int(user_id), ad_url=url)
+    if not off:
+        from services.offer_storage import find_offer_by_incoming_signals
+
+        off_sig = await find_offer_by_incoming_signals(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            subject=subject,
+            from_name=from_name,
+            body_text=body_text,
+            ad_url=ad_url,
+        )
+        if off_sig:
+            off = off_sig
+            url = offer_effective_link(off_sig) or ""
     if off and not url:
         url = offer_effective_link(off)
     return off, url

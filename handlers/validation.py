@@ -480,7 +480,7 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
             items=items,
             validated_rows=validated or [],
             norm_email=_norm_email,
-            max_emails_per_offer=2,
+            max_emails_per_offer=1,
         )
         await session.commit()
 

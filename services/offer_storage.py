@@ -161,7 +161,7 @@ async def find_offer_by_incoming_subject(
 
     subj_norm = normalized_reply_subject(subject)
     subj_compact = _title_compact(subj_norm)
-    if len(subj_compact) < 8:
+    if len(subj_compact) < 4:
         return None
 
     name_offs: list[Offer] = []
@@ -406,19 +406,209 @@ async def diagnose_subject_match(
     ).scalars().all()
     for off in rows:
         title = offer_effective_title(off)
-        if not title:
+        raw = parse_offer_raw(getattr(off, "raw_json", None))
+        hay = _fold_match_text(title)
+        if raw:
+            hay += " " + _fold_match_text(
+                " ".join(
+                    str(raw.get(k) or "")
+                    for k in (
+                        "item_title",
+                        "title",
+                        "item_desc",
+                        "item_person_name",
+                        "person_name",
+                    )
+                )
+            )
+        if not hay.strip():
             continue
-        tf = _fold_match_text(title)
-        if word_toks and all(w in tf for w in word_toks):
+        if word_toks and all(w in hay for w in word_toks):
             near += 1
             if len(samples) < 3:
-                samples.append(title[:50])
+                samples.append((title or str(raw.get("item_title") or ""))[:50])
     return {
         "total": int(total),
         "near": int(near),
         "samples": samples,
         "words": word_toks[:4],
     }
+
+
+async def _offer_ids_with_email(session, user_id: int, fe_can: str) -> set[int]:
+    """Offer.id, у которых есть строка OfferEmail с этим адресом."""
+    from services.offer_matching import _canon_email
+
+    if not fe_can:
+        return set()
+    rows = (
+        await session.execute(
+            sa_select(OfferEmail.offer_id, OfferEmail.email)
+            .join(Offer, Offer.id == OfferEmail.offer_id)
+            .where(Offer.user_id == int(user_id))
+            .order_by(OfferEmail.id.desc())
+            .limit(3000)
+        )
+    ).all()
+    out: set[int] = set()
+    for oid, em in rows:
+        if _canon_email(str(em or "")) == fe_can:
+            out.add(int(oid))
+    return out
+
+
+async def find_offer_by_incoming_signals(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+    subject: str = "",
+    from_name: str = "",
+    body_text: str = "",
+    ad_url: str | None = None,
+    product_title: str | None = None,
+) -> Offer | None:
+    """
+    Точный лот для входящего письма / «Создать ссылку»:
+    validated email + имя продавца + тема + ссылка + поля raw_json.
+    """
+    from services.offer_matching import (
+        _canon_email,
+        _fold_match_text,
+        _ratio,
+        _subject_title_conflicts,
+        _subject_tokens,
+        list_offers_for_incoming_contact,
+        normalized_reply_subject,
+        offer_has_contact_email,
+        offer_matches_incoming_subject,
+        score_offer,
+        subject_is_informative,
+        subject_match_score,
+    )
+
+    fe_can = _canon_email(from_email)
+    subj_norm = normalized_reply_subject(subject)
+    title_hint = (product_title or subj_norm or "").strip()
+    email_offer_ids = await _offer_ids_with_email(session, int(user_id), fe_can) if fe_can else set()
+
+    candidates: list[Offer] = []
+    seen: set[int] = set()
+
+    def _add(off: Offer | None) -> None:
+        if not off:
+            return
+        oid = int(off.id)
+        if oid in seen:
+            return
+        seen.add(oid)
+        candidates.append(off)
+
+    if (ad_url or "").strip():
+        by_url = await find_offer_by_link(session, user_id=int(user_id), ad_url=ad_url or "")
+        _add(by_url)
+
+    for off in await list_offers_for_incoming_contact(
+        session,
+        user_id=int(user_id),
+        from_email=from_email,
+        from_name=from_name,
+    ):
+        _add(off)
+
+    if not candidates:
+        return None
+
+    if len(candidates) == 1:
+        only = candidates[0]
+        title = offer_effective_title(only)
+        if title and subj_norm and _subject_title_conflicts(subject, title):
+            return None
+        if fe_can and (
+            int(only.id) in email_offer_ids or offer_has_contact_email(only, fe_can)
+        ):
+            return only
+        fn = (from_name or "").strip()
+        pn = (only.person_name or "").strip()
+        if fn and pn and _ratio(fn, pn) >= 0.72:
+            return only
+        if not subj_norm or not subject_is_informative(subject):
+            return only
+
+    best: Offer | None = None
+    best_sc = -1.0
+    url_lk = link_key(ad_url or "")
+
+    for off in candidates:
+        title = offer_effective_title(off)
+        if title and subj_norm and _subject_title_conflicts(subject, title):
+            continue
+
+        email_hit = bool(
+            fe_can
+            and (int(off.id) in email_offer_ids or offer_has_contact_email(off, fe_can))
+        )
+        sc = score_offer(
+            off,
+            from_email=from_email,
+            subject=subject,
+            from_name=from_name,
+            body_text=body_text,
+            email_hit=email_hit,
+        )
+        if subj_norm:
+            sc += subject_match_score(subject, off) * 0.65
+        if title_hint and title:
+            sc += 55.0 * _ratio(title_hint, title)
+            th = title_hint.lower()
+            tl = title.lower()
+            if th in tl or tl in th:
+                sc += 40.0
+        off_lk = link_key(offer_effective_link(off))
+        if url_lk and off_lk and url_lk == off_lk:
+            sc += 280.0
+
+        if sc > best_sc:
+            best_sc = sc
+            best = off
+
+    if not best and (from_name or "").strip() and subj_norm:
+        name_offs = await list_offers_for_incoming_contact(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            from_name=from_name,
+        )
+        subj_c = _title_compact(subj_norm)
+        for off in name_offs:
+            title = offer_effective_title(off)
+            if not title:
+                continue
+            tc = _title_compact(title)
+            if subj_c and tc and (tc == subj_c or tc in subj_c or subj_c in tc):
+                return off
+            tf = _fold_match_text(title)
+            if all(w in tf for w in _subject_tokens(subj_norm) if len(w) >= 4):
+                return off
+
+    if not best:
+        return None
+
+    min_sc = 90.0 if fe_can else 125.0
+    if best_sc < min_sc:
+        return None
+
+    email_hit_best = bool(
+        fe_can
+        and (int(best.id) in email_offer_ids or offer_has_contact_email(best, fe_can))
+    )
+    if subject_is_informative(subject) and subj_norm:
+        if not email_hit_best and not offer_matches_incoming_subject(best, subject):
+            fn = (from_name or "").strip()
+            pn = (best.person_name or "").strip()
+            if not (fn and pn and _ratio(fn, pn) >= 0.75):
+                return None
+    return best
 
 
 async def find_offer_by_link(session, *, user_id: int, ad_url: str) -> Offer | None:
@@ -500,11 +690,15 @@ async def save_all_offers_from_import(
     offers_with_email = 0
     email_rows_saved = 0
     output_rows: list[dict[str, Any]] = []
+    seen_fp: set[str] = set()
 
     for it in items:
         if not isinstance(it, dict):
             continue
         fp = offer_fingerprint(it)
+        if fp in seen_fp:
+            continue
+        seen_fp.add(fp)
         vrow = vindex.get(fp)
         if not vrow:
             lk = link_key(str(it.get("item_link") or it.get("link") or ""))
@@ -530,6 +724,7 @@ async def save_all_offers_from_import(
             payload = dict(it)
         if picked:
             payload["validated_emails"] = list(picked)
+            payload["validated_email"] = picked[0]
 
         offer = Offer(
             user_id=int(user_id),

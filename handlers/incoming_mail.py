@@ -964,8 +964,8 @@ async def _get_convlink(
       inbox_email   -> пишем/сравниваем с account_email
       contact_email -> пишем/сравниваем с from_email
     """
-    inbox = (inbox_email or "").strip().lower()
-    contact = (contact_email or "").strip().lower()
+    inbox = _canon_email(inbox_email or "")
+    contact = _canon_email(contact_email or "")
     if not inbox or not contact:
         return None
 
@@ -973,8 +973,8 @@ async def _get_convlink(
         await session.execute(
             sa_select(ConversationLink)
             .where(ConversationLink.user_id == int(user_id))
-            .where(ConversationLink.account_email == inbox)
-            .where(ConversationLink.from_email == contact)
+            .where(func.lower(ConversationLink.account_email) == inbox)
+            .where(func.lower(ConversationLink.from_email) == contact)
             .limit(1)
         )
     ).scalars().first()
@@ -997,8 +997,8 @@ async def _upsert_convlink(
       - account_email — наш почтовый ящик (куда пришло письмо)
       - from_email    — email отправителя (продавца)
     """
-    inbox = (inbox_email or "").strip().lower()
-    contact = (contact_email or "").strip().lower()
+    inbox = _canon_email(inbox_email or "")
+    contact = _canon_email(contact_email or "")
     if not inbox or not contact:
         return
 
@@ -1015,6 +1015,7 @@ async def _upsert_convlink(
             from_email=contact,
             ad_url=(ad_url or "").strip() or None,
             generated_link=(generated_link or "").strip() or None,
+            pinned_offer_id=int(pinned_offer_id) if pinned_offer_id else None,
         )
         session.add(conv)
     else:
@@ -1022,7 +1023,7 @@ async def _upsert_convlink(
             conv.ad_url = (ad_url or "").strip() or conv.ad_url
         if generated_link:
             conv.generated_link = (generated_link or "").strip() or conv.generated_link
-        if pinned_offer_id:
+        if pinned_offer_id and conv.pinned_offer_id is None:
             conv.pinned_offer_id = int(pinned_offer_id)
     await session.commit()
 

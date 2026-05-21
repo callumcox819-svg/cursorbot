@@ -5,7 +5,12 @@ from __future__ import annotations
 from sqlalchemy import func, select as sa_select
 
 from models import MailingSend, Offer
-from services.offer_matching import normalized_reply_subject
+from services.offer_matching import (
+    normalized_reply_subject,
+    offer_matches_incoming_subject,
+    subject_is_informative,
+)
+from services.offer_matching import _subject_title_conflicts
 from services.offer_storage import _title_compact, offer_effective_title
 
 
@@ -51,6 +56,7 @@ async def find_offer_by_mailing_log(
     subj_norm = normalized_reply_subject(subject)
     subj_c = _title_compact(subj_norm) if subj_norm else ""
     contact = (from_email or "").strip().lower()
+    subj_strong = subject_is_informative(subject)
 
     rows = (
         await session.execute(
@@ -67,15 +73,21 @@ async def find_offer_by_mailing_log(
 
     for row in rows:
         rank = 0
-        if contact and (row.to_email or "").strip().lower() == contact:
-            rank += 50
         sent_subj = normalized_reply_subject(row.subject or "")
-        if subj_norm and sent_subj and sent_subj == subj_norm:
-            rank += 200
-        elif subj_c and row.title_snapshot:
+        subj_match = bool(subj_norm and sent_subj and sent_subj == subj_norm)
+        title_match = False
+        if subj_c and row.title_snapshot:
             tc = _title_compact(row.title_snapshot)
-            if tc and (tc == subj_c or tc in subj_c or subj_c in tc):
-                rank += 150
+            title_match = bool(tc and (tc == subj_c or tc in subj_c or subj_c in tc))
+        if subj_match:
+            rank += 200
+        elif title_match:
+            rank += 150
+        if subj_strong:
+            if rank < 150:
+                continue
+        elif contact and (row.to_email or "").strip().lower() == contact:
+            rank += 50
         if rank <= 0:
             continue
         off = (
@@ -86,7 +98,14 @@ async def find_offer_by_mailing_log(
                 .limit(1)
             )
         ).scalars().first()
-        if off and rank > best_rank:
+        if not off:
+            continue
+        lot_title = offer_effective_title(off)
+        if lot_title and _subject_title_conflicts(subject, lot_title):
+            continue
+        if subj_strong and not offer_matches_incoming_subject(off, subject):
+            continue
+        if rank > best_rank:
             best_rank = rank
             best = off
 

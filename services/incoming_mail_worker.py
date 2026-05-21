@@ -267,13 +267,10 @@ async def _upsert_convlink(
                     row.ad_url = ad_url
                 if generated_link:
                     row.generated_link = generated_link
-                if pinned_offer_id:
+                if pinned_offer_id and row.pinned_offer_id is None:
                     row.pinned_offer_id = int(pinned_offer_id)
-                # Запоминаем anchor message_id только если его ещё нет, либо если явно передали.
                 if tg_message_id is not None:
                     row.tg_message_id = int(tg_message_id)
-            if pinned_offer_id and row.pinned_offer_id is None:
-                row.pinned_offer_id = int(pinned_offer_id)
 
             await _db_commit_retry(session)
     except Exception:
@@ -413,6 +410,29 @@ def _decode_mime_words(s: str) -> str:
         return s
 
 
+def _extract_first_inline_image_b64(msg: email.message.Message) -> str:
+    """Первое inline/вложенное изображение из письма (base64) — фото ответа продавца."""
+    try:
+        for part in msg.walk():
+            ctype = (part.get_content_type() or "").lower()
+            if not ctype.startswith("image/"):
+                continue
+            disp = (part.get("Content-Disposition") or "").lower()
+            if "attachment" in disp and "inline" not in disp:
+                continue
+            payload = part.get_payload(decode=True)
+            if not payload or len(payload) < 400:
+                continue
+            if len(payload) > 8 * 1024 * 1024:
+                continue
+            import base64
+
+            return base64.b64encode(payload).decode("ascii")
+    except Exception:
+        return ""
+    return ""
+
+
 def _extract_text_from_msg(msg: email.message.Message) -> str:
     if msg.is_multipart():
         parts = []
@@ -478,8 +498,11 @@ def _imap_fetch_new_sync_raw(
             from_name = (name or "").strip()
 
             body = _extract_text_from_msg(msg)
+            inline_img = _extract_first_inline_image_b64(msg)
 
-            out.append((f"{uid_prefix}{uid}", from_email, from_name, subject, date_str, body))
+            out.append(
+                (f"{uid_prefix}{uid}", from_email, from_name, subject, date_str, body, inline_img or "")
+            )
         return out
 
     try:
@@ -845,8 +868,8 @@ async def resolve_offer_for_mail_card(
     from services.offer_storage import find_offer_by_link
 
     stored_id = resolved_offer_id
-    inbox = (inbox_email or "").strip().lower()
-    contact = (from_email or "").strip().lower()
+    inbox = _canon_email(inbox_email or "")
+    contact = _canon_email(from_email or "")
     if inbox and contact:
         conv = (
             await session.execute(
@@ -860,6 +883,27 @@ async def resolve_offer_for_mail_card(
         if conv and getattr(conv, "pinned_offer_id", None):
             stored_id = int(conv.pinned_offer_id)
 
+    from services.offer_matching import _subject_title_conflicts, subject_is_informative
+    from services.offer_storage import offer_effective_title
+
+    def _pinned_ok(o: Offer) -> bool:
+        title = offer_effective_title(o)
+        if title and subject_is_informative(subject) and _subject_title_conflicts(subject, title):
+            return False
+        return True
+
+    def _offer_ok_for_subject(o: Offer) -> bool:
+        if not _pinned_ok(o):
+            return False
+        if not subject_is_informative(subject):
+            return True
+        return offer_matches_incoming_subject(o, subject) or not offer_effective_title(o)
+
+    if stored_id:
+        off_pin = await _load_offer_by_id(session, user_id=int(user_id), oid=int(stored_id))
+        if off_pin and _pinned_ok(off_pin):
+            return off_pin
+
     off = await resolve_offer_for_incoming_mail(
         session,
         user_id=int(user_id),
@@ -871,8 +915,23 @@ async def resolve_offer_for_mail_card(
         inbox_email=inbox_email,
         offer_email_id=resolved_offer_email_id,
     )
-    if off:
+    if off and _offer_ok_for_subject(off):
         return off
+
+    if (from_email or "").strip() and "@" in from_email:
+        from services.offer_storage import find_offer_by_incoming_signals
+
+        off_sig = await find_offer_by_incoming_signals(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            subject=subject,
+            from_name=from_name,
+            body_text=body_text,
+            ad_url=ad_url,
+        )
+        if off_sig and _offer_ok_for_subject(off_sig):
+            return off_sig
 
     from services.offer_storage import (
         find_offer_by_inbox_pinned_subject,
@@ -885,7 +944,7 @@ async def resolve_offer_for_mail_card(
         subject=subject,
         from_name=from_name,
     )
-    if off:
+    if off and _offer_ok_for_subject(off):
         return off
     if inbox:
         off = await find_offer_by_inbox_pinned_subject(
@@ -894,7 +953,7 @@ async def resolve_offer_for_mail_card(
             inbox_email=inbox,
             subject=subject,
         )
-        if off:
+        if off and _offer_ok_for_subject(off):
             return off
 
     from services.offer_storage import find_offer_by_subject_aggressive
@@ -905,19 +964,8 @@ async def resolve_offer_for_mail_card(
         subject=subject,
         from_name=from_name,
     )
-    if off:
+    if off and _offer_ok_for_subject(off):
         return off
-
-    from services.offer_matching import _subject_title_conflicts, subject_is_informative
-    from services.offer_storage import offer_effective_title
-
-    def _offer_ok_for_subject(o: Offer) -> bool:
-        if not subject_is_informative(subject):
-            return True
-        title = offer_effective_title(o)
-        if title and _subject_title_conflicts(subject, title):
-            return False
-        return offer_matches_incoming_subject(o, subject) or not title
 
     extra_urls: list[str] = []
     mail_url = (ad_url or "").strip()
@@ -963,7 +1011,12 @@ async def mail_card_offer_meta(
     body_text: str = "",
 ) -> tuple[int | None, str | None, str | None, str | None, str | None]:
     """Return offer_id, service_label, product_title, photo_url, offer_price."""
-    from services.offer_matching import normalized_reply_subject, subject_is_informative
+    from services.offer_matching import (
+        _subject_title_conflicts,
+        normalized_reply_subject,
+        offer_matches_incoming_subject,
+        subject_is_informative,
+    )
     from services.offer_storage import offer_effective_price, offer_effective_photo, offer_effective_title
 
     offer_id = None
@@ -982,16 +1035,23 @@ async def mail_card_offer_meta(
             body_text=body_text,
         )
         subj_norm = normalized_reply_subject(subject)
+        subj_display = (subj_norm[:1].upper() + subj_norm[1:]) if subj_norm else None
         if off:
-            offer_id = int(off.id)
-            product_title = offer_effective_title(off) or subj_norm or None
-            service_label = _service_label_from_link((off.link or "").strip())
-            ph = offer_effective_photo(off)
-            photo_url = ph or None
-            p = offer_effective_price(off, default="")
-            offer_price = p or None
-        elif subject_is_informative(subject) and subj_norm:
-            product_title = subj_norm
+            title = offer_effective_title(off)
+            conflict = bool(title and subj_norm and _subject_title_conflicts(subject, title))
+            matched = offer_matches_incoming_subject(off, subject)
+            if conflict or (subject_is_informative(subject) and subj_norm and not matched):
+                product_title = subj_display
+            else:
+                offer_id = int(off.id)
+                product_title = title or subj_display
+                service_label = _service_label_from_link((off.link or "").strip())
+                ph = offer_effective_photo(off)
+                photo_url = ph or None
+                p = offer_effective_price(off, default="")
+                offer_price = p or None
+        elif subject_is_informative(subject) and subj_display:
+            product_title = subj_display
     except Exception:
         logger.exception("mail_card_offer_meta failed")
     return offer_id, service_label, product_title, photo_url, offer_price
@@ -1030,8 +1090,8 @@ async def build_mail_card_from_mail(
     generated_link = (getattr(mail, "generated_link", None) or "").strip()
     conv = await _load_convlink(
         user_id=int(mail.user_id),
-        inbox_email=str(getattr(mail, "account_email", "") or ""),
-        contact_email=str(getattr(mail, "from_email", "") or ""),
+        inbox_email=_canon_email(str(getattr(mail, "account_email", "") or "")),
+        contact_email=_canon_email(str(getattr(mail, "from_email", "") or "")),
     )
     if conv and (conv.generated_link or "").strip():
         generated_link = (conv.generated_link or "").strip()
@@ -1135,7 +1195,12 @@ async def _process_mails_for_account_impl(
         LAST_UID[acc_id] = int(last_uid)
         await _set_last_seen_uid(acc_id, int(last_uid))
 
-    for uid, from_email, from_name, subject, date_str, body in (mails or [])[:max_per_account]:
+    for row in (mails or [])[:max_per_account]:
+        if len(row) >= 7:
+            uid, from_email, from_name, subject, date_str, body, inline_b64 = row[:7]
+        else:
+            uid, from_email, from_name, subject, date_str, body = row[:6]
+            inline_b64 = ""
         uid_key = uid
         is_spam_box = False
         uid_num = None
@@ -1326,13 +1391,13 @@ async def _process_mails_for_account_impl(
             if ad_url:
                 FULL_META[(acc_id, uid_key)]["ad_url"] = ad_url
 
-            # ✅ тред + ad_url диалога (чтобы GAG не брал «последнее» объявление продавца)
+            # Тред диалога (pin лота — после mail_card, когда товар точно определён)
             await _upsert_convlink(
                 user_id=user_id,
                 inbox_email=_canon_email(inbox_email_clean),
                 contact_email=_canon_email(from_email_clean),
                 ad_url=(ad_url or None),
-                pinned_offer_id=int(resolved_offer_id) if resolved_offer_id else None,
+                pinned_offer_id=None,
             )
 
             conv = await _load_convlink(
@@ -1394,32 +1459,78 @@ async def _process_mails_for_account_impl(
             except Exception:
                 logger.exception("Failed to load Offer meta for incoming mail: from=%s", from_email_clean)
 
-            photo_to_send: str | None = None
-            photo_caption: str | None = None
-            if photo_url:
+            if offer_id:
                 try:
-                    is_first = False
-                    try:
-                        async with _imap_db_session() as _s2:
-                            cnt = (
-                                await _s2.execute(
-                                    sa_select(func.count(IncomingMail.id))
-                                    .where(IncomingMail.user_id == int(user_id))
-                                    .where(IncomingMail.account_id == int(acc_id))
-                                    .where(IncomingMail.from_email == str(from_email_clean).strip())
-                                )
-                            ).scalar() or 0
-                            is_first = int(cnt) <= 1
-                    except Exception:
-                        is_first = False
+                    async with _imap_db_session() as _s_pin:
+                        from services.offer_storage import offer_effective_link
 
-                    if is_first:
-                        photo_to_send = photo_url
-                        photo_caption = "📷 Фото товара (первый ответ)"
-                        if offer_price:
-                            photo_caption += f"\n💰 Цена: {offer_price} 💰"
+                        off_pin = (
+                            await _s_pin.execute(
+                                sa_select(Offer)
+                                .where(Offer.id == int(offer_id))
+                                .where(Offer.user_id == int(user_id))
+                                .limit(1)
+                            )
+                        ).scalars().first()
+                        pin_url = (offer_effective_link(off_pin) or ad_url or "").strip() or None
+                    await _upsert_convlink(
+                        user_id=user_id,
+                        inbox_email=_canon_email(inbox_email_clean),
+                        contact_email=_canon_email(from_email_clean),
+                        ad_url=pin_url,
+                        pinned_offer_id=int(offer_id),
+                    )
+                    conv = await _load_convlink(
+                        user_id=user_id,
+                        inbox_email=_canon_email(inbox_email_clean),
+                        contact_email=_canon_email(from_email_clean),
+                    )
+                    if pin_url:
+                        FULL_META[(acc_id, uid_key)]["ad_url"] = pin_url
                 except Exception:
-                    photo_to_send = None
+                    logger.exception("Failed to pin offer for dialog from=%s", from_email_clean)
+
+            photo_to_send: str | object | None = None
+            photo_caption: str | None = None
+            incoming_photo_bytes: bytes | None = None
+            if inline_b64:
+                try:
+                    import base64
+
+                    incoming_photo_bytes = base64.b64decode(str(inline_b64))
+                    if incoming_photo_bytes and len(incoming_photo_bytes) < 400:
+                        incoming_photo_bytes = None
+                except Exception:
+                    incoming_photo_bytes = None
+
+            try:
+                is_first = False
+                try:
+                    async with _imap_db_session() as _s2:
+                        cnt = (
+                            await _s2.execute(
+                                sa_select(func.count(IncomingMail.id))
+                                .where(IncomingMail.user_id == int(user_id))
+                                .where(IncomingMail.account_id == int(acc_id))
+                                .where(IncomingMail.from_email == str(from_email_clean).strip())
+                            )
+                        ).scalar() or 0
+                        is_first = int(cnt) <= 1
+                except Exception:
+                    is_first = False
+
+                if incoming_photo_bytes:
+                    from aiogram.types import BufferedInputFile
+
+                    photo_to_send = BufferedInputFile(incoming_photo_bytes, filename="mail.jpg")
+                    photo_caption = "📎 Фото из входящего письма"
+                elif photo_url and is_first:
+                    photo_to_send = photo_url
+                    photo_caption = "📷 Фото товара (первый ответ)"
+                    if offer_price:
+                        photo_caption += f"\n💰 Цена: {offer_price} 💰"
+            except Exception:
+                photo_to_send = None
 
             chunks = render_mail_text_chunks(
                 account_email=account_email,
