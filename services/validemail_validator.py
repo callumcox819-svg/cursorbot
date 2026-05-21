@@ -358,6 +358,7 @@ async def _validate_offers_old(
             continue
 
         name_key = seller_name_key(raw_name)
+        # 1 продавец = 1 лот за прогон (первый в JSON); повтор имени — как ЧС
         if name_key and (name_key in seller_bl or name_key in batch_seen_names):
             if stats is not None:
                 stats["blacklisted"] = int(stats.get("blacklisted") or 0) + 1
@@ -392,6 +393,8 @@ async def _validate_offers_old(
             "link": str(it.get("item_link") or it.get("link") or it.get("url") or "").strip(),
             "photo": str(it.get("item_photo") or it.get("photo") or it.get("image") or "").strip(),
         })
+        if name_key:
+            batch_seen_names.add(name_key)
 
     if stats is not None:
         stats["offers_eligible"] = len(prepared)

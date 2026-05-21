@@ -366,7 +366,7 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
         validemail_api_keys=api_keys,
         validation_url=config.VALIDEMAIL_URL,
         concurrency=max(8, int(getattr(config, "VALIDEMAIL_CONCURRENCY", 20) or 20)),
-        max_emails_per_seller=3,
+        max_emails_per_seller=1,
         require_first_and_last=REQUIRE_FIRST_AND_LAST,
         max_len=40,
         min_len=MIN_NAME_TOKEN_LEN,

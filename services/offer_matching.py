@@ -808,19 +808,8 @@ async def resolve_offer_for_incoming_mail(
             )
         ).scalars().first()
         if off:
-            from services.offer_storage import offer_effective_title
-
-            if offer_matches_incoming_subject(off, subj):
+            if not subject_is_informative(subj) or offer_matches_incoming_subject(off, subj):
                 return off
-            if not subject_is_informative(subj):
-                return off
-            title = offer_effective_title(off)
-            if title and not _subject_title_conflicts(subj, title):
-                seller_offers = await list_offers_for_seller_email(
-                    session, user_id=int(user_id), from_email=from_email
-                )
-                if len(seller_offers) <= 1:
-                    return off
 
     if subject_is_informative(subj):
         from services.offer_storage import find_offer_by_incoming_subject, offer_effective_title
