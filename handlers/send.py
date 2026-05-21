@@ -252,15 +252,18 @@ async def start_sending(message: Message):
         if not accounts:
             await status_msg.edit_text(
                 "❌ Нет активных аккаунтов.\nДобавьте почту в «Настройки → Аккаунты».",
-                reply_markup=main_menu_kb(tg_user_id),
+                parse_mode="HTML",
             )
+            await message.answer("Меню:", reply_markup=main_menu_kb(tg_user_id))
             return
 
         if total_targets <= 0:
             await status_msg.edit_text(
-                "❌ Очередь пуста — нет email в БД после валидации.",
-                reply_markup=main_menu_kb(tg_user_id),
+                "❌ Очередь пуста — нет email в БД после валидации.\n"
+                "Загрузите JSON и прогоните валидацию (OfferEmail).",
+                parse_mode="HTML",
             )
+            await message.answer("Меню:", reply_markup=main_menu_kb(tg_user_id))
             return
 
         state = get_sending_state(tg_user_id)
@@ -278,8 +281,9 @@ async def start_sending(message: Message):
         if socks_total <= 0:
             await status_msg.edit_text(
                 "❌ Нет SOCKS5 прокси. Добавьте socks5://… в «Прокси».",
-                reply_markup=main_menu_kb(tg_user_id),
+                parse_mode="HTML",
             )
+            await message.answer("Меню:", reply_markup=main_menu_kb(tg_user_id))
             return
 
     try:
@@ -299,7 +303,6 @@ async def start_sending(message: Message):
             await status_msg.edit_text(
                 "❌ <b>Рассылка не запущена</b>\n\n" + px_detail,
                 parse_mode="HTML",
-                reply_markup=main_menu_kb(tg_user_id),
             )
         except Exception:
             await tg_answer_safe(
@@ -345,7 +348,6 @@ async def start_sending(message: Message):
             f"Прокси: до <b>{MAIL_SMTP_MAX_PROXIES}</b> × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с · "
             f"повторов <b>{MAIL_SEND_RETRIES}</b>\n\n"
             "<i>Ящик с Message blocked снимается с рассылки, IMAP остаётся.</i>",
-            reply_markup=main_menu_kb(tg_user_id),
             parse_mode="HTML",
         )
     except Exception:
@@ -626,7 +628,6 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                                 subject=subject,
                                 title_snapshot=offer_effective_title(offer_sent),
                             )
-                            await session.commit()
                             if offer_link:
                                 await _upsert_convlink(
                                     user_id=int(db_user_id),
