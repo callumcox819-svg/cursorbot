@@ -67,7 +67,7 @@ def gag_service_label(code: str | None) -> str:
 
 
 def gag_service_from_offer_link(link: str, *, user_fallback: str | None = None) -> str | None:
-    """Сервис GAG из ссылки объявления (не из глобальных настроек пользователя)."""
+    """Сервис GAG по домену ссылки объявления (если в профиле не выбран сервис)."""
     l = (link or "").lower()
     if "ricardo.ch" in l:
         return "ricardo_ch"
@@ -80,6 +80,17 @@ def gag_service_from_offer_link(link: str, *, user_fallback: str | None = None) 
     if "kleinanzeigen" in l or "ebay." in l:
         return "posta_ch"
     return normalize_gag_service(user_fallback)
+
+
+def resolve_gag_service(*, offer_link: str, user_setting: str | None) -> str | None:
+    """
+    Сервис для /generate: сначала выбор в 👤 Профиль → Выбор сервиса,
+    иначе авто по Offer.link.
+    """
+    chosen = normalize_gag_service(user_setting)
+    if chosen:
+        return chosen
+    return gag_service_from_offer_link(offer_link)
 
 
 def gag_generate_endpoint() -> str:

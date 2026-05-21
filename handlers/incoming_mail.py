@@ -36,7 +36,7 @@ from services.gag_keys import (
     gag_generate_endpoint,
     gag_service_for_api,
     gag_service_for_html_dir,
-    gag_service_from_offer_link,
+    resolve_gag_service,
     get_user_gag_api_key,
     is_valid_gag_service,
 )
@@ -1477,11 +1477,11 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
             return
 
         user_svc = (await get_user_setting(session, tg_user, GAG_SERVICE_KEY) or "").strip()
-        service = gag_service_from_offer_link(url, user_fallback=user_svc) or ""
+        service = resolve_gag_service(offer_link=url, user_setting=user_svc) or ""
         if not is_valid_gag_service(service):
             await callback.message.answer(
-                "❌ Не удалось определить сервис GAG по ссылке объявления. "
-                "Проверьте Offer.link (ricardo/tutti/post) или выберите сервис в 👤 Профиль."
+                "❌ Не удалось определить сервис GAG. "
+                "Выберите сервис в 👤 Профиль → 🧭 Выбор сервиса или проверьте Offer.link."
             )
             await callback.answer()
             return
@@ -1693,7 +1693,7 @@ async def _create_gag_link_work(callback: CallbackQuery, acc_id: int, uid: str, 
             return await callback.answer()
 
         user_svc = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
-        service = gag_service_from_offer_link(url, user_fallback=user_svc) or ""
+        service = resolve_gag_service(offer_link=url, user_setting=user_svc) or ""
         if not is_valid_gag_service(service):
             await callback.message.answer(
                 "❌ Не удалось определить сервис GAG по ссылке объявления. "
@@ -2724,7 +2724,7 @@ async def _gag_generate_link_for_offer(session, user: User, offer: Offer, price:
         raise GAGError("GAG API ключ не установлен")
 
     user_svc = (await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip()
-    service = gag_service_from_offer_link((offer.link or "").strip(), user_fallback=user_svc) or ""
+    service = resolve_gag_service(offer_link=(offer.link or "").strip(), user_setting=user_svc) or ""
     if not is_valid_gag_service(service):
         raise GAGError("Не выбран сервис GAG")
 
@@ -2829,9 +2829,9 @@ async def _regenerate_gag_link_after_price(
                 await get_user_setting(session, user, GAG_PROFILE_TITLE_KEY) or ""
             ).strip()
             or None,
-            "service_code": gag_service_from_offer_link(
-                (offer.link or "").strip(),
-                user_fallback=(await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip(),
+            "service_code": resolve_gag_service(
+                offer_link=(offer.link or "").strip(),
+                user_setting=(await get_user_setting(session, user, GAG_SERVICE_KEY) or "").strip(),
             )
             or "",
             "link": gag_url,
