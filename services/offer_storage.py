@@ -641,6 +641,7 @@ async def resolve_offer_from_saved_context(
     from services.offer_matching import (
         _canon_email,
         _ratio,
+        _subject_title_conflicts,
         offer_acceptable_for_subject,
     )
 

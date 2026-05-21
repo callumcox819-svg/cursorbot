@@ -1394,7 +1394,9 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
         contact_email = _canon_email(mail.from_email or "")
 
         subj = (getattr(mail, "subject", "") or "").strip()
-        from services.offer_matching import resolve_offer_for_aqua_link
+        from services.offer_matching import normalized_reply_subject, resolve_offer_for_aqua_link
+
+        subj_product = normalized_reply_subject(subj) or subj
 
         offer, url = await resolve_offer_for_aqua_link(
             session,
@@ -1407,6 +1409,7 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
             resolved_offer_id=getattr(mail, "resolved_offer_id", None),
             resolved_offer_email_id=getattr(mail, "resolved_offer_email_id", None),
             inbox_email=inbox_email,
+            product_title=subj_product,
         )
         if offer:
             mail.resolved_offer_id = int(offer.id)
