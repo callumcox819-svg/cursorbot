@@ -173,6 +173,23 @@ async def _purge_target(session: AsyncSession, user_id: int, offer_email_id: int
         await _safe_rollback(session)
 
 
+async def clear_mailing_queue(session: AsyncSession, user_id: int) -> int:
+    """
+    Очистить очередь /send: все OfferEmail пользователя.
+    Лоты (Offer) и raw_json в БД не трогаем — после нового JSON валидация снова наполнит очередь.
+    """
+    before = int(await _get_targets_count(session, user_id))
+    if before <= 0:
+        return 0
+    await session.execute(
+        delete(OfferEmail).where(
+            OfferEmail.offer_id.in_(select(Offer.id).where(Offer.user_id == int(user_id)))
+        )
+    )
+    await _safe_commit(session)
+    return before
+
+
 async def _build_message_for_target(session: AsyncSession, tg_user_id: int, tgt: OfferEmail) -> Tuple[str, str]:
     """Return (subject, body) for a single OfferEmail target."""
 
@@ -229,6 +246,52 @@ async def _build_message_for_target(session: AsyncSession, tg_user_id: int, tgt:
     subject = subject_for_offer(item_title or "")
 
     return subject, body
+
+
+@router.message(Command("reset"))
+async def cmd_reset_queue(message: Message) -> None:
+    """Очистить очередь рассылки (OfferEmail), лоты в БД остаются."""
+    tg_user_id = message.from_user.id
+
+    st = get_sending_state(tg_user_id)
+    if st and st.is_running and not st.is_stopping:
+        from handlers.stopsend import stop_sending_for_user
+
+        stop_sending_for_user(tg_user_id)
+
+    async with db_session() as session:
+        user = await get_or_create_user(session, int(tg_user_id))
+        removed = await clear_mailing_queue(session, int(user.id))
+        offers_left = (
+            await session.execute(select(func.count(Offer.id)).where(Offer.user_id == int(user.id)))
+        ).scalar() or 0
+
+    try:
+        from services.mailing_active_db import set_mailing_active
+
+        await set_mailing_active(tg_user_id, active=False)
+    except Exception:
+        logger.exception("reset: clear mailing_active tg=%s", tg_user_id)
+
+    if removed <= 0:
+        text = (
+            "📭 <b>Очередь рассылки уже пуста</b>\n\n"
+            f"Лотов в БД: <b>{offers_left}</b>\n"
+            "Загрузите JSON и прогоните валидацию — адреса снова попадут в очередь."
+        )
+    else:
+        stop_note = ""
+        if st and (st.is_running or st.is_stopping):
+            stop_note = "\n⏹ Активная рассылка помечена на остановку.\n"
+        text = (
+            f"✅ <b>Очередь рассылки очищена</b>{stop_note}\n"
+            f"Удалено email из очереди: <b>{removed}</b>\n"
+            f"Лотов в БД (без изменений): <b>{offers_left}</b>\n\n"
+            "<i>OfferEmail сняты — /send не кому писать. "
+            "Загрузите новый JSON и валидацию, чтобы собрать очередь заново.</i>"
+        )
+
+    await message.answer(text, parse_mode="HTML", reply_markup=main_menu_kb(tg_user_id))
 
 
 @router.message(Command("send"))

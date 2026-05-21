@@ -93,7 +93,7 @@ def _bind_priority_dispatcher_handlers(dp: Dispatcher) -> None:
     from handlers.api_keys import goo_show_key, goo_show_profile
     from handlers.first_sms import firstsms_open
     from handlers.proxies import open_proxies
-    from handlers.send import send_cmd
+    from handlers.send import cmd_reset_queue, send_cmd
     from handlers.settings import (
         _force_settings_menu,
         match_settings_menu_text,
@@ -118,6 +118,7 @@ def _bind_priority_dispatcher_handlers(dp: Dispatcher) -> None:
         F.func(lambda m: match_settings_menu_text(getattr(m, "text", None))),
     )
 
+    dp.message.register(cmd_reset_queue, Command("reset"))
     dp.message.register(send_cmd, Command("send"))
     dp.message.register(send_cmd, F.text == "▶️ Запустить рассылку")
     dp.message.register(cmd_stopsend, Command("stop", "stopsend"))
@@ -215,7 +216,29 @@ def _release_single_instance_lock() -> None:
         pass
 
 
+async def _register_bot_commands(bot: Bot) -> None:
+    """Меню команд слева от поля ввода (кнопка /)."""
+    from aiogram.types import BotCommand
+
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Запустить бота"),
+            BotCommand(command="send", description="Запустить рассылку"),
+            BotCommand(command="stop", description="Остановить рассылку"),
+            BotCommand(command="reset", description="Очистить очередь email"),
+            BotCommand(command="stat", description="Статус рассылки"),
+            BotCommand(command="imap_diag", description="Входящая почта / IMAP"),
+        ]
+    )
+    logger.info("Меню команд Telegram обновлено (/reset и др.)")
+
+
 async def _on_startup(bot: Bot) -> None:
+    try:
+        await _register_bot_commands(bot)
+    except Exception:
+        logger.exception("set_my_commands failed")
+
     wh = await bot.get_webhook_info()
     logger.info(
         "Telegram webhook: url=%r pending_updates=%s",
