@@ -642,20 +642,50 @@ async def resolve_offer_from_saved_context(
         _canon_email,
         _ratio,
         _subject_title_conflicts,
+        normalized_reply_subject,
         offer_acceptable_for_subject,
     )
 
-    def _pair_saved(off: Offer | None, url: str) -> tuple[Offer | None, str]:
-        """Pin / журнал /send — доверяем сохранённому offer_id, не перескориваем по 32 лотам."""
+    def _pair_saved(off: Offer | None, url: str, *, strict_subject: bool = True) -> tuple[Offer | None, str]:
+        """Pin / журнал /send — доверяем сохранённому offer_id."""
         if not off:
             return None, ""
         u = (url or offer_effective_link(off) or "").strip()
         if not u:
             return None, ""
-        title = offer_effective_title(off)
-        if subject and title and _subject_title_conflicts(subject, title):
-            return None, ""
+        if strict_subject:
+            title = offer_effective_title(off)
+            if subject and title and _subject_title_conflicts(subject, title):
+                return None, ""
         return off, u
+
+    from services.mailing_send_log import find_offer_by_mailing_log
+
+    off_log = await find_offer_by_mailing_log(
+        session,
+        user_id=int(user_id),
+        inbox_email=inbox_email,
+        subject=subject,
+        from_email=contact_email,
+        from_name=from_name,
+    )
+    if off_log:
+        got = _pair_saved(off_log, offer_effective_link(off_log) or "", strict_subject=False)
+        if got[0]:
+            return got
+
+    off_sig = await find_offer_by_incoming_signals(
+        session,
+        user_id=int(user_id),
+        from_email=contact_email,
+        subject=subject,
+        from_name=from_name,
+        product_title=normalized_reply_subject(subject) or None,
+    )
+    if off_sig:
+        got = _pair_saved(off_sig, offer_effective_link(off_sig) or "")
+        if got[0]:
+            return got
 
     if resolved_offer_id:
         off = (
@@ -690,6 +720,12 @@ async def resolve_offer_from_saved_context(
             )
         ).scalars().first()
         if conv:
+            if (conv.ad_url or "").strip():
+                cu = (conv.ad_url or "").strip()
+                by_url = await find_offer_by_link(session, user_id=int(user_id), ad_url=cu)
+                got = _pair_saved(by_url, cu)
+                if got[0]:
+                    return got
             if getattr(conv, "pinned_offer_id", None):
                 off = (
                     await session.execute(
@@ -699,15 +735,10 @@ async def resolve_offer_from_saved_context(
                         .limit(1)
                     )
                 ).scalars().first()
-                got = _pair_saved(off, (conv.ad_url or "").strip())
-                if got[0]:
-                    return got
-            if (conv.ad_url or "").strip():
-                cu = (conv.ad_url or "").strip()
-                by_url = await find_offer_by_link(session, user_id=int(user_id), ad_url=cu)
-                got = _pair_saved(by_url, cu)
-                if got[0]:
-                    return got
+                if off and offer_acceptable_for_subject(off, subject):
+                    got = _pair_saved(off, (conv.ad_url or "").strip())
+                    if got[0]:
+                        return got
 
         fn = (from_name or "").strip().lower()
         if fn:
@@ -737,19 +768,6 @@ async def resolve_offer_from_saved_context(
                     got = _pair_saved(off, (conv.ad_url or "").strip())
                     if got[0]:
                         return got
-
-    from services.mailing_send_log import find_offer_by_mailing_log
-
-    off_log = await find_offer_by_mailing_log(
-        session,
-        user_id=int(user_id),
-        inbox_email=inbox_email,
-        subject=subject,
-        from_email=contact_email,
-        from_name=from_name,
-    )
-    if off_log:
-        return _pair_saved(off_log, offer_effective_link(off_log) or "")
 
     return None, ""
 
@@ -812,7 +830,32 @@ def emails_from_validated_row(row: dict[str, Any] | None, norm_email) -> list[st
             continue
         seen.add(e2)
         picked.append(e2)
+        break
     return picked
+
+
+def _scrub_raw_to_single_email(payload: dict[str, Any], keep: str, norm_email) -> None:
+    """В raw_json остаётся одна валидная почта — без второго gmail/icloud из парсера."""
+    kn = norm_email(str(keep or ""))
+    if not kn or not isinstance(payload, dict):
+        return
+    payload["validated_emails"] = [kn]
+    payload["validated_email"] = kn
+    for key in (
+        "email",
+        "seller_email",
+        "contact_email",
+        "from_email",
+        "owner_email",
+        "account_email",
+    ):
+        v = payload.get(key)
+        if isinstance(v, str) and v.strip() and norm_email(v) != kn:
+            del payload[key]
+    for key in ("emails", "seller_emails"):
+        arr = payload.get(key)
+        if isinstance(arr, list):
+            payload[key] = [x for x in arr if norm_email(str(x or "")) == kn]
 
 
 async def save_all_offers_from_import(
@@ -866,8 +909,7 @@ async def save_all_offers_from_import(
         else:
             payload = dict(it)
         if picked:
-            payload["validated_emails"] = list(picked)
-            payload["validated_email"] = picked[0]
+            _scrub_raw_to_single_email(payload, picked[0], norm_email)
 
         offer = Offer(
             user_id=int(user_id),

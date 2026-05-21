@@ -1473,6 +1473,7 @@ async def _process_mails_for_account_impl(
                 try:
                     async with _imap_db_session() as _s_pin:
                         from services.offer_storage import offer_effective_link
+                        from services.offer_matching import offer_acceptable_for_subject
 
                         off_pin = (
                             await _s_pin.execute(
@@ -1482,21 +1483,28 @@ async def _process_mails_for_account_impl(
                                 .limit(1)
                             )
                         ).scalars().first()
-                        pin_url = (offer_effective_link(off_pin) or ad_url or "").strip() or None
-                    await _upsert_convlink(
-                        user_id=user_id,
-                        inbox_email=_canon_email(inbox_email_clean),
-                        contact_email=_canon_email(from_email_clean),
-                        ad_url=pin_url,
-                        pinned_offer_id=int(offer_id),
-                    )
-                    conv = await _load_convlink(
-                        user_id=user_id,
-                        inbox_email=_canon_email(inbox_email_clean),
-                        contact_email=_canon_email(from_email_clean),
-                    )
-                    if pin_url:
-                        FULL_META[(acc_id, uid_key)]["ad_url"] = pin_url
+                        if off_pin and not offer_acceptable_for_subject(
+                            off_pin, subj_for_match or ""
+                        ):
+                            offer_id = None
+                        elif off_pin:
+                            pin_url = (
+                                offer_effective_link(off_pin) or ad_url or ""
+                            ).strip() or None
+                            await _upsert_convlink(
+                                user_id=user_id,
+                                inbox_email=_canon_email(inbox_email_clean),
+                                contact_email=_canon_email(from_email_clean),
+                                ad_url=pin_url,
+                                pinned_offer_id=int(offer_id),
+                            )
+                            conv = await _load_convlink(
+                                user_id=user_id,
+                                inbox_email=_canon_email(inbox_email_clean),
+                                contact_email=_canon_email(from_email_clean),
+                            )
+                            if pin_url:
+                                FULL_META[(acc_id, uid_key)]["ad_url"] = pin_url
                 except Exception:
                     logger.exception("Failed to pin offer for dialog from=%s", from_email_clean)
 
