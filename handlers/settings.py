@@ -176,9 +176,6 @@ def settings_menu_kb(flags: dict[str, bool]) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🌐 Прокси", callback_data="settings_proxies"),
             ],
             [
-                InlineKeyboardButton(text="🛒 Facebook", callback_data="fb_menu"),
-            ],
-            [
                 InlineKeyboardButton(text="🧮 Интервал", callback_data="settings_timings"),
             ],
             [
