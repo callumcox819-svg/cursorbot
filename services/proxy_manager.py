@@ -1,7 +1,10 @@
+import logging
 import random
 from typing import Optional
 
 from sqlalchemy import select, update, delete, or_
+
+logger = logging.getLogger(__name__)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Proxy
@@ -115,6 +118,17 @@ class ProxyManager:
             update(Proxy).where(Proxy.id == proxy_id).values(**values)
         )
         await session.commit()
+        if deactivate:
+            try:
+                from services.proxy_binding import detach_accounts_from_proxy
+
+                await detach_accounts_from_proxy(
+                    session,
+                    int(proxy_id),
+                    reason=err_txt,
+                )
+            except Exception:
+                logger.exception("detach_accounts_from_proxy failed proxy_id=%s", proxy_id)
 
     @staticmethod
     async def note_proxy_success(session: AsyncSession, proxy_id: int) -> None:

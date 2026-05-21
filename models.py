@@ -137,6 +137,8 @@ class EmailAccount(Base):
 
     provider = Column(String, nullable=False, default="gmail")
 
+    proxy_id = Column(ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True, index=True)
+
     status = Column(String, nullable=True, default="active")
     last_error = Column(Text, nullable=True)
 

@@ -115,7 +115,6 @@ async def open_settings_menu(message: Message, state: FSMContext) -> None:
 
 SUBJECT_TEMPLATE_KEY = "subject_template"
 HTML_THEME_KEY = "html_theme"
-PROXY_ROTATION_KEY = "proxy_rotation"
 
 HTMLNICK_KEY = "html_nick"
 COUNTRY_KEY = "country"
@@ -177,9 +176,6 @@ def settings_menu_kb(flags: dict[str, bool]) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="🧮 Интервал", callback_data="settings_timings"),
-            ],
-            [
-                InlineKeyboardButton(text=dot(flags.get("proxy_rotation", False), "Ротация"), callback_data="ref_toggle:proxy_rotation"),
                 InlineKeyboardButton(text="🔑 Ключ", callback_data="gag_show:key"),
             ],
             [
@@ -206,7 +202,6 @@ async def _settings_menu_kb_for_user(tg_user_id: int) -> InlineKeyboardMarkup:
             "smart_mode": await _b("smart_mode", False),
             "spoofing": await _b("spoofing", False),
             "block_control": await _b("block_control", False),
-            "proxy_rotation": await _b("proxy_rotation", True),
         }
 
     return settings_menu_kb(flags)
@@ -796,7 +791,6 @@ _REF_TOGGLE_KEYS = {
     "saver": "saver",
     "card": "card",
     "block_control": "block_control",
-    "proxy_rotation": "proxy_rotation",
 }
 
 
@@ -1050,31 +1044,6 @@ async def html_theme_clear(callback: CallbackQuery, state: FSMContext):
         await set_user_setting(session, user, HTML_THEME_KEY, "")
     await callback.answer("Очищено ✅")
     await html_theme_menu(callback, state)
-
-# =========================
-# Ротация прокси — экран + переключатель proxy_rotation (без "0 действий")
-# =========================
-
-@router.callback_query(F.data == "proxy_rotation_menu")
-async def proxy_rotation_menu(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    async with Session() as session:
-        user = await get_or_create_user(session, callback.from_user.id)
-        v = await get_user_setting(session, user, PROXY_ROTATION_KEY)
-        cur = str(v or "").strip().lower() in {"1","true","yes","on"}
-    status = "✅" if cur else "❌"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🔄 Ротация: {status}", callback_data="ref_toggle:proxy_rotation")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open")],
-    ])
-    await _safe_send(callback.message.edit_text(
-        "🔄 <b>Ротация</b>\n\n"
-        "ВКЛ — прокси меняются между отправками.\n"
-        "ВЫКЛ — один прокси.",
-        reply_markup=kb,
-        parse_mode="HTML",
-    ))
-    await callback.answer()
 
 # =========================
 # Приоритет доменов — сохраняем список доменов по порядку

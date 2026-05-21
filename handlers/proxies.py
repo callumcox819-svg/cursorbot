@@ -450,9 +450,9 @@ async def render_proxy_menu(message_or_cb, telegram_id: int):
         "🧩 <b>Твои прокси</b>\n\n"
         f"Всего: {len(proxies)}\n"
         f"🟢 SMTP OK: {ok_n} · 🟡 неясно/не проверен: {unk_n} · 🔴 мёртв при рассылке: {bad_n}\n\n"
-        "<i>Проверка: SMTP+STARTTLS (до 2 попыток). "
-        "🔴 только если туннель реально умер при /send — не из-за таймаута проверки.</i>\n"
-        "<i>Рассылка использует все SOCKS5, в т.ч. 🟡.</i>"
+        "<i>Каждый почтовый ящик привязан к одному SOCKS5 (без ротации IP). "
+        "Новые ящики получают прокси с наименьшей нагрузкой.</i>\n"
+        "<i>🔴 прокси умер — ящики открепляются до замены живого SOCKS5.</i>"
     )
 
     kb = proxies_menu(proxies)
@@ -657,6 +657,13 @@ async def _proxy_add_work(
             try:
                 session.add(proxy)
                 await session.commit()
+                await session.refresh(proxy)
+                try:
+                    from services.proxy_binding import assign_waiting_accounts
+
+                    await assign_waiting_accounts(session, int(user.id))
+                except Exception:
+                    logger.exception("assign_waiting_accounts after proxy add")
                 ok_count += 1
                 preview = original_text.replace("\n", " / ")
                 if len(preview) > 120:
@@ -751,6 +758,11 @@ async def proxy_delete(callback: CallbackQuery):
     async with Session() as session:
         proxy = await session.get(Proxy, proxy_id)
         if proxy:
+            from services.proxy_binding import detach_accounts_from_proxy
+
+            await detach_accounts_from_proxy(
+                session, int(proxy_id), reason="Прокси удалён"
+            )
             await session.delete(proxy)
             await session.commit()
 

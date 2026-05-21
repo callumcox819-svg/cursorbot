@@ -74,74 +74,13 @@ async def choose_proxy_for_user(
     *,
     exclude_ids: set[int] | None = None,
 ) -> Optional[Proxy]:
-    """
-    Возвращает один активный SOCKS5 прокси пользователя.
-    """
+    """Прокси с наименьшим числом привязанных ящиков (без ротации IP)."""
     try:
-        rot = (
-            await session.execute(
-                select(UserSetting.value)
-                .where(UserSetting.user_id == int(user_id))
-                .where(UserSetting.key == "proxy_rotation")
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        rot_on = str(rot or "0").strip().lower() in {"1", "true", "yes", "on", "y"}
+        from services.proxy_binding import pick_least_loaded_proxy
 
-        active_cond = or_(Proxy.is_active.is_(True), Proxy.is_active.is_(None))
-
-        def _smtp_eligible(p: Proxy) -> bool:
-            if not is_socks5_proxy(p):
-                t = (getattr(p, "type", None) or "").strip().lower()
-                # В БД default=http, хотя прокси SOCKS5 — не отбрасываем пустой/мусорный type
-                if t in ("http", "https"):
-                    return False
-                if t and not t.startswith("socks"):
-                    return False
-            return True
-
-        all_rows = list(
-            (
-                await session.execute(
-                    select(Proxy)
-                    .where(Proxy.user_id == int(user_id))
-                    .order_by(Proxy.id.asc())
-                )
-            ).scalars().all()
+        return await pick_least_loaded_proxy(
+            session, int(user_id), exclude_ids=exclude_ids
         )
-        skip = exclude_ids or set()
-        eligible = [p for p in all_rows if _smtp_eligible(p) and int(p.id) not in skip]
-        preferred = [p for p in eligible if p.is_active is not False]
-        items = preferred if preferred else eligible
-        if not items:
-            logger.warning(
-                "no SMTP proxy for user_id=%s total=%s eligible=%s",
-                user_id,
-                len(all_rows),
-                sum(1 for p in all_rows if _smtp_eligible(p)),
-            )
-            return None
-        if len(items) == 1:
-            return items[0]
-
-        uid = int(user_id)
-        if rot_on:
-            chosen = random.choice(items)
-        else:
-            # Раньше без ротации всегда брался только первый id — новые прокси не использовались.
-            idx = _RR_INDEX.get(uid, 0) % len(items)
-            _RR_INDEX[uid] = idx + 1
-            chosen = items[idx]
-
-        logger.info(
-            "SMTP proxy selected user_id=%s proxy_id=%s %s:%s rot=%s",
-            uid,
-            chosen.id,
-            chosen.host,
-            chosen.port,
-            "random" if rot_on else "rr",
-        )
-        return chosen
     except Exception:
         logger.exception("choose_proxy_for_user failed")
         return None

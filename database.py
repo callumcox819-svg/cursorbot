@@ -181,6 +181,20 @@ async def _ensure_conversation_links_tg_message_id_column() -> None:
         await conn.execute(text("ALTER TABLE conversation_links ADD COLUMN IF NOT EXISTS tg_message_id BIGINT"))
 
 
+async def _ensure_email_accounts_proxy_id_column() -> None:
+    """Привязка ящика к SOCKS5 (proxy_id), без ротации IP."""
+    async with engine.begin() as conn:
+        if engine.dialect.name == "postgresql":
+            await conn.execute(
+                text("ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS proxy_id INTEGER")
+            )
+        else:
+            res = await conn.execute(text("PRAGMA table_info(email_accounts)"))
+            cols = [row[1] for row in res.fetchall()]
+            if "proxy_id" not in cols:
+                await conn.execute(text("ALTER TABLE email_accounts ADD COLUMN proxy_id INTEGER"))
+
+
 async def init_db() -> None:
     dialect = engine.dialect.name
     if dialect == "postgresql":
@@ -243,3 +257,8 @@ async def init_db() -> None:
         await _migrate_seller_blacklist_names()
     except Exception as e:
         log.error("Failed seller_blacklist name migration: %s", e)
+
+    try:
+        await _ensure_email_accounts_proxy_id_column()
+    except Exception as e:
+        log.error("Failed email_accounts.proxy_id migration: %s", e)

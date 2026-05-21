@@ -219,25 +219,35 @@ async def _bulk_add_accounts(
             )
             existing = existing_res.scalar_one_or_none()
             prov = res.provider or "gmail"
+            acc = existing
             if existing:
                 existing.password = work.password
                 existing.provider = prov
                 existing.status = "active"
             else:
-                session.add(
-                    EmailAccount(
-                        user_id=user.id,
-                        email=work.email,
-                        password=work.password,
-                        provider=prov,
-                        status="active",
-                    )
+                acc = EmailAccount(
+                    user_id=user.id,
+                    email=work.email,
+                    password=work.password,
+                    provider=prov,
+                    status="active",
                 )
+                session.add(acc)
+                await session.flush()
+
+            try:
+                from services.proxy_binding import assign_proxy_to_account
+
+                await assign_proxy_to_account(session, acc)
+            except Exception:
+                logger.exception("assign_proxy_to_account failed for %s", work.email)
+
             ok_count += 1
+            px_note = f" · proxy #{acc.proxy_id}" if getattr(acc, "proxy_id", None) else ""
             if gmail_only:
-                details.append(f"✅ <code>{_e(work.email)}</code>")
+                details.append(f"✅ <code>{_e(work.email)}</code>{px_note}")
             else:
-                details.append(f"✅ <code>{_e(work.email)}</code> — добавлен ({_e(prov)})")
+                details.append(f"✅ <code>{_e(work.email)}</code> — {prov}{px_note}")
 
         await _edit_add_progress(
             status_msg,

@@ -311,6 +311,13 @@ async def start_sending(message: Message):
         db_user = await get_or_create_user(session, int(tg_user_id))
 
         db_user_id = db_user.id
+
+        from services.proxy_binding import ensure_all_accounts_assigned
+
+        bound_n = await ensure_all_accounts_assigned(session, int(db_user_id))
+        if bound_n:
+            logger.info("Assigned proxy to %s accounts for user_id=%s", bound_n, db_user_id)
+
         accounts = await _get_active_accounts(session, db_user_id)
 
         accounts_total_db = (
@@ -418,7 +425,7 @@ async def start_sending(message: Message):
             f"В рассылке SOCKS5: <b>{sendable_px}</b> (🔴 не используются)\n"
             f"Режим: <b>SOCKS5 → один SMTP-сеанс на пачку</b> с ящика · пауза MIN–MAX\n"
             f"Успех в /stat: <b>{'IMAP Sent' if MAIL_VERIFY_SENT else 'SMTP 250+NOOP'}</b>\n"
-            f"Прокси: до <b>{MAIL_MAILING_MAX_PROXIES}</b> × <b>{MAIL_MAILING_TIMEOUT_SEC}</b> с\n\n"
+            f"Прокси: <b>1 на ящик</b> (привязка, без ротации) · SMTP <b>{MAIL_MAILING_TIMEOUT_SEC}</b> с\n\n"
             "<i>Пачка: ⚙️ Интервал → третье число (пример: <code>2 4 5</code>). "
             "Ящик с Message blocked снимается с рассылки.</i>",
             parse_mode="HTML",

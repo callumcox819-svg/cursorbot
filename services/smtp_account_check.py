@@ -263,43 +263,38 @@ async def check_smtp_account_with_proxy(
     user_id: int,
     account: EmailAccount,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Одна проверка через SOCKS5 с ротацией прокси при сбое туннеля."""
+    """Проверка SMTP через прокси, привязанный к ящику."""
     from proxy_manager import ProxySMTPContext
-    from services.smtp_proxy_send import choose_required_proxy
-    from services.sender import should_retry_send_with_other_proxy
+    from services.proxy_binding import resolve_proxy_for_account
     from services.proxy_manager import ProxyManager
 
-    last_err: str | None = None
-    tried_ids: set[int] = set()
+    proxy, pick_err = await resolve_proxy_for_account(session, account)
+    if pick_err:
+        return None, pick_err
+    if not proxy:
+        return None, "PROXY_ERROR|no_active_proxy"
 
-    while True:
-        proxy, pick_err = await choose_required_proxy(session, user_id, exclude_ids=tried_ids)
-        if pick_err:
-            return None, pick_err
-        if not proxy:
-            break
+    pid = int(proxy.id)
+    async with ProxySMTPContext(proxy):
+        st, err = await asyncio.to_thread(check_smtp_account_sync, account)
 
-        pid = int(proxy.id)
-        tried_ids.add(pid)
+    if st is not None:
+        try:
+            await ProxyManager.note_proxy_success(session, pid)
+        except Exception:
+            pass
+        return st, err
 
-        async with ProxySMTPContext(proxy):
-            st, err = await asyncio.to_thread(check_smtp_account_sync, account)
+    from services.sender import is_definite_proxy_failure
 
-        if st is not None:
-            return st, err
-
-        last_err = err
-        if not should_retry_send_with_other_proxy(err):
-            return None, err
-
+    if is_definite_proxy_failure(err):
         try:
             await ProxyManager.note_proxy_failure(
-                session, pid, (err or "")[:500], deactivate=False
+                session, pid, (err or "")[:500], deactivate=True, from_mailing=False
             )
         except Exception:
             pass
-
-    return None, last_err or "PROXY_ERROR|no_active_proxy"
+    return None, err
 
 
 @dataclass
