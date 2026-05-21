@@ -796,6 +796,17 @@ async def resolve_offer_for_incoming_mail(
                     return off
 
     if subject_is_informative(subj):
+        from services.offer_storage import find_offer_by_incoming_subject, offer_effective_title
+
+        off_db = await find_offer_by_incoming_subject(
+            session,
+            user_id=int(user_id),
+            subject=subj,
+            from_name=from_name,
+        )
+        if off_db:
+            return off_db
+
         off = await resolve_best_offer_by_subject(
             session,
             user_id=int(user_id),
@@ -816,8 +827,6 @@ async def resolve_offer_for_incoming_mail(
         )
         if off:
             return off
-
-        from services.offer_storage import offer_effective_title
 
         seller_offers = await list_offers_for_seller_email(
             session, user_id=int(user_id), from_email=from_email
@@ -842,22 +851,11 @@ async def resolve_offer_for_incoming_mail(
             if title and not _subject_title_conflicts(subj, title):
                 return only
 
-        from services.offer_storage import find_offer_by_incoming_subject
-
-        off_db = await find_offer_by_incoming_subject(
-            session,
-            user_id=int(user_id),
-            subject=subj,
-            from_name=from_name,
-        )
-        if off_db:
-            return off_db
-
         off_tok = await resolve_offer_by_subject_tokens(
             session,
             user_id=int(user_id),
             subject=subj,
-            candidate_offers=seller_offs or None,
+            candidate_offers=seller_offers or None,
         )
         if off_tok:
             return off_tok
