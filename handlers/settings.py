@@ -472,8 +472,10 @@ async def settings_timings(callback: CallbackQuery, state: FSMContext) -> None:
         "⏱ <b>Тайминги рассылки</b>\n\n"
         "Текущий диапазон:\n"
         f"MIN: <code>{timing.get('min')}</code> сек\n"
-        f"MAX: <code>{timing.get('max')}</code> сек\n\n"
-        " ",
+        f"MAX: <code>{timing.get('max')}</code> сек\n"
+        f"Пачка с ящика: <code>{timing.get('batch_size', 3)}</code> писем / SMTP\n\n"
+        "<i>Пауза MIN–MAX на цикл (пачка). SMTP через SOCKS5, несколько писем за одно подключение. "
+        "Задать: <code>MIN MAX ПАЧКА</code> (пример: <code>2 4 5</code>).</i>\n",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="✏️ Изменить тайминг", callback_data="timings_edit")],
@@ -492,7 +494,8 @@ async def timings_edit(callback: CallbackQuery, state: FSMContext) -> None:
 
     await callback.message.edit_text(
         "⏱ <b>Тайминги рассылки</b>\n\n"
-        "Отправь двумя числами: <code>MIN MAX</code> (пример: <code>1 5</code>).",
+        "Отправь: <code>MIN MAX ПАЧКА</code> (пример: <code>2 4 5</code>).\n"
+        "ПАЧКА — сколько писем с одного ящика за одно SMTP+прокси (1–8).",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_timings")],
@@ -510,14 +513,21 @@ async def timings_set(message: Message, state: FSMContext) -> None:
     from services.settings import load_timing, save_timing
 
     text = (message.text or "").strip()
-    m = re.match(r"^(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)$", text)
+    m = re.match(
+        r"^(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)(?:\s+(\d+))?$",
+        text,
+    )
     if not m:
-        await message.answer("❌ Формат: MIN MAX (например: 1 5)")
+        await message.answer("❌ Формат: MIN MAX [ПАЧКА] (например: 2 4 5)")
         return
     mn = float(m.group(1))
     mx = float(m.group(2))
+    burst = int(m.group(3)) if m.group(3) else None
     if mn <= 0 or mx <= 0 or mx < mn:
         await message.answer("❌ Неверные значения. Нужно: 0 < MIN <= MAX")
+        return
+    if burst is not None and not (1 <= burst <= 8):
+        await message.answer("❌ ПАЧКА: от 1 до 8")
         return
 
     async with Session() as session:
@@ -526,6 +536,8 @@ async def timings_set(message: Message, state: FSMContext) -> None:
         cur["max"] = int(mx) if mx.is_integer() else mx
         cur["min_delay"] = mn
         cur["max_delay"] = mx
+        if burst is not None:
+            cur["batch_size"] = burst
         await save_timing(session, message.from_user.id, cur)
 
     await state.clear()

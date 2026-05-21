@@ -13,8 +13,11 @@ from models import EmailAccount
 from services.sender import normalize_send_error, should_retry_send_with_other_proxy
 from services.smtp_delivery_verify import verify_message_in_sent
 from services.smtp_proxy_send import (
+    MAIL_MAILING_MAX_PROXIES,
+    MAIL_MAILING_TIMEOUT_SEC,
     MAIL_SMTP_MAX_PROXIES,
     MAIL_SMTP_TIMEOUT_SEC,
+    send_batch_via_account_with_proxy,
     send_email_via_account_with_proxy,
 )
 
@@ -34,11 +37,12 @@ MAIL_SEND_RETRY_PAUSE_SEC = max(
 )
 
 
-def mailing_send_overall_timeout_sec() -> int:
-    """Лимит на одно письмо: прокси × таймаут × попытки (без 10-минутных зависаний)."""
-    per = MAIL_SMTP_MAX_PROXIES * MAIL_SMTP_TIMEOUT_SEC + 20
-    raw = per * MAIL_SEND_RETRIES + MAIL_SEND_RETRIES * MAIL_SEND_RETRY_PAUSE_SEC + 15
-    return max(60, min(240, int(os.getenv("SEND_ONE_TIMEOUT", str(int(raw))))))
+def mailing_send_overall_timeout_sec(*, batch_size: int = 1) -> int:
+    """Лимит на цикл (пачка писем с одного ящика через один SOCKS5+SMTP)."""
+    bs = max(1, int(batch_size))
+    per = MAIL_MAILING_MAX_PROXIES * MAIL_MAILING_TIMEOUT_SEC + 15 + (bs - 1) * 8
+    raw = per * MAIL_SEND_RETRIES + MAIL_SEND_RETRIES * MAIL_SEND_RETRY_PAUSE_SEC + 10
+    return max(45, min(240, int(os.getenv("SEND_ONE_TIMEOUT", str(int(raw))))))
 
 
 def _retry_after_failure(err: str | None) -> bool:
@@ -66,6 +70,7 @@ async def send_mailing_one(
             subject,
             body,
             sender_name=sender_name,
+            mailing=True,
         )
         err = normalize_send_error(err)
         last_err = err
@@ -101,6 +106,30 @@ async def send_mailing_one(
         return True, None, msgid
 
     return False, last_err or "UNKNOWN", last_msgid
+
+
+async def send_mailing_batch(
+    session: AsyncSession,
+    user_id: int,
+    account: EmailAccount,
+    items: list[tuple[str, str, str]],
+    sender_name: Optional[str] = None,
+) -> list[tuple[bool, Optional[str]]]:
+    """
+    Несколько писем с одного ящика за одно подключение SMTP через SOCKS5.
+    Быстрее, чем N отдельных send_mailing_one.
+    """
+    if not items:
+        return []
+    raw = await send_batch_via_account_with_proxy(
+        session,
+        int(user_id),
+        account,
+        items,
+        sender_name=sender_name,
+        mailing=True,
+    )
+    return [(bool(ok), normalize_send_error(err)) for ok, err in raw]
 
 
 # совместимость

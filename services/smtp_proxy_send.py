@@ -30,9 +30,11 @@ NO_ACTIVE_PROXY = "PROXY_ERROR|no_active_proxy|No active proxy configured"
 REPLY_SMTP_TIMEOUT_SEC = max(15, min(60, int(os.getenv("REPLY_SMTP_TIMEOUT_SEC", "28"))))
 REPLY_SMTP_MAX_PROXIES = max(1, min(6, int(os.getenv("REPLY_SMTP_MAX_PROXIES", "2"))))
 
-# Рассылка /send: несколько SOCKS5, таймаут на каждую попытку.
+# Рассылка /send: SOCKS5, один SMTP-сеанс на пачку писем с ящика.
 MAIL_SMTP_TIMEOUT_SEC = max(20, min(60, int(os.getenv("MAIL_SMTP_TIMEOUT_SEC", "35"))))
 MAIL_SMTP_MAX_PROXIES = max(1, min(6, int(os.getenv("MAIL_SMTP_MAX_PROXIES", "3"))))
+MAIL_MAILING_TIMEOUT_SEC = max(15, min(45, int(os.getenv("MAIL_MAILING_TIMEOUT_SEC", "22"))))
+MAIL_MAILING_MAX_PROXIES = max(1, min(4, int(os.getenv("MAIL_MAILING_MAX_PROXIES", "2"))))
 
 _LAST_OK_PROXY_ID: dict[int, int] = {}
 # Пара (user_id, account_id) → proxy_id — один ящик стабильнее через один egress (инбокс).
@@ -101,6 +103,7 @@ def _order_proxies_for_send(
     proxies: List[Proxy],
     *,
     fast: bool,
+    mailing: bool = False,
     account_id: int | None = None,
 ) -> List[Proxy]:
     if not proxies:
@@ -123,7 +126,12 @@ def _order_proxies_for_send(
             tail.append(p)
     random.shuffle(tail)
     order = head + mid + tail
-    limit = REPLY_SMTP_MAX_PROXIES if fast else MAIL_SMTP_MAX_PROXIES
+    if mailing:
+        limit = MAIL_MAILING_MAX_PROXIES
+    elif fast:
+        limit = REPLY_SMTP_MAX_PROXIES
+    else:
+        limit = MAIL_SMTP_MAX_PROXIES
     return order[:limit]
 
 
@@ -138,15 +146,21 @@ async def send_email_via_account_with_proxy(
     is_html: Optional[bool] = None,
     *,
     fast: bool = False,
+    mailing: bool = False,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     proxies = await _list_active_socks5_proxies(session, user_id)
     if not proxies:
         return False, NO_ACTIVE_PROXY, None
 
     order = _order_proxies_for_send(
-        int(user_id), proxies, fast=fast, account_id=int(account.id)
+        int(user_id), proxies, fast=fast, mailing=mailing, account_id=int(account.id)
     )
-    smtp_tmo = REPLY_SMTP_TIMEOUT_SEC if fast else MAIL_SMTP_TIMEOUT_SEC
+    if mailing:
+        smtp_tmo = MAIL_MAILING_TIMEOUT_SEC
+    elif fast:
+        smtp_tmo = REPLY_SMTP_TIMEOUT_SEC
+    else:
+        smtp_tmo = MAIL_SMTP_TIMEOUT_SEC
 
     last_err: str | None = None
     last_msgid: str | None = None
@@ -226,8 +240,10 @@ async def send_batch_via_account_with_proxy(
     account: EmailAccount,
     items: list[tuple[str, str, str]],
     sender_name: Optional[str] = None,
+    *,
+    mailing: bool = True,
 ) -> List[Tuple[bool, Optional[str]]]:
-    """Отправка пачки: неудачные адреса повторяются на следующем SOCKS5 (не «3 из 10»)."""
+    """Отправка пачки: один SMTP+прокси на несколько адресов; fail → другой SOCKS5."""
     n = len(items)
     if n == 0:
         return []
@@ -237,8 +253,9 @@ async def send_batch_via_account_with_proxy(
         return [(False, NO_ACTIVE_PROXY) for _ in items]
 
     order = _order_proxies_for_send(
-        int(user_id), proxies, fast=False, account_id=int(account.id)
+        int(user_id), proxies, fast=False, mailing=mailing, account_id=int(account.id)
     )
+    smtp_tmo = MAIL_MAILING_TIMEOUT_SEC if mailing else MAIL_SMTP_TIMEOUT_SEC
     merged: List[Tuple[bool, Optional[str]]] = [(False, NO_ACTIVE_PROXY) for _ in range(n)]
     pending: List[int] = list(range(n))
 
@@ -261,7 +278,7 @@ async def send_batch_via_account_with_proxy(
                 account,
                 batch_items,
                 sender_name=sender_name,
-                smtp_timeout_sec=MAIL_SMTP_TIMEOUT_SEC,
+                smtp_timeout_sec=smtp_tmo,
             )
 
         new_pending: List[int] = []

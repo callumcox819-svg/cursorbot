@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from typing import List, Optional, Tuple
 
 from aiogram import Bot, Router, F
@@ -80,8 +81,8 @@ def set_sending_state(user_id: int, state: Optional[SendingState] = None, **kwar
 SMTP_CONCURRENCY_WITH_PROXY = 1
 SMTP_CONCURRENCY_NO_PROXY = 1
 
-def mailing_send_timeouts() -> int:
-    return mailing_send_overall_timeout_sec()
+def mailing_send_timeouts(*, batch_size: int = 1) -> int:
+    return mailing_send_overall_timeout_sec(batch_size=batch_size)
 
 # user settings keys (уже используются в проекте)
 GAG_PROFILE_NAME_KEY = "gag_profile_name"
@@ -131,17 +132,20 @@ def _remove_account_from_rotation(
     return [a for a in rotation_accounts if int(a.id) != aid]
 
 
-async def _get_targets(session: AsyncSession, user_id: int) -> List[OfferEmail]:
+async def _get_targets(
+    session: AsyncSession, user_id: int, *, limit: int | None = None
+) -> List[OfferEmail]:
     """Targets are OfferEmail rows belonging to offers of this user."""
-    rows = (
-        await session.execute(
-            select(OfferEmail)
-            .join(Offer, Offer.id == OfferEmail.offer_id)
-            .where(Offer.user_id == user_id)
-            .options(selectinload(OfferEmail.offer))
-            .order_by(OfferEmail.id.asc())
-        )
-    ).scalars().all()
+    q = (
+        select(OfferEmail)
+        .join(Offer, Offer.id == OfferEmail.offer_id)
+        .where(Offer.user_id == user_id)
+        .options(selectinload(OfferEmail.offer))
+        .order_by(OfferEmail.id.asc())
+    )
+    if limit is not None:
+        q = q.limit(max(1, int(limit)))
+    rows = (await session.execute(q)).scalars().all()
     return list(rows)
 
 
@@ -338,7 +342,10 @@ async def start_sending(message: Message):
     await set_mailing_active(tg_user_id, active=True)
 
     from services.mailing_send import MAIL_SEND_RETRIES, MAIL_VERIFY_SENT
-    from services.smtp_proxy_send import MAIL_SMTP_MAX_PROXIES, MAIL_SMTP_TIMEOUT_SEC
+    from services.smtp_proxy_send import (
+        MAIL_MAILING_MAX_PROXIES,
+        MAIL_MAILING_TIMEOUT_SEC,
+    )
 
     try:
         await status_msg.edit_text(
@@ -346,11 +353,11 @@ async def start_sending(message: Message):
             f"В очереди: <b>{total_targets}</b> · ящиков active: <b>{len(accounts)}</b>\n"
             f"{px_detail}\n"
             f"В рассылке SOCKS5: <b>{sendable_px}</b> (🔴 не используются)\n"
-            f"Ротация: <b>1 ящик → 1 умный пресет → 1 адрес</b> → пауза MIN–MAX\n"
+            f"Режим: <b>SOCKS5 → один SMTP-сеанс на пачку</b> с ящика · пауза MIN–MAX\n"
             f"Успех в /stat: <b>{'IMAP Sent' if MAIL_VERIFY_SENT else 'SMTP 250+NOOP'}</b>\n"
-            f"Прокси: до <b>{MAIL_SMTP_MAX_PROXIES}</b> × <b>{MAIL_SMTP_TIMEOUT_SEC}</b> с · "
-            f"повторов <b>{MAIL_SEND_RETRIES}</b>\n\n"
-            "<i>Ящик с Message blocked снимается с рассылки, IMAP остаётся.</i>",
+            f"Прокси: до <b>{MAIL_MAILING_MAX_PROXIES}</b> × <b>{MAIL_MAILING_TIMEOUT_SEC}</b> с\n\n"
+            "<i>Пачка: ⚙️ Интервал → третье число (пример: <code>2 4 5</code>). "
+            "Ящик с Message blocked снимается с рассылки.</i>",
             parse_mode="HTML",
         )
     except Exception:
@@ -497,7 +504,6 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 pass
             return
 
-    send_one_timeout = mailing_send_timeouts()
     mail_max_per_account = max(0, int(os.getenv("MAIL_MAX_PER_ACCOUNT", "0")))
 
     try:
@@ -510,10 +516,17 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 set_sending_state(tg_user_id, state=state)
                 break
 
+            iter_started = time.monotonic()
+            min_delay = 2.0
+            max_delay = 4.0
+
             async with db_session() as session:
                 user = await get_or_create_user(session, tg_user_id)
                 db_user_id = int(user.id)
                 sender_name = getattr(user, "sender_name", None)
+                timing = await load_timing(session, tg_user_id)
+                min_delay = float(timing.get("min_delay", 2.0))
+                max_delay = float(timing.get("max_delay", 4.0))
 
                 if not rotation_accounts:
                     rotation_accounts = _shuffle_rotation_accounts(
@@ -532,18 +545,17 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     set_sending_state(tg_user_id, state=state)
                     break
 
-                targets = await _get_targets(session, db_user_id)
-                if not targets:
+                burst_size = max(1, min(8, int(timing.get("batch_size", 3))))
+                targets_batch = await _get_targets(session, db_user_id, limit=burst_size)
+                if not targets_batch:
                     state.is_running = False
                     state.last_status = "DONE"
                     set_sending_state(tg_user_id, state=state)
                     break
 
-                timing = await load_timing(session, tg_user_id)
-                min_delay = float(timing.get("min_delay", 2.0))
-                max_delay = float(timing.get("max_delay", 4.0))
+                send_one_timeout = mailing_send_timeouts(batch_size=burst_size)
 
-                # Ротация ящиков + случайный умный пресет на каждое письмо.
+                # Ротация ящиков; с ящика — пачка писем за одно SMTP через SOCKS5.
                 acc: EmailAccount | None = None
                 if mail_max_per_account > 0:
                     eligible = [
@@ -571,112 +583,136 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                     acc = rotation_accounts[acc_idx % len(rotation_accounts)]
                 acc_idx += 1
 
-                tgt = targets[0]
-                to_addr = (tgt.email or "").strip()
-                state.current_to = to_addr
+                batch_jobs: list[tuple[OfferEmail, str, str, str]] = []
+                for tgt in targets_batch:
+                    to_addr = (tgt.email or "").strip()
+                    if not to_addr:
+                        continue
+                    subject, body = await _build_message_for_target(
+                        session, tg_user_id, tgt
+                    )
+                    batch_jobs.append((tgt, to_addr, subject, body))
+
+                if not batch_jobs:
+                    continue
+
+                state.current_to = batch_jobs[0][1]
                 state.last_status = "SENDING"
                 set_sending_state(tg_user_id, state=state)
 
+                smtp_items = [(j[1], j[2], j[3]) for j in batch_jobs]
                 try:
-                    subject, body = await _build_message_for_target(session, tg_user_id, tgt)
+                    from services.mailing_send import send_mailing_batch
+
                     logger.info(
-                        "[mailing rotate] from=%s to=%s subject=%r",
+                        "[mailing burst] from=%s count=%s first=%s",
                         acc.email,
-                        to_addr,
-                        (subject or "")[:60],
+                        len(smtp_items),
+                        smtp_items[0][0],
                     )
                     async with smtp_sem:
-                        ok, err, _msgid = await asyncio.wait_for(
-                            send_mailing_one(
+                        results = await asyncio.wait_for(
+                            send_mailing_batch(
                                 session,
                                 db_user_id,
                                 acc,
-                                to_addr,
-                                subject,
-                                body,
+                                smtp_items,
                                 sender_name=sender_name,
                             ),
                             timeout=send_one_timeout,
                         )
                 except asyncio.TimeoutError:
-                    ok, err = False, normalize_send_error(
-                        f"SMTP_TIMEOUT|timeout|SMTP send exceeded {send_one_timeout}s"
-                    )
+                    results = [
+                        (
+                            False,
+                            normalize_send_error(
+                                f"SMTP_TIMEOUT|timeout|batch exceeded {send_one_timeout}s"
+                            ),
+                        )
+                    ] * len(batch_jobs)
                 except Exception as e:
-                    ok, err = False, normalize_send_error(str(e))
+                    err_one = normalize_send_error(str(e))
+                    results = [(False, err_one)] * len(batch_jobs)
 
                 state.current_to = ""
-                if ok:
-                    state.sent_count += 1
-                    state.last_status = "NORMAL"
-                    account_send_counts[int(acc.id)] = account_send_counts.get(int(acc.id), 0) + 1
-                    offer_sent = getattr(tgt, "offer", None)
-                    if offer_sent:
-                        try:
-                            from services.offer_storage import (
-                                offer_effective_link,
-                                offer_effective_title,
-                            )
-                            from services.mailing_send_log import record_mailing_send
-                            from services.incoming_mail_worker import _upsert_convlink
-
-                            offer_link = (offer_effective_link(offer_sent) or "").strip()
-                            from services.offer_matching import _canon_email
-
-                            inbox_c = _canon_email(acc.email or "")
-                            contact_c = _canon_email(to_addr)
-                            await record_mailing_send(
-                                session,
-                                user_id=int(db_user_id),
-                                offer_id=int(offer_sent.id),
-                                offer_email_id=int(tgt.id),
-                                inbox_email=inbox_c,
-                                to_email=contact_c,
-                                subject=subject,
-                                title_snapshot=offer_effective_title(offer_sent),
-                            )
-                            if offer_link:
-                                await _upsert_convlink(
-                                    user_id=int(db_user_id),
-                                    inbox_email=inbox_c,
-                                    contact_email=contact_c,
-                                    ad_url=offer_link,
-                                    pinned_offer_id=int(offer_sent.id),
+                for (tgt, to_addr, subject, body), (ok, err) in zip(batch_jobs, results):
+                    if ok:
+                        state.sent_count += 1
+                        state.last_status = "NORMAL"
+                        account_send_counts[int(acc.id)] = (
+                            account_send_counts.get(int(acc.id), 0) + 1
+                        )
+                        offer_sent = getattr(tgt, "offer", None)
+                        if offer_sent:
+                            try:
+                                from services.offer_storage import (
+                                    offer_effective_link,
+                                    offer_effective_title,
                                 )
-                        except Exception:
-                            logger.exception(
-                                "mailing_send_log / convlink after send to=%s offer=%s",
-                                to_addr,
-                                getattr(offer_sent, "id", None),
+                                from services.mailing_send_log import record_mailing_send
+                                from services.incoming_mail_worker import _upsert_convlink
+
+                                offer_link = (offer_effective_link(offer_sent) or "").strip()
+                                from services.offer_matching import _canon_email
+
+                                inbox_c = _canon_email(acc.email or "")
+                                contact_c = _canon_email(to_addr)
+                                await record_mailing_send(
+                                    session,
+                                    user_id=int(db_user_id),
+                                    offer_id=int(offer_sent.id),
+                                    offer_email_id=int(tgt.id),
+                                    inbox_email=inbox_c,
+                                    to_email=contact_c,
+                                    subject=subject,
+                                    title_snapshot=offer_effective_title(offer_sent),
+                                )
+                                if offer_link:
+                                    await _upsert_convlink(
+                                        user_id=int(db_user_id),
+                                        inbox_email=inbox_c,
+                                        contact_email=contact_c,
+                                        ad_url=offer_link,
+                                        pinned_offer_id=int(offer_sent.id),
+                                    )
+                            except Exception:
+                                logger.exception(
+                                    "mailing_send_log / convlink after send to=%s",
+                                    to_addr,
+                                )
+                        await _purge_target(session, db_user_id, tgt.id)
+                    else:
+                        state.last_status = "NORMAL"
+                        blocked = await _handle_send_failure(
+                            session=session,
+                            db_user_id=db_user_id,
+                            state=state,
+                            tgt=tgt,
+                            err=err or "UNKNOWN",
+                            acc=acc,
+                            bot=bot,
+                            chat_id=chat_id,
+                        )
+                        if blocked:
+                            rotation_accounts = _remove_account_from_rotation(
+                                rotation_accounts, int(acc.id)
                             )
-                    await _purge_target(session, db_user_id, tgt.id)
-                else:
-                    state.last_status = "NORMAL"
-                    blocked = await _handle_send_failure(
-                        session=session,
-                        db_user_id=db_user_id,
-                        state=state,
-                        tgt=tgt,
-                        err=err or "UNKNOWN",
-                        acc=acc,
-                        bot=bot,
-                        chat_id=chat_id,
-                    )
-                    if blocked:
-                        rotation_accounts = _remove_account_from_rotation(
-                            rotation_accounts, int(acc.id)
-                        )
-                        state.accounts_active = len(rotation_accounts)
-                        logger.info(
-                            "removed smtp_blocked account from rotation: %s",
-                            acc.email,
-                        )
+                            state.accounts_active = len(rotation_accounts)
+                            logger.info(
+                                "removed smtp_blocked account from rotation: %s",
+                                acc.email,
+                            )
+                            break
 
                 set_sending_state(tg_user_id, state=state)
 
             if not state.is_running:
                 break
-            await asyncio.sleep(random.uniform(min_delay, max_delay))
+            # Интервал = минимум секунд на одно письмо (как в обычном софте), не «SMTP + пауза».
+            pace = random.uniform(min_delay, max_delay)
+            wait_more = pace - (time.monotonic() - iter_started)
+            if wait_more > 0:
+                await asyncio.sleep(wait_more)
 
     except TelegramNetworkError:
         state.is_running = False

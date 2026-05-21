@@ -71,7 +71,7 @@ def _timing_default() -> dict:
         "max": 5,
         "min_delay": 2,
         "max_delay": 4,
-        "batch_size": 1,
+        "batch_size": 3,
     }
 
 
@@ -95,7 +95,7 @@ async def load_timing(session: Session, tg_user_id: int) -> dict:
                 # совместимость с send.py, который может ожидать min_delay/max_delay/batch_size
                 base["min_delay"] = float(base.get("min_delay", base["min"]))
                 base["max_delay"] = float(base.get("max_delay", base["max"]))
-                base["batch_size"] = 1  # рассылка всегда 1 ящик → 1 письмо
+                base["batch_size"] = max(1, min(8, int(base.get("batch_size", 3))))
 
                 return base
         except Exception:
@@ -113,6 +113,6 @@ async def save_timing(session: Session, tg_user_id: int, timing: dict) -> None:
         "max": int(timing.get("max", 5)),
         "min_delay": float(timing.get("min_delay", timing.get("min", 1))),
         "max_delay": float(timing.get("max_delay", timing.get("max", 5))),
-        "batch_size": 1,
+        "batch_size": max(1, min(8, int(timing.get("batch_size", 3)))),
     }
     await set_user_setting(session, user, TIMING_KEY, json.dumps(payload, ensure_ascii=False))
