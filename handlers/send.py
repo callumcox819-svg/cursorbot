@@ -311,6 +311,38 @@ async def start_sending(message: Message):
 
     status_msg = await message.answer("⏳ Проверяю очередь и аккаунты…", parse_mode="HTML")
 
+    try:
+        await _start_sending_impl(
+            message,
+            tg_user_id=tg_user_id,
+            chat_id=chat_id,
+            bot=bot,
+            status_msg=status_msg,
+        )
+    except Exception as e:
+        logger.exception("start_sending failed tg=%s", tg_user_id)
+        err = str(e).replace("<", "").replace(">", "")[:300]
+        try:
+            await status_msg.edit_text(
+                f"❌ <b>Не удалось запустить рассылку</b>\n\n<code>{err}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            await tg_answer_safe(
+                message,
+                f"❌ Не удалось запустить рассылку: {err}",
+                reply_markup=main_menu_kb(tg_user_id),
+            )
+
+
+async def _start_sending_impl(
+    message: Message,
+    *,
+    tg_user_id: int,
+    chat_id: int,
+    bot: Bot,
+    status_msg: Message,
+) -> None:
     async with db_session() as session:
         db_user = await get_or_create_user(session, int(tg_user_id))
 
@@ -325,14 +357,9 @@ async def start_sending(message: Message):
         cleared = await clear_legacy_account_proxy_state(session, int(db_user_id))
         if cleared:
             logger.info("Cleared legacy proxy state on %s accounts", cleared)
-        revived = await revive_proxies_after_transient_mailing_errors(
-            session, int(db_user_id)
-        )
+        revived = await revive_all_mailing_dead_proxies(session, int(db_user_id))
         if revived:
-            logger.info("Revived %s proxies after transient mailing errors", revived)
-        soft = await revive_soft_dead_proxies(session, int(db_user_id))
-        if soft:
-            logger.info("Revived %s soft-dead proxies for mailing pool", soft)
+            logger.info("Revived %s proxies for mailing pool", revived)
         reset_mailing_proxy_round_robin(int(db_user_id))
 
         accounts = await _get_active_accounts(session, db_user_id)
@@ -591,11 +618,11 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 pass
             return
 
-        from services.proxy_binding import revive_proxies_after_transient_mailing_errors
+        from services.proxy_binding import revive_all_mailing_dead_proxies
         from services.smtp_proxy_send import _list_active_socks5_proxies
 
         if not await _list_active_socks5_proxies(session, int(db_user_id)):
-            await revive_proxies_after_transient_mailing_errors(session, int(db_user_id))
+            await revive_all_mailing_dead_proxies(session, int(db_user_id))
         if not await _list_active_socks5_proxies(session, int(db_user_id)):
             state.is_running = False
             state.last_error = "PROXY_ERROR|no_active_proxy|No sendable SOCKS5"
