@@ -33,7 +33,9 @@ _NO_ACCESS_KINDS = frozenset(
 )
 _NO_ACCESS_PHRASES = (
     "username and password not accepted",
+    "authentication credentials invalid",
     "invalid credentials",
+    "smtpauthenticationerror",
     "authentication unsuccessful",
     "web login required",
     "please log in via your web browser",

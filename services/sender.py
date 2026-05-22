@@ -182,6 +182,41 @@ def _extract_code_text_from_exception(e: Exception) -> tuple[Optional[str], str]
     return code, (text or "").strip()
 
 
+def _classify_smtp_exception(e: Exception) -> str:
+    """SMTP-ошибка в маркер ACCOUNT_* / PROXY_* (для /stat и блокировки ящика)."""
+    code, text = _extract_code_text_from_exception(e)
+    blob = f"{type(e).__name__}: {code or ''} {text}".strip() or str(e)
+
+    if _is_proxy_error(e, text):
+        return _marker("PROXY_ERROR", code or "socks", text or str(e))
+    if _is_smtp_timeout_text(text or str(e)):
+        return _marker("SMTP_TIMEOUT", code or "timeout", text or str(e))
+    if _is_invalid_creds(code, text or blob):
+        return _marker("ACCOUNT_INVALID_CREDENTIALS", code, text or blob)
+    if _is_web_login_required(text or blob):
+        return _marker("ACCOUNT_WEB_LOGIN_REQUIRED", code, text or blob)
+    if _is_rate_limit(code, text or blob):
+        return _marker("ACCOUNT_RATE_LIMIT", code, text or blob)
+    if _is_hard_bounce(code, text or blob):
+        return _marker("RECIPIENT_DEAD", code, text or blob)
+    if _is_blocked(code, text or blob):
+        return _marker("ACCOUNT_BLOCKED", code, text or blob)
+    return blob
+
+
+def is_account_invalid_credentials_error(err: str | None) -> bool:
+    s = normalize_send_error(err or "")
+    kind = s.split("|", 1)[0].split(":", 1)[0].strip().upper()
+    if kind == "ACCOUNT_INVALID_CREDENTIALS" or kind.startswith("ACCOUNT_INVALID"):
+        return True
+    t = s.lower()
+    if re.search(r"\b535\b", t) and (
+        "credential" in t or "password" in t or "authentication" in t
+    ):
+        return True
+    return any(re.search(p, t) for p in _INVALID_CRED_PATTERNS)
+
+
 # Только явные сбои SOCKS/прокси — НЕ голый SMTP timeout (часто лаг Gmail/прокси).
 _PROXY_PATTERNS_STRICT = [
     r"generalproxyerror",
@@ -217,9 +252,12 @@ _TRANSIENT_CONNECTION_PATTERNS = [
 
 _INVALID_CRED_PATTERNS = [
     r"authentication failed",
+    r"authentication credentials invalid",
+    r"invalid credentials",
     r"invalid login",
     r"bad credentials",
     r"username and password not accepted",
+    r"smtpauthenticationerror",
     r"534-5\.7\.9",
     r"535-5\.7\.8",
     r"5\.7\.8",
@@ -364,12 +402,20 @@ def normalize_send_error(err: str | None) -> str:
     if kind in _KNOWN_ERROR_KINDS:
         return s
     t = s.lower()
+    code_m = re.search(r"\b(421|450|451|452|454|534|535|550|551|552|553|554)\b", s)
+    code = code_m.group(1) if code_m else None
+    if _is_invalid_creds(code, s):
+        return _marker("ACCOUNT_INVALID_CREDENTIALS", code, s)
+    if _is_web_login_required(s):
+        return _marker("ACCOUNT_WEB_LOGIN_REQUIRED", code, s)
+    if _is_rate_limit(code, s) or _is_blocked(code, s):
+        return _marker("ACCOUNT_RATE_LIMIT", code, s)
     if _is_smtp_timeout_text(s):
         return _marker("SMTP_TIMEOUT", "timeout", s)
     if any(re.search(p, t) for p in _PROXY_PATTERNS_STRICT):
         return _marker("PROXY_ERROR", "socks", s)
-    if _is_hard_bounce(None, t):
-        return _marker("RECIPIENT_DEAD", None, s)
+    if _is_hard_bounce(code, t):
+        return _marker("RECIPIENT_DEAD", code, s)
     return s
 
 
@@ -515,28 +561,7 @@ def _send_plain_sync(
         return True, None, msgid
 
     except Exception as e:
-        code, text = _extract_code_text_from_exception(e)
-
-        if _is_proxy_error(e, text):
-            return False, _marker("PROXY_ERROR", code or "socks", text or str(e)), None
-        if _is_smtp_timeout_text(text or str(e)):
-            return False, _marker("SMTP_TIMEOUT", code or "timeout", text or str(e)), None
-
-        if _is_invalid_creds(code, text):
-            return False, _marker("ACCOUNT_INVALID_CREDENTIALS", code, text), None
-        if _is_web_login_required(text):
-            return False, _marker("ACCOUNT_WEB_LOGIN_REQUIRED", code, text), None
-
-        if _is_rate_limit(code, text):
-            return False, _marker("ACCOUNT_RATE_LIMIT", code, text), None
-
-        if _is_hard_bounce(code, text):
-            return False, _marker("RECIPIENT_DEAD", code, text), None
-
-        if _is_blocked(code, text):
-            return False, _marker("ACCOUNT_BLOCKED", code, text), None
-
-        return False, f"{type(e).__name__}: {code or ''} {text}".strip() or str(e), None
+        return False, _classify_smtp_exception(e), None
 
 
 async def send_email_via_account(
@@ -611,36 +636,22 @@ def _send_batch_sync(
                         )
                         results.append((True, None))
                 except Exception as e:
-                    code, text = _extract_code_text_from_exception(e)
-
-                    if _is_proxy_error(e, text):
-                        results.append((False, _marker("PROXY_ERROR", code or "socks", text or str(e))))
-                    elif _is_smtp_timeout_text(text or str(e)):
-                        results.append((False, _marker("SMTP_TIMEOUT", code or "timeout", text or str(e))))
-                    elif _is_invalid_creds(code, text):
-                        results.append((False, _marker("ACCOUNT_INVALID_CREDENTIALS", code, text)))
-                    elif _is_web_login_required(text):
-                        results.append((False, _marker("ACCOUNT_WEB_LOGIN_REQUIRED", code, text)))
-                    elif _is_rate_limit(code, text):
-                        results.append((False, _marker("ACCOUNT_RATE_LIMIT", code, text)))
-                    elif _is_hard_bounce(code, text):
-                        results.append((False, _marker("RECIPIENT_DEAD", code, text)))
-                    elif _is_blocked(code, text):
-                        results.append((False, _marker("ACCOUNT_BLOCKED", code, text)))
-                    else:
-                        results.append((False, f"{type(e).__name__}: {code or ''} {text}".strip() or str(e)))
+                    err = _classify_smtp_exception(e)
+                    results.append((False, err))
+                    if is_account_invalid_credentials_error(err) or (
+                        err.split("|", 1)[0].split(":", 1)[0].strip().upper()
+                        in ("ACCOUNT_WEB_LOGIN_REQUIRED", "ACCOUNT_RATE_LIMIT", "ACCOUNT_BLOCKED")
+                    ):
+                        break
                     try:
                         s.rset()
                     except Exception:
                         break
 
     except Exception as e:
-        code, text = _extract_code_text_from_exception(e)
-        err = normalize_send_error(
-            f"{type(e).__name__}: {code or ''} {text}".strip() or str(e)
-        )
-        while len(results) < len(items):
-            results.append((False, err))
+        err = _classify_smtp_exception(e)
+        results.append((False, err))
+        return results
 
     return results
 
