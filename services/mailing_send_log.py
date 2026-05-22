@@ -58,7 +58,7 @@ async def find_offer_by_mailing_log(
 
     subj_norm = normalized_reply_subject(subject)
     subj_c = _title_compact(subj_norm) if subj_norm else ""
-    contact = _canon_email(from_email)
+    contact = _canon_email(from_email) if (from_email or "").strip() else ""
     fn = (from_name or "").strip().lower()
     subj_strong = subject_is_informative(subject)
     rows = (
@@ -167,7 +167,9 @@ async def find_offer_by_mailing_log(
             )
         )
         if subj_strong and not snap_ok and not offer_matches_incoming_subject(off, subject):
-            continue
+            # Tutti/relay: ответ с другого From, но тема/снапшот рассылки совпали — берём лот.
+            if not (title_match or subj_match):
+                continue
         if rank > best_rank:
             best_rank = rank
             best = off

@@ -991,7 +991,13 @@ async def mail_card_offer_meta(
         offer_matches_incoming_subject,
         subject_is_informative,
     )
-    from services.offer_storage import offer_effective_price, offer_effective_photo, offer_effective_title
+    from services.offer_storage import (
+        offer_bound_to_validated_email,
+        offer_effective_link,
+        offer_effective_price,
+        offer_effective_photo,
+        offer_effective_title,
+    )
 
     offer_id = None
     service_label = product_title = photo_url = offer_price = None
@@ -1014,16 +1020,31 @@ async def mail_card_offer_meta(
             title = offer_effective_title(off)
             conflict = bool(title and subj_norm and _subject_title_conflicts(subject, title))
             matched = offer_matches_incoming_subject(off, subject)
-            if conflict or (subject_is_informative(subject) and subj_norm and not matched):
+            trusted = bool(
+                resolved_offer_id and int(off.id) == int(resolved_offer_id)
+            )
+            if not trusted and (from_email or "").strip():
+                trusted = await offer_bound_to_validated_email(
+                    session,
+                    user_id=int(user_id),
+                    offer=off,
+                    contact_email=from_email,
+                )
+            if conflict:
                 product_title = subj_display
-            else:
+            elif trusted or not (
+                subject_is_informative(subject) and subj_norm and not matched
+            ):
                 offer_id = int(off.id)
                 product_title = title or subj_display
-                service_label = _service_label_from_link((off.link or "").strip())
+                eff_link = (offer_effective_link(off) or (off.link or "")).strip()
+                service_label = _service_label_from_link(eff_link) or None
                 ph = offer_effective_photo(off)
                 photo_url = ph or None
                 p = offer_effective_price(off, default="")
                 offer_price = p or None
+            else:
+                product_title = subj_display
         elif subject_is_informative(subject) and subj_display:
             product_title = subj_display
     except Exception:
