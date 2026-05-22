@@ -238,7 +238,10 @@ async def find_offer_by_incoming_subject(
     if best and best_key >= 50.0:
         return best
 
-    word_toks = [t for t in _subject_tokens(subj_norm) if len(t) >= 4]
+    from services.offer_matching import _product_token_hits, product_match_tokens
+
+    word_toks = product_match_tokens(subject)
+    need_hits = 2 if len(word_toks) >= 2 else 1
     all_rows = (
         await session.execute(
             sa_select(Offer)
@@ -249,10 +252,10 @@ async def find_offer_by_incoming_subject(
     ).scalars().all()
     for off in all_rows:
         title = offer_effective_title(off)
-        if not title or _subject_title_conflicts(subj_norm, title):
+        if not title or _subject_title_conflicts(subject, title):
             continue
         tf = _fold_match_text(title)
-        if word_toks and not all(w in tf for w in word_toks):
+        if word_toks and _product_token_hits(word_toks, tf) < need_hits:
             continue
         tc = _title_compact(title)
         if tc and (tc == subj_compact or tc in subj_compact or subj_compact in tc):
@@ -360,14 +363,16 @@ async def find_offer_by_subject_aggressive(
         return None
     from services.subject_offer import offer_title_from_mail_subject
 
+    from services.offer_matching import _product_token_hits, product_match_tokens
+
     subj_norm = offer_title_from_mail_subject(subject) or normalized_reply_subject(subject)
-    toks = [t for t in _subject_tokens(subj_norm) if len(t) >= 3]
-    word_toks = [t for t in toks if len(t) >= 4]
+    word_toks = product_match_tokens(subject)
     if not word_toks:
         return None
+    need_hits = 2 if len(word_toks) >= 2 else 1
 
     stmt = sa_select(Offer).where(Offer.user_id == int(user_id))
-    for t in word_toks[:4]:
+    for t in word_toks[:2]:
         pat = f"%{t}%"
         stmt = stmt.where(
             sa_or(
@@ -383,7 +388,8 @@ async def find_offer_by_subject_aggressive(
         rows = [
             o
             for o in pool
-            if all(w in _fold_match_text(offer_effective_title(o)) for w in word_toks)
+            if _product_token_hits(word_toks, _fold_match_text(offer_effective_title(o)))
+            >= need_hits
         ]
 
     subj_c = _title_compact(subj_norm)
@@ -391,10 +397,10 @@ async def find_offer_by_subject_aggressive(
     best_sc = 0.0
     for off in rows:
         title = offer_effective_title(off)
-        if not title or _subject_title_conflicts(subj_norm, title):
+        if not title or _subject_title_conflicts(subject, title):
             continue
         tf = _fold_match_text(title)
-        if not all(w in tf for w in word_toks):
+        if _product_token_hits(word_toks, tf) < need_hits:
             continue
         tc = _title_compact(title)
         sc = float(len(word_toks)) * 20.0
@@ -415,10 +421,13 @@ async def find_offer_by_core_subject_title(
     """
     Лот по OFFER-названию в теме (шаблон рассылки), даже если from_email не в OfferEmail.
     """
+    from difflib import SequenceMatcher
+
     from services.offer_matching import (
         _fold_match_text,
+        _product_token_hits,
         _subject_title_conflicts,
-        _subject_tokens,
+        product_match_tokens,
         resolve_offer_by_subject_tokens,
     )
     from services.subject_offer import offer_title_from_mail_subject
@@ -428,40 +437,69 @@ async def find_offer_by_core_subject_title(
         return None
 
     off = await resolve_offer_by_subject_tokens(
-        session, user_id=int(user_id), subject=core
+        session, user_id=int(user_id), subject=subject
     )
     if off:
         return off
 
+    product_toks = product_match_tokens(subject)
+    if product_toks:
+        stmt = sa_select(Offer).where(Offer.user_id == int(user_id))
+        for t in product_toks[:2]:
+            pat = f"%{t}%"
+            stmt = stmt.where(
+                sa_or(
+                    func.lower(Offer.title).like(pat),
+                    func.lower(Offer.raw_json).like(pat),
+                )
+            )
+        sql_rows = (
+            await session.execute(stmt.order_by(Offer.id.desc()).limit(40))
+        ).scalars().all()
+        if sql_rows:
+            rows = sql_rows
+        else:
+            rows = []
+    else:
+        rows = []
+
     subj_c = _title_compact(core)
-    if not subj_c:
-        return None
-    rows = (
-        await session.execute(
-            sa_select(Offer)
-            .where(Offer.user_id == int(user_id))
-            .order_by(Offer.id.desc())
-            .limit(800)
-        )
-    ).scalars().all()
-    product_toks = [t for t in _subject_tokens(core) if len(t) >= 4]
+    if not rows:
+        rows = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.user_id == int(user_id))
+                .order_by(Offer.id.desc())
+                .limit(800)
+            )
+        ).scalars().all()
     best: Offer | None = None
     best_hits = 0
+    best_ratio = 0.0
     for off_row in rows:
         title = offer_effective_title(off_row)
-        if not title or _subject_title_conflicts(core, title):
+        if not title or _subject_title_conflicts(subject, title):
             continue
         tc = _title_compact(title)
-        if tc and (tc == subj_c or subj_c in tc or tc in subj_c):
-            return off_row
+        if tc and subj_c:
+            if tc == subj_c or subj_c in tc or tc in subj_c:
+                return off_row
+            ratio = SequenceMatcher(None, subj_c, tc).ratio()
+            if ratio >= 0.78 and ratio > best_ratio:
+                best_ratio = ratio
+                best = off_row
         tf = _fold_match_text(title)
         if product_toks:
-            hits = sum(1 for t in product_toks if t in tf)
+            hits = _product_token_hits(product_toks, tf)
             need = 2 if len(product_toks) >= 2 else 1
             if hits >= need and hits > best_hits:
                 best_hits = hits
                 best = off_row
-    return best
+    if best and best_hits >= (2 if len(product_toks) >= 2 else 1):
+        return best
+    if best_ratio >= 0.78:
+        return best
+    return None
 
 
 async def diagnose_subject_match(
@@ -471,7 +509,7 @@ async def diagnose_subject_match(
     subject: str,
 ) -> dict[str, Any]:
     """Подсказка в ошибке: есть ли похожие лоты в БД."""
-    from services.offer_matching import _fold_match_text, _subject_tokens
+    from services.offer_matching import _fold_match_text, _product_token_hits, product_match_tokens
     from services.subject_offer import offer_title_from_mail_subject
 
     total = (
@@ -480,7 +518,8 @@ async def diagnose_subject_match(
         )
     ).scalar() or 0
     core = offer_title_from_mail_subject(subject)
-    word_toks = [t for t in _subject_tokens(core) if len(t) >= 4] if core else []
+    word_toks = product_match_tokens(subject) if core else []
+    need_hits = 2 if len(word_toks) >= 2 else (1 if word_toks else 0)
     near = 0
     samples: list[str] = []
     rows = (
@@ -510,7 +549,7 @@ async def diagnose_subject_match(
             )
         if not hay.strip():
             continue
-        if word_toks and all(w in hay for w in word_toks):
+        if word_toks and _product_token_hits(word_toks, hay) >= need_hits:
             near += 1
             if len(samples) < 3:
                 samples.append((title or str(raw.get("item_title") or ""))[:50])
@@ -519,6 +558,7 @@ async def diagnose_subject_match(
         "near": int(near),
         "samples": samples,
         "words": word_toks[:4],
+        "core": (core or "")[:80],
     }
 
 
@@ -673,6 +713,7 @@ async def find_offer_by_incoming_signals(
     from services.offer_matching import (
         _canon_email,
         _fold_match_text,
+        _product_token_hits,
         _ratio,
         _subject_distinct_tokens,
         _subject_title_conflicts,
@@ -681,6 +722,7 @@ async def find_offer_by_incoming_signals(
         normalized_reply_subject,
         offer_has_contact_email,
         offer_matches_incoming_subject,
+        product_match_tokens,
         score_offer,
         subject_is_informative,
         subject_match_score,
@@ -775,7 +817,8 @@ async def find_offer_by_incoming_signals(
             continue
         if distinct:
             tf = _fold_match_text(title)
-            if not all(t in tf for t in distinct):
+            need_d = 2 if len(distinct) >= 2 else 1
+            if _product_token_hits(distinct, tf) < need_d:
                 continue
 
         email_hit = bool(
@@ -822,7 +865,8 @@ async def find_offer_by_incoming_signals(
             if subj_c and tc and (tc == subj_c or tc in subj_c or subj_c in tc):
                 return off
             tf = _fold_match_text(title)
-            if all(w in tf for w in _subject_tokens(subj_norm) if len(w) >= 4):
+            pt = product_match_tokens(subject)
+            if pt and _product_token_hits(pt, tf) >= (2 if len(pt) >= 2 else 1):
                 return off
 
     if not best:

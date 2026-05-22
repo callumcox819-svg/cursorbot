@@ -393,6 +393,8 @@ def should_retry_send_with_other_proxy(err: str | None) -> bool:
         return False
     if "no_active_proxy" in s.lower() or "no_proxy_context" in s.lower():
         return False
+    if "pool_retry" in s.lower():
+        return True
     if kind in {"SMTP_SESSION_LOST", "SMTP_TIMEOUT", "PROXY_ERROR"}:
         return True
     if is_smtp_timeout_error(err) or is_transient_connection_error(err):

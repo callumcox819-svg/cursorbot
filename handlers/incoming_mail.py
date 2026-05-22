@@ -1441,10 +1441,22 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
                 ).scalar() or 0
                 words = diag.get("words") or []
                 w_hint = "+".join(words) if words else "—"
-                reasons.append(
-                    f"нет Offer в БД по теме «{subj_hint}» (лотов: {diag.get('total', 0)}, "
-                    f"с словами {w_hint}: {diag.get('near', 0)})"
+                core_offer = (diag.get("core") or subj_product or "").strip()
+                core_line = (
+                    f"OFFER из темы: «{_e(core_offer[:70])}»\n"
+                    if core_offer and core_offer != subj_hint
+                    else ""
                 )
+                reasons.append(
+                    f"{core_line}"
+                    f"нет Offer в БД (лотов: {diag.get('total', 0)}, "
+                    f"товарные слова {w_hint}: {diag.get('near', 0)} совпадений)"
+                )
+                if not diag.get("near") and core_offer:
+                    reasons.append(
+                        f"тема письма «{subj_hint[:80]}» — загрузите JSON с этим лотом "
+                        "и сделайте /send с той же темой"
+                    )
                 samples = diag.get("samples") or []
                 if samples:
                     reasons.append("похожие названия: " + "; ".join(samples[:3]))

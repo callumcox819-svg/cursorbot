@@ -96,6 +96,33 @@ _SUBJECT_WEAK = frozenset(
     }
 )
 
+# Место / способ получения в OFFER-теме — не требуем в названии лота (Bulach, Abholung).
+_SUBJECT_LOCATION = frozenset(
+    {
+        "abholung",
+        "abholen",
+        "pickup",
+        "collection",
+        "bulach",
+        "zur",
+        "zum",
+        "von",
+        "aus",
+        "bei",
+        "ort",
+        "stadt",
+        "region",
+        "kanton",
+        "verfuegbar",
+        "available",
+        "disponible",
+        "noch",
+        "frage",
+        "anfrage",
+        "kurze",
+    }
+)
+
 # Разные категории товара в теме и в названии лота (Sofa vs Télévision samsung).
 _PRODUCT_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"sofa", "couch", "sectional", "divan", "canape", "canapee", "ecksofa", "sessel"}),
@@ -148,11 +175,42 @@ def _fold_de(s: str) -> str:
     return s
 
 
-def _subject_distinct_tokens(subj: str) -> list[str]:
-    """Слова только из OFFER-названия в теме."""
+def product_match_tokens(subj: str) -> list[str]:
+    """Токены товара из OFFER-части темы (без локации и служебных слов)."""
     core = offer_title_from_mail_subject(subj) or subj
     base = _fold_match_text(core)
-    return [t for t in _subject_tokens(base) if len(t) >= 4 and t not in _SUBJECT_WEAK]
+    return [
+        t
+        for t in _subject_tokens(base)
+        if len(t) >= 4 and t not in _SUBJECT_WEAK and t not in _SUBJECT_LOCATION
+    ]
+
+
+def _token_in_folded_hay(tok: str, hay: str, *, ratio_min: float = 0.86) -> bool:
+    """Токен в строке; kalax ≈ kallax."""
+    t = (tok or "").strip().lower()
+    h = (hay or "").strip().lower()
+    if not t or not h:
+        return False
+    if t in h:
+        return True
+    if len(t) < 4:
+        return False
+    for w in re.findall(r"[^\W\d_]{3,}", h, flags=re.UNICODE):
+        if w == t or (len(w) >= 4 and SequenceMatcher(None, t, w).ratio() >= ratio_min):
+            return True
+    return False
+
+
+def _product_token_hits(tokens: list[str], hay: str) -> int:
+    if not tokens or not hay:
+        return 0
+    return sum(1 for t in tokens if _token_in_folded_hay(t, hay))
+
+
+def _subject_distinct_tokens(subj: str) -> list[str]:
+    """Слова только из OFFER-названия в теме (товар, не место)."""
+    return product_match_tokens(subj)
 
 
 def _fold_match_text(s: str) -> str:
@@ -179,10 +237,7 @@ def offer_title_from_mail_subject(subject: str) -> str:
 
 def _subject_significant_tokens(subj: str) -> list[str]:
     """Токены только из OFFER-части темы (название товара)."""
-    core = offer_title_from_mail_subject(subj)
-    if not core:
-        return []
-    return [t for t in _subject_tokens(core) if len(t) >= 4]
+    return product_match_tokens(subj)
 
 
 async def resolve_offer_by_subject_tokens(
@@ -221,7 +276,7 @@ async def resolve_offer_by_subject_tokens(
             continue
         if _subject_title_conflicts(core, offer_effective_title(off)):
             continue
-        hits = sum(1 for t in toks if t in title)
+        hits = _product_token_hits(toks, title)
         need = 2
         if len(toks) == 1 and len(toks[0]) >= 7:
             need = 1
@@ -515,23 +570,33 @@ def _subject_title_conflicts(subj: str, title: str) -> bool:
 
     subj_toks = set(_subject_tokens(subj))
     title_toks = set(_subject_tokens(title_l))
-    # Re: полное название лота + пара уточняющих слов в теме — не конфликт.
-    if len(title_toks) >= 2 and title_toks <= subj_toks:
+    # Re: название лота в теме (+ место Abholung) — не конфликт.
+    title_product = [t for t in title_toks if len(t) >= 4 and t not in _SUBJECT_WEAK]
+    if len(title_product) >= 2 and all(_token_in_folded_hay(t, subj) for t in title_product):
         return False
 
-    distinct = _subject_distinct_tokens(subj)
+    distinct = product_match_tokens(subj)
     if distinct:
-        if not all(t in title_l for t in distinct):
+        matched = _product_token_hits(distinct, title_l)
+        need = 2 if len(distinct) >= 2 else 1
+        if matched >= need:
+            return False
+        if matched < need:
             return True
-        title_distinct = [t for t in _subject_tokens(title_l) if len(t) >= 4 and t not in _SUBJECT_WEAK]
-        if title_distinct and not all(t in subj for t in title_distinct):
-            return True
+        title_distinct = product_match_tokens(title_l)
+        if title_distinct:
+            back = _product_token_hits(title_distinct, subj)
+            back_need = 2 if len(title_distinct) >= 2 else 1
+            if back < back_need:
+                return True
 
     sig_min = 5
     significant = [
         t
         for t in _subject_tokens(subj)
-        if len(t) >= sig_min and t not in ("stuhle", "stuhl", "chair", "chairs")
+        if len(t) >= sig_min
+        and t not in ("stuhle", "stuhl", "chair", "chairs")
+        and t not in _SUBJECT_LOCATION
     ]
     title_sig = [
         t
@@ -539,11 +604,11 @@ def _subject_title_conflicts(subj: str, title: str) -> bool:
         if len(t) >= sig_min and t not in ("stuhle", "stuhl", "chair", "chairs")
     ]
     if title_sig:
-        extra_in_title = sum(1 for t in title_sig if t not in subj)
+        extra_in_title = sum(1 for t in title_sig if not _token_in_folded_hay(t, subj))
         if extra_in_title >= 2:
             return True
     if significant:
-        missing = sum(1 for t in significant if t not in title_l)
+        missing = sum(1 for t in significant if not _token_in_folded_hay(t, title_l))
         if missing >= 3:
             return True
         if (
@@ -638,7 +703,7 @@ def subject_token_hits(subject: str, off: Offer) -> int:
     title_l = _fold_match_text(offer_effective_title(off))
     if not title_l:
         return 0
-    return sum(1 for tok in _subject_tokens(core) if tok in title_l)
+    return _product_token_hits(product_match_tokens(subject), title_l)
 
 
 def subject_match_score(subject: str, off: Offer) -> float:
@@ -666,8 +731,8 @@ def subject_match_score(subject: str, off: Offer) -> float:
     subj_l = subj
     title_l = title
     tok_hits = 0
-    for tok in _subject_tokens(core):
-        if tok in title_l:
+    for tok in product_match_tokens(subject):
+        if _token_in_folded_hay(tok, title_l):
             tok_hits += 1
             score += 24.0
     if tok_hits >= 2:

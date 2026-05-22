@@ -117,8 +117,11 @@ async def _send_with_proxy_pool(
         )
 
         if mailing and is_mailing_proxy_failure(last_err):
-            await deactivate_proxy_from_mailing(session, proxy, last_err)
-            exclude.add(pid)
+            removed = await deactivate_proxy_from_mailing(session, proxy, last_err)
+            if removed:
+                exclude.add(pid)
+                continue
+            # мягкий таймаут — тот же прокси можно снова в следующей пачке
             continue
 
         dead = is_definite_proxy_failure(last_err)

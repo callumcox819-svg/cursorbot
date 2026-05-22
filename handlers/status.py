@@ -42,7 +42,11 @@ def _humanize_send_error(raw: str) -> str:
     detail = s.replace("\n", " ").strip()
     if len(detail) > 220:
         detail = detail[:220] + "…"
-    if "no_active_proxy" in s.lower():
+    if "pool_retry" in s.lower():
+        hint = (
+            "Прокси в меню 🟢, но рассылка исчерпала круг — остановите /stop и снова /send"
+        )
+    elif "no_active_proxy" in s.lower():
         hint = "Нет активного SOCKS5 в БД (добавьте или «Проверить прокси»)"
     if hint:
         return f"{hint}\n<code>{detail}</code>"
