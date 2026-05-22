@@ -1311,20 +1311,37 @@ async def resolve_offer_for_aqua_link(
         url = offer_effective_link(off)
 
     if off and subject_is_informative(subject) and not offer_acceptable_for_subject(off, subject):
-        from services.offer_storage import find_offer_by_incoming_subject
-
-        off_subj = await find_offer_by_incoming_subject(
-            session,
-            user_id=int(user_id),
-            subject=subject,
-            from_name=from_name,
-            from_email=from_email,
+        keep_saved = bool(
+            resolved_offer_id and int(off.id) == int(resolved_offer_id)
         )
-        if off_subj and offer_acceptable_for_subject(off_subj, subject):
-            off = off_subj
-            url = (offer_effective_link(off_subj) or "").strip()
-        else:
-            off = None
-            url = ""
+        if not keep_saved:
+            from services.mailing_send_log import find_offer_by_mailing_log
+
+            off_log = await find_offer_by_mailing_log(
+                session,
+                user_id=int(user_id),
+                inbox_email=inbox_email or "",
+                subject=subject,
+                from_email=from_email,
+                from_name=from_name,
+            )
+            keep_saved = bool(off_log and int(off_log.id) == int(off.id))
+
+        if not keep_saved:
+            from services.offer_storage import find_offer_by_incoming_subject
+
+            off_subj = await find_offer_by_incoming_subject(
+                session,
+                user_id=int(user_id),
+                subject=subject,
+                from_name=from_name,
+                from_email=from_email,
+            )
+            if off_subj and offer_acceptable_for_subject(off_subj, subject):
+                off = off_subj
+                url = (offer_effective_link(off_subj) or "").strip()
+            else:
+                off = None
+                url = ""
 
     return off, url

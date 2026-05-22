@@ -750,7 +750,7 @@ async def resolve_offer_from_saved_context(
                 .limit(1)
             )
         ).scalars().first()
-        got = _pair_saved(off, (ad_url or "").strip())
+        got = _pair_saved(off, (ad_url or "").strip(), strict_subject=False)
         if got[0]:
             return got
 

@@ -836,6 +836,32 @@ async def _load_offer_by_id(session, *, user_id: int, oid: int) -> Offer | None:
     ).scalars().first()
 
 
+def _meta_tuple_from_offer(
+    off: Offer,
+    *,
+    subject: str = "",
+) -> tuple[int, str | None, str | None, str | None, str | None]:
+    """Сервис/товар/фото/цена строго с лота (для карточки и GAG)."""
+    from services.offer_matching import normalized_reply_subject
+    from services.offer_storage import (
+        offer_effective_link,
+        offer_effective_photo,
+        offer_effective_price,
+        offer_effective_title,
+    )
+
+    title = (offer_effective_title(off) or "").strip()
+    subj_norm = normalized_reply_subject(subject)
+    subj_display = (subj_norm[:1].upper() + subj_norm[1:]) if subj_norm else None
+    product_title = title or subj_display
+    eff_link = (offer_effective_link(off) or (off.link or "")).strip()
+    service_label = _service_label_from_link(eff_link) or None
+    photo_url = (offer_effective_photo(off) or "").strip() or None
+    p = (offer_effective_price(off, default="") or "").strip()
+    offer_price = p or None
+    return int(off.id), service_label, product_title, photo_url, offer_price
+
+
 async def resolve_offer_for_mail_card(
     session,
     *,
@@ -855,6 +881,12 @@ async def resolve_offer_for_mail_card(
     from services.offer_storage import find_offer_by_link
 
     stored_id = resolved_offer_id
+    # Уже привязан при IMAP (/send, журнал) — не отбрасываем из‑за Re: темы.
+    if stored_id:
+        off_saved = await _load_offer_by_id(session, user_id=int(user_id), oid=int(stored_id))
+        if off_saved:
+            return off_saved
+
     inbox = _canon_email(inbox_email or "")
     contact = _canon_email(from_email or "")
     if inbox and contact:
@@ -1015,6 +1047,18 @@ async def mail_card_offer_meta(
     offer_id = None
     service_label = product_title = photo_url = offer_price = None
     try:
+        if resolved_offer_id:
+            off_saved = await _load_offer_by_id(
+                session, user_id=int(user_id), oid=int(resolved_offer_id)
+            )
+            if off_saved:
+                oid, service_label, product_title, photo_url, offer_price = _meta_tuple_from_offer(
+                    off_saved, subject=subject
+                )
+                if not service_label:
+                    service_label = _service_label_from_body(body_text) or None
+                return oid, service_label, product_title, photo_url, offer_price
+
         off = await resolve_offer_for_mail_card(
             session,
             user_id=int(user_id),
@@ -1105,14 +1149,10 @@ async def persist_incoming_mail_snapshot(
     )
     if oid:
         mail_row.resolved_offer_id = int(oid)
-    if product_title:
-        mail_row.product_title = (product_title or "").strip() or None
-    if service_label:
-        mail_row.service_label = (service_label or "").strip() or None
-    if photo_url:
-        mail_row.photo_url = (photo_url or "").strip() or None
-    if offer_price:
-        mail_row.offer_price = (offer_price or "").strip() or None
+    mail_row.product_title = (product_title or "").strip() or None
+    mail_row.service_label = (service_label or "").strip() or None
+    mail_row.photo_url = (photo_url or "").strip() or None
+    mail_row.offer_price = (offer_price or "").strip() or None
     if oid and not (getattr(mail_row, "ad_url", None) or "").strip():
         from services.offer_storage import offer_effective_link
 
@@ -1150,7 +1190,9 @@ async def build_mail_card_from_mail(
 
     stored_title = (getattr(mail, "product_title", None) or "").strip()
     stored_service = (getattr(mail, "service_label", None) or "").strip()
-    oid, service_label, product_title, _photo, _price = await mail_card_offer_meta(
+    stored_photo = (getattr(mail, "photo_url", None) or "").strip()
+    stored_price = (getattr(mail, "offer_price", None) or "").strip()
+    oid, service_label, product_title, photo_url, offer_price = await mail_card_offer_meta(
         session,
         user_id=int(mail.user_id),
         from_email=str(getattr(mail, "from_email", "") or ""),
@@ -1166,6 +1208,10 @@ async def build_mail_card_from_mail(
         product_title = stored_title
     if stored_service and not service_label:
         service_label = stored_service
+    if stored_photo and not photo_url:
+        photo_url = stored_photo
+    if stored_price and not offer_price:
+        offer_price = stored_price
     if not oid and getattr(mail, "resolved_offer_id", None):
         oid = int(mail.resolved_offer_id)
 
@@ -1330,19 +1376,10 @@ async def _process_mails_for_account_impl(
 
                         subj = subject or ""
 
-                        off_mail = await resolve_offer_for_incoming_mail(
-                            session,
-                            user_id=int(user_id),
-                            from_email=from_email_clean,
-                            subject=subj,
-                            from_name=from_name or "",
-                            body_text=body_clean or "",
-                            stored_offer_id=None,
-                            inbox_email=inbox_email_clean,
-                        )
-                        if not off_mail and (inbox_email_clean or "").strip():
-                            from services.mailing_send_log import find_offer_by_mailing_log
+                        from services.mailing_send_log import find_offer_by_mailing_log
 
+                        off_mail = None
+                        if (inbox_email_clean or "").strip():
                             off_mail = await find_offer_by_mailing_log(
                                 session,
                                 user_id=int(user_id),
@@ -1350,6 +1387,17 @@ async def _process_mails_for_account_impl(
                                 subject=subj,
                                 from_email=from_email_clean,
                                 from_name=from_name or "",
+                            )
+                        if not off_mail:
+                            off_mail = await resolve_offer_for_incoming_mail(
+                                session,
+                                user_id=int(user_id),
+                                from_email=from_email_clean,
+                                subject=subj,
+                                from_name=from_name or "",
+                                body_text=body_clean or "",
+                                stored_offer_id=None,
+                                inbox_email=inbox_email_clean,
                             )
                         resolved_offer_id = int(off_mail.id) if off_mail else None
                         resolved_offer_email_id = None
@@ -1624,6 +1672,8 @@ async def _process_mails_for_account_impl(
                 elif photo_url and is_first:
                     photo_to_send = photo_url
                     photo_caption = "📷 Фото товара (первый ответ)"
+                    if (product_title or "").strip():
+                        photo_caption = f"📌 {(product_title or '').strip()}\n{photo_caption}"
                     if offer_price:
                         photo_caption += f"\n💰 Цена: {offer_price} 💰"
             except Exception:
