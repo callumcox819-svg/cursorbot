@@ -687,9 +687,10 @@ async def _quick_gmail_begin(message: Message, state: FSMContext) -> None:
         ]
     )
     await message.answer(
-        "⚡ <b>Быстрое добавление (Gmail)</b>\n\n"
+        "⚡ <b>Быстрое добавление</b>\n\n"
         "<b>Шаг 1/2.</b> Введите <b>имя и фамилию</b> для отправки писем\n"
         "(например: <code>Maria Johansen</code>).\n\n"
+        "Поддерживаются: Gmail, GMX, iCloud.\n\n"
         "Отмена: отправьте <code>-</code>",
         reply_markup=kb,
         parse_mode="HTML",
@@ -724,10 +725,11 @@ async def quick_gmail_sender_name(message: Message, state: FSMContext) -> None:
     await state.set_state(AccountsQuickGmailStates.waiting_gmail_creds)
     await message.answer(
         "✅ Имя сохранено.\n\n"
-        "<b>Шаг 2/2.</b> Отправьте Gmail-аккаунты:\n"
-        "<code>email@gmail.com:app_password</code>\n\n"
+        "<b>Шаг 2/2.</b> Отправьте почтовые аккаунты:\n"
+        "<code>email:пароль</code>\n\n"
         "Каждый аккаунт — с новой строки (можно несколько).\n"
-        "<b>app_password</b> — пароль приложения Google.\n\n"
+        "<b>Gmail / iCloud</b> — пароль приложения.\n"
+        "<b>GMX</b> (gmx.com, gmx.de, gmx.ch…) — обычный пароль, IMAP включён в настройках GMX.\n\n"
         "Отмена: <code>-</code>",
         parse_mode="HTML",
     )
@@ -748,14 +750,17 @@ async def quick_gmail_creds(message: Message, state: FSMContext) -> None:
 
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     if not lines:
-        return await message.answer("Не вижу строк. Формат: <code>login@gmail.com:пароль</code>", parse_mode="HTML")
+        return await message.answer(
+            "Не вижу строк. Формат: <code>email:пароль</code> (Gmail, GMX, iCloud)",
+            parse_mode="HTML",
+        )
 
     tg_id = message.from_user.id
     if bg_is_running(tg_id, "accounts_add"):
         return await message.answer("⏳ Добавление аккаунтов уже выполняется…")
 
     await state.clear()
-    await message.answer("⏳ Проверяю Gmail (IMAP)…")
+    await message.answer("⏳ Проверяю аккаунты (IMAP)…")
 
     async def _job() -> None:
         async with Session() as session:
@@ -767,7 +772,7 @@ async def quick_gmail_creds(message: Message, state: FSMContext) -> None:
                 await session.refresh(user)
             user.sender_name = sender_name
             ok_count, fail_count, details = await _bulk_add_accounts(
-                message, session, user, lines, gmail_only=True,
+                message, session, user, lines, gmail_only=False,
             )
             await session.commit()
         summary = (
