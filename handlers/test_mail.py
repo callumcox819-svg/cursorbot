@@ -158,6 +158,8 @@ async def _show_menu(message: Message, tg_id: int, *, edit: bool = False) -> Non
 
 async def _pick_send_context(
     tg_id: int,
+    *,
+    subject_rotation_index: int = 0,
 ) -> tuple[int, EmailAccount, str, str, str, str | None] | None:
     async with async_session() as session:
         user = (
@@ -184,7 +186,10 @@ async def _pick_send_context(
 
     from services.subject_offer import subject_for_offer
 
-    subject = subject_for_offer(offer_title or "")
+    subject = subject_for_offer(
+        offer_title or "",
+        rotation_index=int(subject_rotation_index),
+    )
     body = await pick_random_smart_preset(tg_id, offer_title)
     if not (body or "").strip():
         body = await pick_random_first_sms(tg_id, offer_title)
@@ -290,11 +295,22 @@ async def _run_test_batch(
     lines: List[str] = []
     last_subject = ""
     last_sender_name: str | None = None
+    subject_seq = 0
+
+    async with async_session() as session:
+        user = (
+            await session.execute(select(User).where(User.telegram_id == int(tg_id)).limit(1))
+        ).scalars().first()
+        if user:
+            from services.subject_offer import load_subject_rotation_index
+
+            subject_seq = await load_subject_rotation_index(session, int(user.id))
 
     for i, to_email in enumerate(targets):
         if i > 0:
             await asyncio.sleep(4)
-        ctx = await _pick_send_context(tg_id)
+        ctx = await _pick_send_context(tg_id, subject_rotation_index=subject_seq)
+        subject_seq += 1
         if not ctx:
             fail_n += 1
             lines.append(f"❌ {to_email}: нет аккаунта/шаблона")
@@ -327,12 +343,22 @@ async def _run_test_batch(
         except Exception:
             pass
 
+    async with async_session() as session:
+        user = (
+            await session.execute(select(User).where(User.telegram_id == int(tg_id)).limit(1))
+        ).scalars().first()
+        if user:
+            from services.subject_offer import save_subject_rotation_index
+
+            await save_subject_rotation_index(session, int(user.id), int(subject_seq))
+
     from_part = ""
     if last_sender_name:
         from_part = f"From: <code>{html.escape(last_sender_name)}</code>\n"
     summary = (
         f"<b>Тест завершён</b> — OK: {ok_n}, ошибок: {fail_n}\n"
-        f"Тема (как в рассылке): <code>{html.escape(last_subject or '—')}</code>\n"
+        f"Последняя тема: <code>{html.escape(last_subject or '—')}</code>\n"
+        f"<i>Темы ротируются: Anfrage → Kurze Frage → noch verfuegbar</i>\n"
         f"{from_part}\n"
         + "\n".join(lines)
     )

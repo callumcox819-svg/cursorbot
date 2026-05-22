@@ -190,7 +190,13 @@ async def clear_mailing_queue(session: AsyncSession, user_id: int) -> int:
     return before
 
 
-async def _build_message_for_target(session: AsyncSession, tg_user_id: int, tgt: OfferEmail) -> Tuple[str, str]:
+async def _build_message_for_target(
+    session: AsyncSession,
+    tg_user_id: int,
+    tgt: OfferEmail,
+    *,
+    subject_rotation_index: int = 0,
+) -> Tuple[str, str]:
     """Return (subject, body) for a single OfferEmail target."""
 
     offer: Offer | None = getattr(tgt, "offer", None)
@@ -238,12 +244,9 @@ async def _build_message_for_target(session: AsyncSession, tg_user_id: int, tgt:
 
     body = fold_plain_mail_text(body)
 
-    # ==========================
-    # Тема письма (глобально OFFER из config)
-    # ==========================
     from services.subject_offer import subject_for_offer
 
-    subject = subject_for_offer(item_title or "")
+    subject = subject_for_offer(item_title or "", rotation_index=int(subject_rotation_index))
 
     return subject, body
 
@@ -540,10 +543,14 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
     acc_idx = 0
     rotation_accounts: List[EmailAccount] = []
     account_send_counts: dict[int, int] = {}
+    subject_seq = 0
 
     async with db_session() as session:
         user = await get_or_create_user(session, tg_user_id)
         db_user_id = user.id
+        from services.subject_offer import load_subject_rotation_index
+
+        subject_seq = await load_subject_rotation_index(session, int(db_user_id))
 
         rotation_accounts = _shuffle_rotation_accounts(
             await _get_active_accounts(session, db_user_id)
@@ -654,17 +661,27 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 acc_idx += 1
 
                 batch_jobs: list[tuple[OfferEmail, str, str, str]] = []
+                subj_idx = int(subject_seq)
                 for tgt in targets_batch:
                     to_addr = (tgt.email or "").strip()
                     if not to_addr:
                         continue
                     subject, body = await _build_message_for_target(
-                        session, tg_user_id, tgt
+                        session,
+                        tg_user_id,
+                        tgt,
+                        subject_rotation_index=subj_idx,
                     )
+                    subj_idx += 1
                     batch_jobs.append((tgt, to_addr, subject, body))
 
                 if not batch_jobs:
                     continue
+
+                subject_seq = subj_idx
+                from services.subject_offer import save_subject_rotation_index
+
+                await save_subject_rotation_index(session, int(db_user_id), int(subject_seq))
 
                 state.current_to = batch_jobs[0][1]
                 state.last_status = "SENDING"

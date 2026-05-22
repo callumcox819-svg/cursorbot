@@ -234,7 +234,7 @@ async def _spoof_name_menu_payload(tg_user_id: int) -> tuple[str, InlineKeyboard
         f"Сервис: <b>{label}</b>\n"
         f"Имя отправителя (при 🟢 Спуфинг): <b>{cur_line}</b>\n\n"
         f"Используется только при отправке <b>HTML</b>.\n"
-        f"Рассылка — отдельно: имя из «📧 E-mail», тема <code>OFFER</code>.\n\n"
+        f"Рассылка — имя из «📧 E-mail», тема: 3 шаблона с ротацией (<code>OFFER</code>).\n\n"
         f"📌 <b>Тема для HTML:</b> <code>{html_subj}</code>"
     )
     kb = InlineKeyboardMarkup(
@@ -920,21 +920,32 @@ async def ref_open_commands(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "themes_menu")
 async def themes_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    from services.subject_offer import (
+        load_subject_rotation_index,
+        rotation_subject_templates,
+        rotation_templates_preview,
+    )
+
+    templates = rotation_subject_templates()
+    n_tpl = len(templates) or 1
+
     async with Session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
         cur = (await get_user_setting(session, user, SUBJECT_TEMPLATE_KEY) or "").strip()
+        rot_idx = await load_subject_rotation_index(session, int(user.id))
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Изменить", callback_data="themes_edit")],
-        [InlineKeyboardButton(text="🗑 Очистить", callback_data="themes_clear")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_open")],
     ])
     cur_show = cur if cur else "—"
     txt = (
-        "📌 <b>Темы</b>\n\n"
-        "Шаблон темы письма (поддерживает <code>OFFER</code>):\n"
-        f"<code>{cur_show}</code>\n\n"
-        "Пример: <code>OFFER | Antwort</code>"
+        "📌 <b>Темы рассылки</b>\n\n"
+        "Глобально для всех: <b>3 темы по кругу</b> на каждое письмо "
+        "(/send и 🧪 тест-маил). <code>OFFER</code> → название товара.\n\n"
+        f"{rotation_templates_preview()}\n\n"
+        f"Следующее письмо: шаблон <b>#{(rot_idx % n_tpl) + 1}</b>.\n\n"
+        "<i>Старый личный шаблон в БД (если был):</i>\n"
+        f"<code>{cur_show}</code> — <b>не используется</b> в рассылке."
     )
     await _safe_send(callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML"))
     await callback.answer()
@@ -1005,7 +1016,7 @@ async def html_theme_menu(callback: CallbackQuery, state: FSMContext):
     txt = (
         "📌 <b>Тема для HTML</b>\n\n"
         "Используется только при отправке <b>HTML</b> (не при массовой рассылке).\n"
-        "Рассылка использует глобальный <code>OFFER</code> → название товара.\n\n"
+        "Рассылка: 3 темы с ротацией (<code>Anfrage zu OFFER</code> и др.).\n\n"
         f"Текущее значение:\n<code>{cur_show}</code>"
     )
     await _safe_send(callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML"))

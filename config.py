@@ -37,7 +37,7 @@ class Config:
         VALIDEMAIL_API_KEYS = [k for k in (VALIDEMAIL_API_KEY_1, VALIDEMAIL_API_KEY_2) if k]
     VALIDEMAIL_CONCURRENCY = int(os.getenv("VALIDEMAIL_CONCURRENCY", "12"))
 
-    # 📌 Тема писем для всех пользователей: OFFER → название товара
+    # 📌 Устаревший одиночный шаблон; рассылка использует 3 темы с ротацией (services/subject_offer.py)
     GLOBAL_SUBJECT_TEMPLATE = os.getenv("GLOBAL_SUBJECT_TEMPLATE", "OFFER").strip() or "OFFER"
 
     # 🌐 API GAG (imgbeoxo) — личный ключ у каждого пользователя (⚙️ → 🔑 Ключ)
