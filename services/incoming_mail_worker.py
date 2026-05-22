@@ -1137,7 +1137,21 @@ async def mail_card_offer_meta(
                     mctx.offer_price,
                 )
 
-        from services.offer_storage import pick_offer_for_incoming_reply
+        from services.offer_storage import (
+            find_offer_by_core_subject_title,
+            pick_offer_for_incoming_reply,
+        )
+
+        off_core = await find_offer_by_core_subject_title(
+            session, user_id=int(user_id), subject=subject
+        )
+        if off_core:
+            oid, service_label, product_title, photo_url, offer_price = _meta_tuple_from_offer(
+                off_core, subject=subject
+            )
+            if not service_label:
+                service_label = _service_label_from_body(body_text) or None
+            return oid, service_label, product_title, photo_url, offer_price
 
         off_pick = await pick_offer_for_incoming_reply(
             session,
