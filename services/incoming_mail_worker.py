@@ -703,6 +703,19 @@ def _service_label_from_link(link: str) -> str:
     return ""
 
 
+def _service_label_from_body(body: str) -> str:
+    bl = (body or "").lower()
+    if "ricardo.ch" in bl or re.search(r"\bricardo\b", bl):
+        return "ricardo.ch"
+    if "tutti.ch" in bl or re.search(r"\btutti\b", bl):
+        return "tutti.ch"
+    if "kleinanzeigen" in bl:
+        return "kleinanzeigen.de"
+    if "facebook.com" in bl or re.search(r"\bfacebook\b", bl):
+        return "facebook.com"
+    return ""
+
+
 def _service_html(label: str) -> str:
     """Как «Товар» — моноширинный текст для копирования, без кликабельной ссылки и превью."""
     s = (label or "").strip()
@@ -1017,6 +1030,8 @@ async def mail_card_offer_meta(
         subj_norm = normalized_reply_subject(subject)
         subj_display = (subj_norm[:1].upper() + subj_norm[1:]) if subj_norm else None
         if off:
+            from services.offer_storage import _title_compact
+
             title = offer_effective_title(off)
             conflict = bool(title and subj_norm and _subject_title_conflicts(subject, title))
             matched = offer_matches_incoming_subject(off, subject)
@@ -1030,7 +1045,15 @@ async def mail_card_offer_meta(
                     offer=off,
                     contact_email=from_email,
                 )
-            if conflict:
+            if not trusted and title and subj_norm:
+                sc = _title_compact(subj_norm)
+                tc = _title_compact(title)
+                if sc and tc and (sc == tc or sc in tc or tc in sc):
+                    trusted = True
+            if not trusted and matched:
+                trusted = True
+
+            if conflict and not trusted:
                 product_title = subj_display
             elif trusted or not (
                 subject_is_informative(subject) and subj_norm and not matched
@@ -1047,9 +1070,65 @@ async def mail_card_offer_meta(
                 product_title = subj_display
         elif subject_is_informative(subject) and subj_display:
             product_title = subj_display
+
+        if not service_label:
+            service_label = _service_label_from_body(body_text) or None
     except Exception:
         logger.exception("mail_card_offer_meta failed")
     return offer_id, service_label, product_title, photo_url, offer_price
+
+
+async def persist_incoming_mail_snapshot(
+    session,
+    mail_row: IncomingMail,
+    *,
+    user_id: int,
+    from_email: str,
+    subject: str = "",
+    from_name: str = "",
+    body_text: str = "",
+    inbox_email: str | None = None,
+    ad_url: str | None = None,
+) -> tuple[int | None, str | None, str | None, str | None, str | None]:
+    """Записать в incoming_mails offer_id + товар/сервис/фото/цену (снимок карточки)."""
+    oid, service_label, product_title, photo_url, offer_price = await mail_card_offer_meta(
+        session,
+        user_id=int(user_id),
+        from_email=from_email,
+        resolved_offer_id=getattr(mail_row, "resolved_offer_id", None),
+        resolved_offer_email_id=getattr(mail_row, "resolved_offer_email_id", None),
+        ad_url=ad_url or (getattr(mail_row, "ad_url", None) or None),
+        inbox_email=inbox_email or (getattr(mail_row, "account_email", None) or None),
+        subject=subject or (getattr(mail_row, "subject", None) or ""),
+        from_name=from_name or (getattr(mail_row, "from_name", None) or ""),
+        body_text=body_text or (getattr(mail_row, "body", None) or ""),
+    )
+    if oid:
+        mail_row.resolved_offer_id = int(oid)
+    if product_title:
+        mail_row.product_title = (product_title or "").strip() or None
+    if service_label:
+        mail_row.service_label = (service_label or "").strip() or None
+    if photo_url:
+        mail_row.photo_url = (photo_url or "").strip() or None
+    if offer_price:
+        mail_row.offer_price = (offer_price or "").strip() or None
+    if oid and not (getattr(mail_row, "ad_url", None) or "").strip():
+        from services.offer_storage import offer_effective_link
+
+        off = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.id == int(oid))
+                .where(Offer.user_id == int(user_id))
+                .limit(1)
+            )
+        ).scalars().first()
+        if off:
+            lk = (offer_effective_link(off) or "").strip()
+            if lk:
+                mail_row.ad_url = lk
+    return oid, service_label, product_title, photo_url, offer_price
 
 
 async def build_mail_card_from_mail(
@@ -1069,6 +1148,8 @@ async def build_mail_card_from_mail(
         except Exception:
             inbox_label = None
 
+    stored_title = (getattr(mail, "product_title", None) or "").strip()
+    stored_service = (getattr(mail, "service_label", None) or "").strip()
     oid, service_label, product_title, _photo, _price = await mail_card_offer_meta(
         session,
         user_id=int(mail.user_id),
@@ -1081,6 +1162,12 @@ async def build_mail_card_from_mail(
         from_name=str(getattr(mail, "from_name", "") or ""),
         body_text=(getattr(mail, "body", None) or "").strip(),
     )
+    if stored_title and not product_title:
+        product_title = stored_title
+    if stored_service and not service_label:
+        service_label = stored_service
+    if not oid and getattr(mail, "resolved_offer_id", None):
+        oid = int(mail.resolved_offer_id)
 
     generated_link = (getattr(mail, "generated_link", None) or "").strip()
     conv = await _load_convlink(
@@ -1242,7 +1329,6 @@ async def _process_mails_for_account_impl(
                             )
 
                         subj = subject or ""
-                        from services.offer_matching import offer_acceptable_for_subject
 
                         off_mail = await resolve_offer_for_incoming_mail(
                             session,
@@ -1254,12 +1340,27 @@ async def _process_mails_for_account_impl(
                             stored_offer_id=None,
                             inbox_email=inbox_email_clean,
                         )
-                        if off_mail and offer_acceptable_for_subject(off_mail, subj):
-                            resolved_offer_id = int(off_mail.id)
-                            resolved_offer_email_id = None
-                        else:
-                            resolved_offer_id = None
-                            resolved_offer_email_id = None
+                        if not off_mail and (inbox_email_clean or "").strip():
+                            from services.mailing_send_log import find_offer_by_mailing_log
+
+                            off_mail = await find_offer_by_mailing_log(
+                                session,
+                                user_id=int(user_id),
+                                inbox_email=inbox_email_clean,
+                                subject=subj,
+                                from_email=from_email_clean,
+                                from_name=from_name or "",
+                            )
+                        resolved_offer_id = int(off_mail.id) if off_mail else None
+                        resolved_offer_email_id = None
+                        if off_mail:
+                            from services.offer_matching import _offer_email_id_for_offer
+
+                            oe = await _offer_email_id_for_offer(
+                                session, int(user_id), int(off_mail.id)
+                            )
+                            if oe:
+                                resolved_offer_email_id = int(oe)
 
                         existing = (
                             await session.execute(
@@ -1399,6 +1500,11 @@ async def _process_mails_for_account_impl(
 
             # ✅ сохраняем в БД полные данные по письму (включая ссылки),
             # чтобы их можно было смотреть по кнопке ℹ️ Инфо и использовать дальше.
+            offer_id = None
+            service_label = None
+            product_title = None
+            photo_url = None
+            offer_price: str | None = None
             if mail_db_id:
                 try:
                     async with _imap_db_session() as session:
@@ -1408,35 +1514,34 @@ async def _process_mails_for_account_impl(
                             )
                         ).scalars().first()
                         if mail_row:
-                            mail_row.ad_url = (FULL_META.get((acc_id, uid_key), {}).get("ad_url") or "").strip() or None
+                            mail_row.ad_url = (
+                                FULL_META.get((acc_id, uid_key), {}).get("ad_url") or ad_url or ""
+                            ).strip() or None
                             mail_row.generated_link = (
                                 FULL_META.get((acc_id, uid_key), {}).get("generated_link") or ""
                             ).strip() or None
+                            offer_id, service_label, product_title, photo_url, offer_price = (
+                                await persist_incoming_mail_snapshot(
+                                    session,
+                                    mail_row,
+                                    user_id=int(user_id),
+                                    from_email=from_email_clean,
+                                    subject=subject or "",
+                                    from_name=(from_name or "").strip(),
+                                    body_text=body_clean or "",
+                                    inbox_email=inbox_email_clean,
+                                    ad_url=mail_row.ad_url,
+                                )
+                            )
+                            if offer_id:
+                                resolved_offer_id = int(offer_id)
                             await _db_commit_retry(session)
                 except Exception:
-                    logger.exception("Failed to persist IncomingMail links mail_id=%s", mail_db_id)
-            # ✅ ТЗ: подтягиваем товар/сервис/фото из БД по email отправителя (валиднутый email продавца)
-            offer_id = None
-            service_label = None
-            product_title = None
-            photo_url = None
-            offer_price: str | None = None
-            try:
-                async with _imap_db_session() as _s:
-                    offer_id, service_label, product_title, photo_url, offer_price = await mail_card_offer_meta(
-                        _s,
-                        user_id=int(user_id),
-                        from_email=from_email_clean,
-                        resolved_offer_id=resolved_offer_id,
-                        resolved_offer_email_id=resolved_offer_email_id,
-                        ad_url=(FULL_META.get((acc_id, uid_key), {}).get("ad_url") or ad_url or "").strip() or None,
-                        inbox_email=inbox_email_clean,
-                        subject=subject or "",
-                        from_name=(from_name or "").strip(),
-                        body_text=body_clean or "",
+                    logger.exception(
+                        "Failed to persist IncomingMail snapshot mail_id=%s from=%s",
+                        mail_db_id,
+                        from_email_clean,
                     )
-            except Exception:
-                logger.exception("Failed to load Offer meta for incoming mail: from=%s", from_email_clean)
 
             if offer_id:
                 try:

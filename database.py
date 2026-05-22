@@ -124,6 +124,26 @@ async def _ensure_incoming_mail_link_columns() -> None:
         await conn.execute(text("ALTER TABLE incoming_mails ADD COLUMN IF NOT EXISTS generated_link TEXT"))
 
 
+async def _ensure_incoming_mail_snapshot_columns() -> None:
+    """Снимок товара/сервиса/фото на входящем — не теряется при повторном открытии карточки."""
+    if engine.dialect.name != "postgresql":
+        return
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("ALTER TABLE incoming_mails ADD COLUMN IF NOT EXISTS product_title TEXT")
+        )
+        await conn.execute(
+            text("ALTER TABLE incoming_mails ADD COLUMN IF NOT EXISTS service_label VARCHAR")
+        )
+        await conn.execute(
+            text("ALTER TABLE incoming_mails ADD COLUMN IF NOT EXISTS photo_url TEXT")
+        )
+        await conn.execute(
+            text("ALTER TABLE incoming_mails ADD COLUMN IF NOT EXISTS offer_price VARCHAR")
+        )
+
+
 async def _ensure_conversation_links_generated_link_column() -> None:
     """Автомиграция: добавляем conversation_links.generated_link если её нет.
 
@@ -236,6 +256,11 @@ async def init_db() -> None:
         await _ensure_incoming_mail_link_columns()
     except Exception as e:
         log.error("Failed incoming_mails link columns migration: %s", e)
+
+    try:
+        await _ensure_incoming_mail_snapshot_columns()
+    except Exception as e:
+        log.error("Failed incoming_mails snapshot columns migration: %s", e)
 
     try:
         await _ensure_incoming_mail_telegram_message_id_column()

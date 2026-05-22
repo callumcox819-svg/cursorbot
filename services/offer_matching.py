@@ -990,6 +990,8 @@ async def resolve_offer_for_incoming_mail(
         title = offer_effective_title(off)
         if title and _subject_title_conflicts(subj, title):
             return False
+        if from_mailing_log:
+            return True
         if subject_is_informative(subj) and not offer_matches_incoming_subject(off, subj):
             return False
         if fe_can and not from_mailing_log:

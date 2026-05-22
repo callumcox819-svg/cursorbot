@@ -85,7 +85,7 @@ async def find_offer_by_mailing_log(
                     .limit(1)
                 )
             ).scalars().first()
-            if off and offer_effective_link(off):
+            if off:
                 snap = (row.title_snapshot or offer_effective_title(off) or "").strip()
                 if not snap or not _subject_title_conflicts(subject, snap):
                     return off
@@ -109,7 +109,7 @@ async def find_offer_by_mailing_log(
                             .limit(1)
                         )
                     ).scalars().first()
-                    if off and offer_effective_link(off):
+                    if off:
                         return off
 
     best: Offer | None = None

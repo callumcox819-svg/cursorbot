@@ -2594,7 +2594,9 @@ async def cb_mail_info(callback: CallbackQuery):
     offer_emails_cnt = 0
     offer_link_by_email = ""
     offer_emails_cnt_by_email = 0
+    snap_product = snap_service = snap_photo = ""
 
+    mail = None
     async with Session() as session:
         owner_user_id = await _get_acc_owner_user_id(session, acc_id)
         if owner_user_id:
@@ -2618,6 +2620,9 @@ async def cb_mail_info(callback: CallbackQuery):
                 ad_url = (getattr(mail, "ad_url", "") or "").strip() or ad_url
                 gen_link = (getattr(mail, "generated_link", "") or "").strip() or gen_link
                 resolved_offer_id = int(getattr(mail, "resolved_offer_id", 0) or 0) or None
+                snap_product = (getattr(mail, "product_title", None) or "").strip()
+                snap_service = (getattr(mail, "service_label", None) or "").strip()
+                snap_photo = (getattr(mail, "photo_url", None) or "").strip()
 
             conv = await _get_convlink(
                 session,
@@ -2703,6 +2708,9 @@ async def cb_mail_info(callback: CallbackQuery):
         f"<b>DB conv ad_url:</b> <code>{_e(conv_ad) or '—'}</code>\n"
         f"<b>DB conv generated_link:</b> <code>{_e(conv_gen) or '—'}</code>\n\n"
         f"<b>Resolved offer_id:</b> <code>{resolved_offer_id or '—'}</code>\n"
+        f"<b>DB snapshot product:</b> <code>{_e(snap_product) or '—'}</code>\n"
+        f"<b>DB snapshot service:</b> <code>{_e(snap_service) or '—'}</code>\n"
+        f"<b>DB snapshot photo:</b> <code>{_e(snap_photo) or '—'}</code>\n"
         f"<b>Offer.title:</b> <code>{_e(offer_title_full) or '—'}</code>\n"
         f"<b>Offer.price:</b> <code>{_e(offer_price) or '—'}</code>\n"
         f"<b>Offer.link:</b> <code>{_e(offer_link_full) or '—'}</code>\n"

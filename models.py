@@ -382,6 +382,12 @@ class IncomingMail(Base):
     ad_url = Column(Text, nullable=True)
     generated_link = Column(Text, nullable=True)
 
+    # Снимок карточки на момент приёма (сервис/фото/товар из Offer + журнал /send)
+    product_title = Column(Text, nullable=True)
+    service_label = Column(String, nullable=True)
+    photo_url = Column(Text, nullable=True)
+    offer_price = Column(String, nullable=True)
+
     resolved_offer_id = Column(ForeignKey("offers.id", ondelete="SET NULL"), nullable=True, index=True)
     resolved_offer_email_id = Column(ForeignKey("offer_emails.id", ondelete="SET NULL"), nullable=True, index=True)
 
