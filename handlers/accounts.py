@@ -276,16 +276,11 @@ def accounts_menu_kb(
 ) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
 
-    # Список аккаунтов
+    from services.account_status import account_list_emoji
+
+    # Список аккаунтов: 🔴 только неверный пароль; 🟡 блок SMTP; прокси не красит
     for acc in accounts_page:
-        st = (acc.status or "").strip().lower()
-        if st == "active":
-            emoji = "🟢"
-        elif st == "smtp_blocked":
-            emoji = "🟡"
-        else:
-            emoji = "🔴"
-        text = f"{emoji} {acc.email}"
+        text = f"{account_list_emoji(acc)} {acc.email}"
 
         email_btn = InlineKeyboardButton(
             text=text,
@@ -327,6 +322,10 @@ async def render_accounts_menu(message_or_cb, telegram_id: int, page: int = 1, s
             session.add(user)
             await session.commit()
             await session.refresh(user)
+
+        from services.account_status import heal_accounts_mislabeled_by_proxy
+
+        await heal_accounts_mislabeled_by_proxy(session, int(user.id))
 
         result = await session.execute(
             select(EmailAccount)
@@ -419,9 +418,14 @@ async def acc_delete_inactive(callback: CallbackQuery) -> None:
             select(EmailAccount).where(EmailAccount.user_id == user.id)
         )
         all_accs = list(result.scalars())
-        to_del = [a for a in all_accs if (a.status or "active").strip().lower() != "active"]
+        from services.account_status import is_account_truly_inactive
+
+        to_del = [a for a in all_accs if is_account_truly_inactive(a)]
         if not to_del:
-            return await callback.answer("Нет неактивных аккаунтов для удаления.", show_alert=True)
+            return await callback.answer(
+                "Нет ящиков с неверным паролем (🔴). Блок SMTP (🟡) не удаляем.",
+                show_alert=True,
+            )
 
         for acc in to_del:
             await session.delete(acc)
@@ -504,8 +508,8 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
     async def _job() -> None:
         from services.smtp_account_check import (
             check_smtp_accounts_parallel,
+            is_account_no_access_error,
             is_account_no_access_status,
-            is_transient_smtp_check_failure,
         )
         from services.smtp_block_control import short_block_reason
 
@@ -542,21 +546,9 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
                     return
                 db_uid = int(user.id)
 
-                await session.execute(
-                    update(EmailAccount)
-                    .where(EmailAccount.user_id == db_uid)
-                    .where(EmailAccount.status == "error")
-                    .where(
-                        or_(
-                            EmailAccount.last_error.ilike("%starttls%"),
-                            EmailAccount.last_error.ilike("%connection unexpectedly%"),
-                            EmailAccount.last_error.ilike("%smtpnotsupported%"),
-                            EmailAccount.last_error.ilike("%smtpserverdisconnected%"),
-                        )
-                    )
-                    .values(status="active", last_error=None)
-                )
-                await session.commit()
+                from services.account_status import heal_accounts_mislabeled_by_proxy
+
+                await heal_accounts_mislabeled_by_proxy(session, db_uid)
 
                 result = await session.execute(
                     select(EmailAccount)
@@ -579,21 +571,7 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
 
                     st, err = res.status, res.error
 
-                    if st is None or st == "error":
-                        skip_n += 1
-                        reason = short_block_reason(err) or "сеть / таймаут SMTP"
-                        lines.append(
-                            f"⏭ <code>{_e(res.email)}</code> — проверка не удалась\n"
-                            f"   <i>{_e(reason)}</i>"
-                        )
-                        prev_st = (row.status or "").strip().lower()
-                        if prev_st == "error" and is_transient_smtp_check_failure(err):
-                            row.status = "active"
-                            row.last_error = None
-                            await session.commit()
-                        continue
-
-                    if is_account_no_access_status(st):
+                    if is_account_no_access_error(err) or is_account_no_access_status(st):
                         deleted_n += 1
                         em = row.email or ""
                         reason = short_block_reason(err)
@@ -603,6 +581,19 @@ async def acc_check_smtp(callback: CallbackQuery) -> None:
                             f"🗑 <code>{_e(em)}</code> — удалён (нет доступа)\n"
                             f"   <i>{_e(reason)}</i>"
                         )
+                        continue
+
+                    if st is None or st == "error":
+                        skip_n += 1
+                        reason = short_block_reason(err) or "сеть / таймаут (прокси не влияет на статус)"
+                        lines.append(
+                            f"⏭ <code>{_e(res.email)}</code> — проверка не удалась\n"
+                            f"   <i>{_e(reason)}</i>"
+                        )
+                        if (row.status or "").strip().lower() != "smtp_blocked":
+                            row.status = "active"
+                            row.last_error = None
+                            await session.commit()
                         continue
 
                     prev = (row.status or "").strip().lower()

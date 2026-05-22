@@ -254,7 +254,7 @@ async def start_imap_idle_worker(bot: Bot) -> None:
                 async with Session() as session:
                     accounts = (await session.execute(
                         select(EmailAccount).where(
-                            or_(EmailAccount.status.is_(None), EmailAccount.status.in_(["active", "enabled", "proxy_error"]))
+                            or_(EmailAccount.status.is_(None), EmailAccount.status.in_(["active", "enabled", "smtp_blocked"]))
                         )
                     )).scalars().all()
                     users = (await session.execute(select(User))).scalars().all()

@@ -1970,7 +1970,7 @@ async def _refresh_accounts_map() -> list[tuple[EmailAccount, int]]:
             sa_select(EmailAccount).where(
                 sa_or(
                     EmailAccount.status.is_(None),
-                    EmailAccount.status.in_(["active", "enabled", "proxy_error", "smtp_blocked"]),
+                    EmailAccount.status.in_(["active", "enabled", "smtp_blocked"]),
                 )
             )
         )).scalars().all()

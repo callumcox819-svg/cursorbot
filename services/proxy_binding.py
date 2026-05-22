@@ -92,23 +92,12 @@ async def pick_mailing_proxy(
 
 
 async def clear_legacy_account_proxy_state(session: AsyncSession, user_id: int) -> int:
-    """
-    Сброс старой схемы (proxy_error / proxy_id на ящиках).
-    Ящики остаются active — прокси только из пула при отправке.
-    """
-    res = await session.execute(
-        update(EmailAccount)
-        .where(EmailAccount.user_id == int(user_id))
-        .where(
-            (EmailAccount.status == "proxy_error")
-            | (EmailAccount.proxy_id.isnot(None))
-        )
-        .values(proxy_id=None, status="active", last_error=None)
-    )
-    await session.commit()
-    n = int(res.rowcount or 0)
+    """Сброс proxy_error / proxy_id; smtp_blocked и 🔴 по паролю не трогаем."""
+    from services.account_status import heal_accounts_mislabeled_by_proxy
+
+    n = await heal_accounts_mislabeled_by_proxy(session, user_id)
     if n:
-        logger.info("cleared legacy proxy bind/error on %s accounts user_id=%s", n, user_id)
+        logger.info("healed proxy-mislabeled accounts=%s user_id=%s", n, user_id)
     return n
 
 
