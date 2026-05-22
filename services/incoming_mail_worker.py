@@ -1047,6 +1047,26 @@ async def mail_card_offer_meta(
     offer_id = None
     service_label = product_title = photo_url = offer_price = None
     try:
+        if (inbox_email or "").strip():
+            from services.mailing_send_log import resolve_mailing_reply_context
+
+            mctx = await resolve_mailing_reply_context(
+                session,
+                user_id=int(user_id),
+                inbox_email=inbox_email or "",
+                subject=subject,
+                from_email=from_email,
+                from_name=from_name,
+            )
+            if mctx:
+                return (
+                    int(mctx.offer_id),
+                    mctx.service_label,
+                    mctx.product_title,
+                    mctx.photo_url,
+                    mctx.offer_price,
+                )
+
         if resolved_offer_id:
             off_saved = await _load_offer_by_id(
                 session, user_id=int(user_id), oid=int(resolved_offer_id)
@@ -1357,6 +1377,7 @@ async def _process_mails_for_account_impl(
             mail_db_id: int | None = None
             already_notified_tg: int | None = None
             account_already_smtp_blocked = False
+            mail_ctx = None
             for _persist_try in range(3):
                 try:
                     async with _imap_db_session() as session:
@@ -1376,11 +1397,11 @@ async def _process_mails_for_account_impl(
 
                         subj = subject or ""
 
-                        from services.mailing_send_log import find_offer_by_mailing_log
+                        from services.mailing_send_log import resolve_mailing_reply_context
 
-                        off_mail = None
+                        mail_ctx = None
                         if (inbox_email_clean or "").strip():
-                            off_mail = await find_offer_by_mailing_log(
+                            mail_ctx = await resolve_mailing_reply_context(
                                 session,
                                 user_id=int(user_id),
                                 inbox_email=inbox_email_clean,
@@ -1388,6 +1409,7 @@ async def _process_mails_for_account_impl(
                                 from_email=from_email_clean,
                                 from_name=from_name or "",
                             )
+                        off_mail = mail_ctx.offer if mail_ctx else None
                         if not off_mail:
                             off_mail = await resolve_offer_for_incoming_mail(
                                 session,
@@ -1401,7 +1423,9 @@ async def _process_mails_for_account_impl(
                             )
                         resolved_offer_id = int(off_mail.id) if off_mail else None
                         resolved_offer_email_id = None
-                        if off_mail:
+                        if mail_ctx and mail_ctx.send_row and mail_ctx.send_row.offer_email_id:
+                            resolved_offer_email_id = int(mail_ctx.send_row.offer_email_id)
+                        elif off_mail:
                             from services.offer_matching import _offer_email_id_for_offer
 
                             oe = await _offer_email_id_for_offer(
@@ -1494,7 +1518,7 @@ async def _process_mails_for_account_impl(
                     logger.exception("Failed pre-mark smtp_blocked acc=%s", acc_id)
 
             # ad_url берём ТОЛЬКО из БД (по ТЗ: не ищем ссылку в теле письма)
-            ad_url: str | None = None
+            ad_url: str | None = (mail_ctx.ad_url if mail_ctx else None) or None
 
             # ✅ если ссылки нет — берём из Offer.link (валидированные данные в БД)
             if (not ad_url) and resolved_offer_id:
@@ -1581,7 +1605,21 @@ async def _process_mails_for_account_impl(
                                     ad_url=mail_row.ad_url,
                                 )
                             )
-                            if offer_id:
+                            if mail_ctx:
+                                offer_id = int(mail_ctx.offer_id)
+                                resolved_offer_id = int(mail_ctx.offer_id)
+                                product_title = mail_ctx.product_title or product_title
+                                service_label = mail_ctx.service_label or service_label
+                                photo_url = mail_ctx.photo_url or photo_url
+                                offer_price = mail_ctx.offer_price or offer_price
+                                if mail_ctx.ad_url:
+                                    mail_row.ad_url = mail_ctx.ad_url
+                                mail_row.resolved_offer_id = int(mail_ctx.offer_id)
+                                mail_row.product_title = product_title
+                                mail_row.service_label = service_label
+                                mail_row.photo_url = photo_url
+                                mail_row.offer_price = offer_price
+                            elif offer_id:
                                 resolved_offer_id = int(offer_id)
                             await _db_commit_retry(session)
                 except Exception:
@@ -1591,7 +1629,9 @@ async def _process_mails_for_account_impl(
                         from_email_clean,
                     )
 
-            if offer_id:
+            if offer_id or (mail_ctx and mail_ctx.offer_id):
+                if mail_ctx and not offer_id:
+                    offer_id = int(mail_ctx.offer_id)
                 try:
                     async with _imap_db_session() as _s_pin:
                         from services.offer_storage import offer_effective_link

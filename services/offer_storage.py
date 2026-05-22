@@ -713,9 +713,9 @@ async def resolve_offer_from_saved_context(
                 return None, ""
         return off, u
 
-    from services.mailing_send_log import find_offer_by_mailing_log
+    from services.mailing_send_log import resolve_mailing_reply_context
 
-    off_log = await find_offer_by_mailing_log(
+    mctx = await resolve_mailing_reply_context(
         session,
         user_id=int(user_id),
         inbox_email=inbox_email,
@@ -723,10 +723,10 @@ async def resolve_offer_from_saved_context(
         from_email=contact_email,
         from_name=from_name,
     )
-    if off_log:
-        got = _pair_saved(off_log, offer_effective_link(off_log) or "", strict_subject=False)
-        if got[0]:
-            return got
+    if mctx:
+        url = (mctx.ad_url or offer_effective_link(mctx.offer) or "").strip()
+        if url:
+            return mctx.offer, url
 
     off_sig = await find_offer_by_incoming_signals(
         session,

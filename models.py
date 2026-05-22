@@ -263,6 +263,11 @@ class MailingSend(Base):
     to_email = Column(String, nullable=False, index=True)
     subject = Column(Text, nullable=True)
     title_snapshot = Column(Text, nullable=True)
+    # Снимок лота в момент /send — для карточки входящего без пересчёта
+    service_label = Column(String, nullable=True)
+    photo_url = Column(Text, nullable=True)
+    offer_price = Column(String, nullable=True)
+    ad_url_snapshot = Column(Text, nullable=True)
 
     sent_at = Column(DateTime, default=datetime.utcnow, index=True)
 

@@ -761,6 +761,7 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                                     to_email=contact_c,
                                     subject=subject,
                                     title_snapshot=offer_effective_title(offer_sent),
+                                    offer=offer_sent,
                                 )
                                 await _safe_commit(session)
                                 logger.info(
