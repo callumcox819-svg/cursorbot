@@ -163,6 +163,66 @@ async def assign_waiting_accounts(session: AsyncSession, user_id: int) -> int:
     return n
 
 
+def is_mailing_proxy_failure(err: str | None) -> bool:
+    """Срыв /send из‑за прокси/SMTP-туннеля — снимаем прокси с очереди рассылки."""
+    from services.sender import (
+        is_definite_proxy_failure,
+        is_proxy_error_marker,
+        is_smtp_timeout_error,
+        is_transient_connection_error,
+        normalize_send_error,
+        should_retry_send_with_other_proxy,
+    )
+
+    if should_retry_send_with_other_proxy(err):
+        return True
+    if is_definite_proxy_failure(err) or is_smtp_timeout_error(err):
+        return True
+    if is_transient_connection_error(err):
+        return True
+    if is_proxy_error_marker(err):
+        return True
+    s = (normalize_send_error(err) or "").lower()
+    if "bound_proxy" in s or "serverdisconnected" in s.replace(" ", ""):
+        return True
+    if "unexpectedly closed" in s or "connection closed" in s:
+        return True
+    return False
+
+
+async def eject_proxy_after_mailing_failure(
+    session: AsyncSession,
+    *,
+    account: EmailAccount,
+    proxy: Proxy | None,
+    err: str | None,
+) -> Optional[Proxy]:
+    """
+    Прокси 🔴 + отвязка ящиков; этот ящик сразу на другой SOCKS5 (если есть).
+    """
+    if not proxy or not is_mailing_proxy_failure(err):
+        return None
+
+    from services.proxy_manager import ProxyManager
+
+    pid = int(proxy.id)
+    err_txt = (err or "mailing proxy failure")[:500]
+    await ProxyManager.note_proxy_failure(
+        session, pid, err_txt, deactivate=True, from_mailing=True
+    )
+    new_proxy = await assign_proxy_to_account(session, account, force_new=True)
+    logger.warning(
+        "mailing eject proxy_id=%s %s:%s account=%s err=%s -> %s",
+        pid,
+        proxy.host,
+        proxy.port,
+        account.email,
+        err_txt[:120],
+        f"proxy_id={new_proxy.id}" if new_proxy else "NO_REPLACEMENT",
+    )
+    return new_proxy
+
+
 async def detach_accounts_from_proxy(
     session: AsyncSession,
     proxy_id: int,

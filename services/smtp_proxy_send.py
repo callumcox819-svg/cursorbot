@@ -9,7 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import EmailAccount, Proxy
 from proxy_manager import ProxySMTPContext
-from services.proxy_binding import NO_ACTIVE_PROXY, resolve_proxy_for_account
+from services.proxy_binding import (
+    NO_ACTIVE_PROXY,
+    eject_proxy_after_mailing_failure,
+    is_mailing_proxy_failure,
+    resolve_proxy_for_account,
+)
 from services.sender import (
     is_definite_proxy_failure,
     is_smtp_timeout_error,
@@ -116,22 +121,27 @@ async def send_email_via_account_with_proxy(
         account.email,
         (err or "")[:200],
     )
-    dead = is_definite_proxy_failure(err)
-    try:
-        await ProxyManager.note_proxy_failure(
-            session,
-            pid,
-            (err or "")[:500],
-            deactivate=dead,
-            from_mailing=mailing,
+    if mailing and is_mailing_proxy_failure(err):
+        await eject_proxy_after_mailing_failure(
+            session, account=account, proxy=proxy, err=err
         )
-    except Exception:
-        pass
+    else:
+        dead = is_definite_proxy_failure(err)
+        try:
+            await ProxyManager.note_proxy_failure(
+                session,
+                pid,
+                (err or "")[:500],
+                deactivate=dead,
+                from_mailing=mailing,
+            )
+        except Exception:
+            pass
 
     if is_smtp_timeout_error(err):
         hint = (
-            f"Прокси {proxy.host}:{proxy.port} не достучался до SMTP "
-            f"({err or 'timeout'}). Замените прокси в «Прокси»."
+            f"Прокси {proxy.host}:{proxy.port} снят с рассылки "
+            f"({err or 'timeout'}). Ящик переключён на другой SOCKS5, если есть."
         )
         return False, f"SMTP_TIMEOUT|bound_proxy|{hint}", msgid
     return False, err or NO_ACTIVE_PROXY, msgid
@@ -192,15 +202,20 @@ async def send_batch_via_account_with_proxy(
             pass
         return merged
 
-    dead = is_definite_proxy_failure(last_err)
-    try:
-        await ProxyManager.note_proxy_failure(
-            session,
-            pid,
-            (last_err or "batch fail")[:500],
-            deactivate=dead,
-            from_mailing=True,
+    if mailing and is_mailing_proxy_failure(last_err):
+        await eject_proxy_after_mailing_failure(
+            session, account=account, proxy=proxy, err=last_err
         )
-    except Exception:
-        pass
+    else:
+        dead = is_definite_proxy_failure(last_err)
+        try:
+            await ProxyManager.note_proxy_failure(
+                session,
+                pid,
+                (last_err or "batch fail")[:500],
+                deactivate=dead,
+                from_mailing=True,
+            )
+        except Exception:
+            pass
     return merged
