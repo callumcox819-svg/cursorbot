@@ -56,12 +56,16 @@ async def summarize_proxy_health(session, user_id: int) -> ProxyHealthSummary:
 
 
 async def run_proxy_health_check(session, user_id: int) -> ProxyHealthSummary:
-    """Туннель + smtp.gmail.com:587 — как в меню «Прокси»."""
+    """Перед /send — лёгкая проверка SOCKS5 (не вешает 🔴 из-за лага SMTP)."""
+    from services.proxy_binding import revive_all_mailing_dead_proxies
+
+    await revive_all_mailing_dead_proxies(session, int(user_id))
     await refresh_proxies_status(
         session,
         int(user_id),
         concurrency=MAIL_PROXY_PREFLIGHT_CONCURRENCY,
         timeout=MAIL_PROXY_PREFLIGHT_TIMEOUT,
+        lite=True,
     )
     return await summarize_proxy_health(session, user_id)
 
@@ -80,8 +84,8 @@ def mailing_may_start(summary: ProxyHealthSummary) -> Tuple[bool, str]:
     return (
         False,
         summary.format_lines()
-        + "\n\n❌ Все прокси помечены 🔴 после сбоя туннеля при рассылке. "
-        "Замените их или дождитесь «Проверить прокси» (🟢).",
+        + "\n\n❌ Все прокси 🔴 (только явный сбой SOCKS5). "
+        "Откройте «Прокси» или добавьте новые socks5://…",
     )
 
 

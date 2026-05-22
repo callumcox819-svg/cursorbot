@@ -483,8 +483,7 @@ async def open_proxies(callback: CallbackQuery):
             return
         from services.proxy_binding import (
             reset_mailing_proxy_round_robin,
-            revive_proxies_after_transient_mailing_errors,
-            revive_soft_dead_proxies,
+            revive_all_mailing_dead_proxies,
         )
         from services.proxy_verify import heal_proxy_rows_from_stale_check_markers
 
@@ -492,8 +491,7 @@ async def open_proxies(callback: CallbackQuery):
             (await session.execute(select(Proxy).where(Proxy.user_id == user.id))).scalars().all()
         )
         heal_proxy_rows_from_stale_check_markers(proxies)
-        await revive_proxies_after_transient_mailing_errors(session, int(user.id))
-        await revive_soft_dead_proxies(session, int(user.id))
+        await revive_all_mailing_dead_proxies(session, int(user.id))
         await session.commit()
         reset_mailing_proxy_round_robin(int(user.id))
         proxies = list(
@@ -649,10 +647,14 @@ async def _proxy_add_work(
                 details.append(f"❌ `{preview}` — {err}")
                 continue
 
+            from services.proxy_verify import test_proxy_socks_only
+
             try:
-                ok, info = await asyncio.wait_for(test_proxy(parsed, timeout=22), timeout=55)
+                ok, info = await asyncio.wait_for(
+                    test_proxy_socks_only(parsed, timeout=18), timeout=35
+                )
             except asyncio.TimeoutError:
-                ok, info = False, "Timeout: проверка прокси заняла слишком долго"
+                ok, info = False, "Timeout: SOCKS5 не ответил вовремя"
             except Exception as e:
                 ok, info = False, f"{type(e).__name__}: {e}"
 
@@ -694,12 +696,10 @@ async def _proxy_add_work(
         if ok_count > 0:
             from services.proxy_binding import (
                 reset_mailing_proxy_round_robin,
-                revive_proxies_after_transient_mailing_errors,
-                revive_soft_dead_proxies,
+                revive_all_mailing_dead_proxies,
             )
 
-            await revive_proxies_after_transient_mailing_errors(session, int(user.id))
-            await revive_soft_dead_proxies(session, int(user.id))
+            await revive_all_mailing_dead_proxies(session, int(user.id))
             await session.commit()
             reset_mailing_proxy_round_robin(int(user.id))
 

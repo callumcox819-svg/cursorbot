@@ -118,7 +118,7 @@ async def revive_proxies_after_transient_mailing_errors(
     session: AsyncSession,
     user_id: int,
 ) -> int:
-    """Снять ложный 🔴 после таймаутов рассылки — прокси снова в пуле."""
+    """Снять 🔴 после [mailing] (таймауты SMTP ≠ мёртвый SOCKS5)."""
     from services.proxy_verify import MAILING_PROXY_DEAD_PREFIX
 
     res = await session.execute(
@@ -130,6 +130,13 @@ async def revive_proxies_after_transient_mailing_errors(
     )
     await session.commit()
     return int(res.rowcount or 0)
+
+
+async def revive_all_mailing_dead_proxies(session: AsyncSession, user_id: int) -> int:
+    """Все 🔴 с меткой [mailing] → 🟡 (после смены прокси / перезапуска рассылки)."""
+    n1 = await revive_proxies_after_transient_mailing_errors(session, int(user_id))
+    n2 = await revive_soft_dead_proxies(session, int(user_id))
+    return int(n1) + int(n2)
 
 
 async def pick_mailing_proxy(
@@ -227,8 +234,8 @@ async def deactivate_proxy_from_mailing(
     err: str | None,
 ) -> bool:
     """
-    Таймаут/обрыв → временно skip в этой рассылке.
-    🔴 в БД только при явной смерти SOCKS5 или N таймаутов подряд.
+    Таймаут/обрыв → только last_error, без 🔴.
+    🔴 в БД только при явной смерти SOCKS5 (GeneralProxyError и т.п.).
     """
     if not proxy or not is_mailing_proxy_failure(err):
         return False
@@ -240,15 +247,13 @@ async def deactivate_proxy_from_mailing(
     pid = int(proxy.id)
     err_txt = (err or "mailing proxy failure")[:500]
 
+    # 🔴 только явный сбой SOCKS5 — не SMTP_TIMEOUT и не «connection closed» от Gmail.
     hard_dead = is_definite_proxy_failure(err)
-    if not hard_dead and is_smtp_timeout_error(err):
-        key = (uid, pid)
-        streak = _mailing_fail_streak.get(key, 0) + 1
-        _mailing_fail_streak[key] = streak
-        hard_dead = streak >= MAILING_PROXY_MAX_TIMEOUT_STREAK
-    elif not hard_dead:
+    if hard_dead:
         key = (uid, pid)
         _mailing_fail_streak[key] = _mailing_fail_streak.get(key, 0) + 1
+    else:
+        _mailing_fail_streak.pop((uid, pid), None)
 
     if hard_dead:
         exclude_proxy_for_mailing_session(uid, pid)

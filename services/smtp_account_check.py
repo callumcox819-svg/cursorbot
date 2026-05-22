@@ -292,7 +292,7 @@ async def check_smtp_account_with_proxy(
     if is_definite_proxy_failure(err):
         try:
             await ProxyManager.note_proxy_failure(
-                session, pid, (err or "")[:500], deactivate=True, from_mailing=False
+                session, pid, (err or "")[:500], deactivate=False, from_mailing=False
             )
         except Exception:
             pass

@@ -319,8 +319,7 @@ async def start_sending(message: Message):
         from services.proxy_binding import (
             clear_legacy_account_proxy_state,
             reset_mailing_proxy_round_robin,
-            revive_proxies_after_transient_mailing_errors,
-            revive_soft_dead_proxies,
+            revive_all_mailing_dead_proxies,
         )
 
         cleared = await clear_legacy_account_proxy_state(session, int(db_user_id))
@@ -383,8 +382,8 @@ async def start_sending(message: Message):
 
     try:
         await status_msg.edit_text(
-            "⏳ Проверяю SOCKS5 (туннель + SMTP+STARTTLS)…\n"
-            "<i>Это может занять 1–2 минуты.</i>",
+            "⏳ Проверяю SOCKS5 (туннель до Gmail SMTP)…\n"
+            "<i>Быстрая проверка, без ложного 🔴.</i>",
             parse_mode="HTML",
         )
     except Exception:

@@ -173,6 +173,16 @@ def heal_proxy_rows_from_stale_check_markers(proxies: list[Proxy]) -> None:
             row.is_active = None
 
 
+async def test_proxy_socks_only(
+    proxy: Proxy | dict[str, Any], *, timeout: int = 15
+) -> Tuple[bool, str]:
+    """Достаточно для 🟢 в меню: SOCKS5 до smtp.gmail.com:587 (без EHLO всей рассылки)."""
+    d = proxy_to_dict(proxy)
+    if not is_socks5_type(normalize_proxy_type(d.get("type"))):
+        return False, "Только SOCKS5."
+    return await _test_socks5_handshake(proxy, timeout=max(10, int(timeout)))
+
+
 async def _test_proxy_once(proxy: Proxy | dict[str, Any], *, timeout: int = 20) -> Tuple[bool, str]:
     """Одна попытка: SMTP+STARTTLS как при /send."""
     d = proxy_to_dict(proxy)
@@ -240,6 +250,7 @@ async def refresh_proxies_status(
     *,
     concurrency: int = 10,
     timeout: int = 20,
+    lite: bool = False,
 ) -> tuple[int, int, int]:
     from sqlalchemy import select as sa_select
 
@@ -259,10 +270,16 @@ async def refresh_proxies_status(
     async def _one(p: Proxy) -> None:
         async with sem:
             try:
-                ok, info = await asyncio.wait_for(
-                    test_proxy(p, timeout=per_proxy_timeout),
-                    timeout=per_proxy_timeout * 2 + 10,
-                )
+                if lite:
+                    ok, info = await asyncio.wait_for(
+                        test_proxy_socks_only(p, timeout=per_proxy_timeout),
+                        timeout=per_proxy_timeout + 8,
+                    )
+                else:
+                    ok, info = await asyncio.wait_for(
+                        test_proxy(p, timeout=per_proxy_timeout),
+                        timeout=per_proxy_timeout * 2 + 10,
+                    )
             except asyncio.TimeoutError:
                 ok, info = False, "Timeout: проверка прокси заняла слишком долго"
             except Exception as e:
