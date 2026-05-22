@@ -836,6 +836,62 @@ async def _load_offer_by_id(session, *, user_id: int, oid: int) -> Offer | None:
     ).scalars().first()
 
 
+def _product_title_looks_like_outgoing_subject(title: str | None) -> bool:
+    t = (title or "").strip().lower()
+    return t.startswith(("kurze frage", "anfrage zu")) or "noch verfuegbar" in t
+
+
+async def _enrich_incoming_card_meta(
+    session,
+    user_id: int,
+    *,
+    resolved_offer_id: int | None,
+    offer_id: int | None,
+    service_label: str | None,
+    product_title: str | None,
+    photo_url: str | None,
+    offer_price: str | None,
+    subject: str,
+    mail_ctx: Any | None = None,
+) -> tuple[int | None, str | None, str | None, str | None, str | None]:
+    """Сервис/фото/название с лота или журнала /send — не оставлять только тему Re:."""
+    from services.subject_offer import extract_core_offer_title_from_subject
+
+    if mail_ctx is not None:
+        return (
+            int(mail_ctx.offer_id),
+            mail_ctx.service_label or service_label,
+            mail_ctx.product_title or product_title,
+            mail_ctx.photo_url or photo_url,
+            mail_ctx.offer_price or offer_price,
+        )
+
+    oid = int(offer_id or resolved_offer_id or 0) or None
+    if oid:
+        off = await _load_offer_by_id(session, int(user_id), int(oid))
+        if off:
+            o, svc, tit, ph, pr = _meta_tuple_from_offer(off, subject=subject)
+            pt = tit or product_title
+            if _product_title_looks_like_outgoing_subject(pt):
+                pt = (
+                    extract_core_offer_title_from_subject(subject)
+                    or tit
+                    or pt
+                )
+            return (
+                o,
+                svc or service_label,
+                pt,
+                ph or photo_url,
+                pr or offer_price,
+            )
+
+    core = extract_core_offer_title_from_subject(subject)
+    if core and _product_title_looks_like_outgoing_subject(product_title):
+        product_title = core
+    return offer_id, service_label, product_title, photo_url, offer_price
+
+
 def _meta_tuple_from_offer(
     off: Offer,
     *,
@@ -1399,7 +1455,6 @@ async def _process_mails_for_account_impl(
 
                         from services.mailing_send_log import resolve_mailing_reply_context
 
-                        mail_ctx = None
                         if (inbox_email_clean or "").strip():
                             mail_ctx = await resolve_mailing_reply_context(
                                 session,
@@ -1718,6 +1773,32 @@ async def _process_mails_for_account_impl(
                         photo_caption += f"\n💰 Цена: {offer_price} 💰"
             except Exception:
                 photo_to_send = None
+
+            try:
+                async with _imap_db_session() as _s_enrich:
+                    offer_id, service_label, product_title, photo_url, offer_price = (
+                        await _enrich_incoming_card_meta(
+                            _s_enrich,
+                            int(user_id),
+                            resolved_offer_id=resolved_offer_id,
+                            offer_id=offer_id,
+                            service_label=service_label,
+                            product_title=product_title,
+                            photo_url=photo_url,
+                            offer_price=offer_price,
+                            subject=subject or "",
+                            mail_ctx=mail_ctx,
+                        )
+                    )
+                    if photo_url and is_first and not photo_to_send:
+                        photo_to_send = photo_url
+                        photo_caption = "📷 Фото товара (первый ответ)"
+                        if (product_title or "").strip():
+                            photo_caption = f"📌 {(product_title or '').strip()}\n{photo_caption}"
+                        if offer_price:
+                            photo_caption += f"\n💰 Цена: {offer_price} 💰"
+            except Exception:
+                logger.exception("enrich incoming card meta failed from=%s", from_email_clean)
 
             chunks = render_mail_text_chunks(
                 account_email=account_email,

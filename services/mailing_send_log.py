@@ -96,7 +96,15 @@ class MailingReplyContext:
 
 
 def _ctx_from_row(row: MailingSend, off: Offer) -> MailingReplyContext:
-    title = (row.title_snapshot or offer_effective_title(off) or "").strip() or None
+    from services.subject_offer import extract_core_offer_title_from_subject
+
+    title = (row.title_snapshot or offer_effective_title(off) or "").strip()
+    if not title:
+        title = extract_core_offer_title_from_subject(row.subject or "")
+    core = extract_core_offer_title_from_subject(row.subject or "")
+    if core and title and title.lower().startswith(("kurze frage", "anfrage zu")):
+        title = core
+    title = title or None
     link = (row.ad_url_snapshot or offer_effective_link(off) or "").strip()
     svc = (row.service_label or "").strip() or _service_from_link(link) or None
     photo = (row.photo_url or offer_effective_photo(off) or "").strip() or None
@@ -194,6 +202,31 @@ async def resolve_mailing_reply_context(
     if not rows:
         return None
 
+    from services.subject_offer import subjects_same_for_mailing
+
+    contact_oids: set[int] = set()
+    if contact:
+        contact_oids = await _offer_ids_with_email(session, int(user_id), contact)
+
+    # 0) Тема ответа = тема /send (Kurze Frage: Mac Pro… ↔ Re: Kurze Frage: Mac Pro…)
+    subj_rows = [r for r in rows if subjects_same_for_mailing(r.subject or "", subject)]
+    if subj_rows:
+        narrowed = subj_rows
+        if contact:
+            by_contact = [
+                r
+                for r in subj_rows
+                if _canon_email(r.to_email or "") == contact
+                or int(r.offer_id) in contact_oids
+            ]
+            if by_contact:
+                narrowed = by_contact
+        if len(narrowed) == 1:
+            row0 = narrowed[0]
+            off0 = await _load_offer(session, int(user_id), int(row0.offer_id))
+            if off0:
+                return _ctx_from_row(row0, off0)
+
     def _pick_row(candidates: list[MailingSend]) -> MailingSend | None:
         if not candidates:
             return None
@@ -227,13 +260,22 @@ async def resolve_mailing_reply_context(
                 if off:
                     return _ctx_from_row(picked, off)
 
-    # 2) to_email == from ответа
+    # 2) to_email == from ответа (или единственная рассылка на этот контакт)
     if contact:
         contact_rows = [r for r in rows if _canon_email(r.to_email or "") == contact]
+        subj_contact = [r for r in contact_rows if subjects_same_for_mailing(r.subject or "", subject)]
+        if len(subj_contact) == 1:
+            rowc = subj_contact[0]
+            offc = await _load_offer(session, int(user_id), int(rowc.offer_id))
+            if offc:
+                return _ctx_from_row(rowc, offc)
         picked = _pick_row(contact_rows)
         if picked:
             off = await _load_offer(session, int(user_id), int(picked.offer_id))
-            if off and _snapshot_matches_reply(picked, subject, offer=off):
+            if off and (
+                _snapshot_matches_reply(picked, subject, offer=off)
+                or subjects_same_for_mailing(picked.subject or "", subject)
+            ):
                 return _ctx_from_row(picked, off)
             if off and len(contact_rows) == 1:
                 return _ctx_from_row(picked, off)
@@ -257,14 +299,11 @@ async def resolve_mailing_reply_context(
     # 4) Ранжирование (тема / снапшот / имя продавца) — как раньше, но возвращаем строку журнала
     best_row: MailingSend | None = None
     best_rank = -1
-    contact_oids: set[int] = set()
-    if contact:
-        contact_oids = await _offer_ids_with_email(session, int(user_id), contact)
 
     for row in rows:
         rank = 0
         sent_subj = normalized_reply_subject(row.subject or "")
-        subj_match = bool(subj_norm and sent_subj and sent_subj == subj_norm)
+        subj_match = subjects_same_for_mailing(row.subject or "", subject)
         title_match = False
         if subj_c and row.title_snapshot:
             tc = _title_compact(row.title_snapshot)

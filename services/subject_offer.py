@@ -85,6 +85,47 @@ async def save_subject_rotation_index(session, user_id: int, value: int) -> None
     )
 
 
+_OUTGOING_SUBJ_PREFIX_RE = re.compile(
+    r"^(?:anfrage zu|kurze frage)\s*:?\s*",
+    re.IGNORECASE,
+)
+_OUTGOING_SUBJ_SUFFIX_RE = re.compile(
+    r"\s*[—\-]\s*noch verfuegbar\?\s*$",
+    re.IGNORECASE,
+)
+
+
+def extract_core_offer_title_from_subject(subject: str) -> str:
+    """
+    Из темы ответа Re: / из исходящей темы рассылки — только название лота
+    (без «Kurze Frage:», «Anfrage zu», «— noch verfuegbar?»).
+    """
+    from services.offer_matching import normalized_reply_subject
+
+    s = normalized_reply_subject(subject or "")
+    if not s:
+        return ""
+    s = _OUTGOING_SUBJ_PREFIX_RE.sub("", s).strip()
+    s = _OUTGOING_SUBJ_SUFFIX_RE.sub("", s).strip()
+    return sanitize_email_subject(s)
+
+
+def subjects_same_for_mailing(sent_subject: str, reply_subject: str) -> bool:
+    """Тема ответа = тема исходящего письма /send (с учётом Re: и шаблонов)."""
+    from services.offer_matching import normalized_reply_subject
+    from services.offer_storage import _title_compact
+
+    a = normalized_reply_subject(sent_subject or "")
+    b = normalized_reply_subject(reply_subject or "")
+    if a and b and a == b:
+        return True
+    ca = _title_compact(extract_core_offer_title_from_subject(sent_subject))
+    cb = _title_compact(extract_core_offer_title_from_subject(reply_subject))
+    if ca and cb and (ca == cb or ca in cb or cb in ca):
+        return True
+    return False
+
+
 def rotation_templates_preview() -> str:
     """Текст для настроек / подсказок."""
     return "\n".join(
