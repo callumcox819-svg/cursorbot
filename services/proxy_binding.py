@@ -22,6 +22,12 @@ PROXY_NOT_ASSIGNED = PROXY_WAIT_REPLACEMENT
 
 _rr_lock = asyncio.Lock()
 _rr_index: dict[int, int] = {}
+# Временно исключены из пула только на текущую рассылку (не трогаем is_active в БД)
+_mailing_excluded: dict[int, set[int]] = {}
+_mailing_fail_streak: dict[tuple[int, int], int] = {}
+MAILING_PROXY_MAX_TIMEOUT_STREAK = max(
+    2, min(8, int(__import__("os").getenv("MAILING_PROXY_MAX_TIMEOUT_STREAK", "4")))
+)
 
 
 def _smtp_eligible_proxy_row(p: Proxy) -> bool:
@@ -68,7 +74,38 @@ async def get_proxy_row(session: AsyncSession, proxy_id: int, user_id: int) -> O
 
 
 def reset_mailing_proxy_round_robin(user_id: int) -> None:
-    _rr_index[int(user_id)] = 0
+    uid = int(user_id)
+    _rr_index[uid] = 0
+    _mailing_excluded.pop(uid, None)
+    keys = [k for k in _mailing_fail_streak if k[0] == uid]
+    for k in keys:
+        _mailing_fail_streak.pop(k, None)
+
+
+def get_mailing_excluded_proxy_ids(user_id: int) -> set[int]:
+    return set(_mailing_excluded.get(int(user_id), set()))
+
+
+def exclude_proxy_for_mailing_session(user_id: int, proxy_id: int) -> None:
+    _mailing_excluded.setdefault(int(user_id), set()).add(int(proxy_id))
+
+
+async def revive_proxies_after_transient_mailing_errors(
+    session: AsyncSession,
+    user_id: int,
+) -> int:
+    """Снять ложный 🔴 после таймаутов рассылки — прокси снова в пуле."""
+    from services.proxy_verify import MAILING_PROXY_DEAD_PREFIX
+
+    res = await session.execute(
+        update(Proxy)
+        .where(Proxy.user_id == int(user_id))
+        .where(Proxy.is_active.is_(False))
+        .where(Proxy.last_error.ilike(f"{MAILING_PROXY_DEAD_PREFIX}%"))
+        .values(is_active=None, last_error=None)
+    )
+    await session.commit()
+    return int(res.rowcount or 0)
 
 
 async def pick_mailing_proxy(
@@ -78,8 +115,9 @@ async def pick_mailing_proxy(
     exclude_ids: set[int] | None = None,
 ) -> Optional[Proxy]:
     """Следующий живой SOCKS5 из пула (round-robin), без привязки к ящику."""
-    proxies = await list_sendable_proxies(session, user_id)
-    skip = exclude_ids or set()
+    uid = int(user_id)
+    proxies = await list_sendable_proxies(session, uid)
+    skip = get_mailing_excluded_proxy_ids(uid) | set(exclude_ids or ())
     available = [p for p in proxies if int(p.id) not in skip]
     if not available:
         return None
@@ -152,24 +190,53 @@ async def deactivate_proxy_from_mailing(
     proxy: Proxy | None,
     err: str | None,
 ) -> bool:
-    """Мёртвый SOCKS5 → 🔴 в списке прокси, ящики не трогаем."""
+    """
+    Таймаут/обрыв → временно skip в этой рассылке.
+    🔴 в БД только при явной смерти SOCKS5 или N таймаутов подряд.
+    """
     if not proxy or not is_mailing_proxy_failure(err):
         return False
 
     from services.proxy_manager import ProxyManager
+    from services.sender import is_definite_proxy_failure, is_smtp_timeout_error
 
+    uid = int(proxy.user_id)
     pid = int(proxy.id)
     err_txt = (err or "mailing proxy failure")[:500]
-    await ProxyManager.note_proxy_failure(
-        session, pid, err_txt, deactivate=True, from_mailing=True
-    )
-    logger.warning(
-        "mailing pool remove proxy_id=%s %s:%s err=%s",
-        pid,
-        proxy.host,
-        proxy.port,
-        err_txt[:120],
-    )
+    exclude_proxy_for_mailing_session(uid, pid)
+
+    hard_dead = is_definite_proxy_failure(err)
+    if not hard_dead and is_smtp_timeout_error(err):
+        key = (uid, pid)
+        streak = _mailing_fail_streak.get(key, 0) + 1
+        _mailing_fail_streak[key] = streak
+        hard_dead = streak >= MAILING_PROXY_MAX_TIMEOUT_STREAK
+    elif not hard_dead:
+        key = (uid, pid)
+        _mailing_fail_streak[key] = _mailing_fail_streak.get(key, 0) + 1
+
+    if hard_dead:
+        await ProxyManager.note_proxy_failure(
+            session, pid, err_txt, deactivate=True, from_mailing=True
+        )
+        logger.warning(
+            "mailing proxy DEAD proxy_id=%s %s:%s err=%s",
+            pid,
+            proxy.host,
+            proxy.port,
+            err_txt[:120],
+        )
+    else:
+        await ProxyManager.note_proxy_failure(
+            session, pid, err_txt, deactivate=False, from_mailing=True
+        )
+        logger.info(
+            "mailing proxy skip (session) proxy_id=%s %s:%s err=%s",
+            pid,
+            proxy.host,
+            proxy.port,
+            err_txt[:120],
+        )
     return True
 
 

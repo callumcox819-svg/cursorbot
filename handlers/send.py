@@ -318,11 +318,17 @@ async def start_sending(message: Message):
         from services.proxy_binding import (
             clear_legacy_account_proxy_state,
             reset_mailing_proxy_round_robin,
+            revive_proxies_after_transient_mailing_errors,
         )
 
         cleared = await clear_legacy_account_proxy_state(session, int(db_user_id))
         if cleared:
             logger.info("Cleared legacy proxy state on %s accounts", cleared)
+        revived = await revive_proxies_after_transient_mailing_errors(
+            session, int(db_user_id)
+        )
+        if revived:
+            logger.info("Revived %s proxies after transient mailing errors", revived)
         reset_mailing_proxy_round_robin(int(db_user_id))
 
         accounts = await _get_active_accounts(session, db_user_id)
@@ -432,7 +438,7 @@ async def start_sending(message: Message):
             f"В рассылке SOCKS5: <b>{sendable_px}</b> (🔴 не используются)\n"
             f"Режим: <b>SOCKS5 → один SMTP-сеанс на пачку</b> с ящика · пауза MIN–MAX\n"
             f"Успех в /stat: <b>{'IMAP Sent' if MAIL_VERIFY_SENT else 'SMTP 250+NOOP'}</b>\n"
-            f"Прокси: <b>1 на ящик</b> (привязка, без ротации) · SMTP <b>{MAIL_MAILING_TIMEOUT_SEC}</b> с\n\n"
+            f"Прокси: <b>пул SOCKS5</b> (round-robin, мёртвые снимаются) · SMTP <b>{MAIL_MAILING_TIMEOUT_SEC}</b> с\n\n"
             "<i>Пачка: ⚙️ Интервал → третье число (пример: <code>2 4 5</code>). "
             "Ящик с Message blocked снимается с рассылки.</i>",
             parse_mode="HTML",
@@ -569,8 +575,11 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 pass
             return
 
+        from services.proxy_binding import revive_proxies_after_transient_mailing_errors
         from services.smtp_proxy_send import _list_active_socks5_proxies
 
+        if not await _list_active_socks5_proxies(session, int(db_user_id)):
+            await revive_proxies_after_transient_mailing_errors(session, int(db_user_id))
         if not await _list_active_socks5_proxies(session, int(db_user_id)):
             state.is_running = False
             state.last_error = "PROXY_ERROR|no_active_proxy|No sendable SOCKS5"

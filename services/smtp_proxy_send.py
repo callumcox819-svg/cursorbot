@@ -73,8 +73,11 @@ async def _send_with_proxy_pool(
     run_on_proxy: Callable[[Proxy], Awaitable[T]],
     fail_result: Callable[[str], T],
 ) -> T:
-    exclude: Set[int] = set()
-    sendable = await list_sendable_proxies(session, int(user_id))
+    from services.proxy_binding import get_mailing_excluded_proxy_ids
+
+    uid = int(user_id)
+    exclude: Set[int] = get_mailing_excluded_proxy_ids(uid)
+    sendable = await list_sendable_proxies(session, uid)
     max_tries = _mailing_proxy_attempt_cap(len(sendable), mailing=mailing)
     last_err: Optional[str] = None
 

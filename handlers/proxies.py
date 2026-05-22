@@ -450,9 +450,8 @@ async def render_proxy_menu(message_or_cb, telegram_id: int):
         "🧩 <b>Твои прокси</b>\n\n"
         f"Всего: {len(proxies)}\n"
         f"🟢 SMTP OK: {ok_n} · 🟡 неясно/не проверен: {unk_n} · 🔴 мёртв при рассылке: {bad_n}\n\n"
-        "<i>Каждый почтовый ящик привязан к одному SOCKS5 (без ротации IP). "
-        "Новые ящики получают прокси с наименьшей нагрузкой.</i>\n"
-        "<i>🔴 прокси умер — ящики открепляются до замены живого SOCKS5.</i>"
+        "<i>Рассылка берёт любой 🟢/🟡 SOCKS5 из пула (по очереди).</i>\n"
+        "<i>🔴 — только после реального сбоя туннеля при /send (таймаут ≠ сразу 🔴).</i>"
     )
 
     kb = proxies_menu(proxies)
@@ -482,6 +481,15 @@ async def open_proxies(callback: CallbackQuery):
         ).scalar_one_or_none()
         if not user:
             return
+        from services.proxy_binding import revive_proxies_after_transient_mailing_errors
+        from services.proxy_verify import heal_proxy_rows_from_stale_check_markers
+
+        proxies = list(
+            (await session.execute(select(Proxy).where(Proxy.user_id == user.id))).scalars().all()
+        )
+        heal_proxy_rows_from_stale_check_markers(proxies)
+        await revive_proxies_after_transient_mailing_errors(session, int(user.id))
+        await session.commit()
         proxies = list(
             (await session.execute(select(Proxy).where(Proxy.user_id == user.id))).scalars().all()
         )
