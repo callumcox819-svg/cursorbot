@@ -320,6 +320,7 @@ async def start_sending(message: Message):
             clear_legacy_account_proxy_state,
             reset_mailing_proxy_round_robin,
             revive_proxies_after_transient_mailing_errors,
+            revive_soft_dead_proxies,
         )
 
         cleared = await clear_legacy_account_proxy_state(session, int(db_user_id))
@@ -330,6 +331,9 @@ async def start_sending(message: Message):
         )
         if revived:
             logger.info("Revived %s proxies after transient mailing errors", revived)
+        soft = await revive_soft_dead_proxies(session, int(db_user_id))
+        if soft:
+            logger.info("Revived %s soft-dead proxies for mailing pool", soft)
         reset_mailing_proxy_round_robin(int(db_user_id))
 
         accounts = await _get_active_accounts(session, db_user_id)
