@@ -1,11 +1,12 @@
-"""Постоянная привязка SOCKS5-прокси к почтовому ящику (без ротации)."""
+"""SOCKS5 для SMTP: общий пул на пользователя, без привязки к ящику."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
-from sqlalchemy import func, select, update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import EmailAccount, Proxy
@@ -15,11 +16,12 @@ logger = logging.getLogger(__name__)
 
 NO_ACTIVE_PROXY = "PROXY_ERROR|no_active_proxy|No active proxy configured"
 PROXY_WAIT_REPLACEMENT = (
-    "PROXY_ERROR|dead_proxy|Прокси отключён — добавьте живой SOCKS5 и снова /send"
+    "PROXY_ERROR|dead_proxy|Нет живых SOCKS5 — добавьте прокси и снова /send"
 )
-PROXY_NOT_ASSIGNED = (
-    "PROXY_ERROR|no_proxy_assigned|Нет свободного SOCKS5 для привязки к ящику"
-)
+PROXY_NOT_ASSIGNED = PROXY_WAIT_REPLACEMENT
+
+_rr_lock = asyncio.Lock()
+_rr_index: dict[int, int] = {}
 
 
 def _smtp_eligible_proxy_row(p: Proxy) -> bool:
@@ -49,35 +51,6 @@ async def list_sendable_proxies(session: AsyncSession, user_id: int) -> list[Pro
     return out
 
 
-async def count_accounts_per_proxy(session: AsyncSession, user_id: int) -> dict[int, int]:
-    rows = (
-        await session.execute(
-            select(EmailAccount.proxy_id, func.count(EmailAccount.id))
-            .where(EmailAccount.user_id == int(user_id))
-            .where(EmailAccount.proxy_id.isnot(None))
-            .group_by(EmailAccount.proxy_id)
-        )
-    ).all()
-    return {int(pid): int(cnt) for pid, cnt in rows if pid is not None}
-
-
-async def pick_least_loaded_proxy(
-    session: AsyncSession,
-    user_id: int,
-    *,
-    exclude_ids: set[int] | None = None,
-) -> Optional[Proxy]:
-    """Прокси с минимумом привязанных ящиков — чтобы все 3–4 использовались."""
-    proxies = await list_sendable_proxies(session, user_id)
-    skip = exclude_ids or set()
-    proxies = [p for p in proxies if int(p.id) not in skip]
-    if not proxies:
-        return None
-
-    counts = await count_accounts_per_proxy(session, user_id)
-    return min(proxies, key=lambda p: (counts.get(int(p.id), 0), int(p.id)))
-
-
 async def get_proxy_row(session: AsyncSession, proxy_id: int, user_id: int) -> Optional[Proxy]:
     p = (
         await session.execute(
@@ -94,77 +67,72 @@ async def get_proxy_row(session: AsyncSession, proxy_id: int, user_id: int) -> O
     return p
 
 
+def reset_mailing_proxy_round_robin(user_id: int) -> None:
+    _rr_index[int(user_id)] = 0
+
+
+async def pick_mailing_proxy(
+    session: AsyncSession,
+    user_id: int,
+    *,
+    exclude_ids: set[int] | None = None,
+) -> Optional[Proxy]:
+    """Следующий живой SOCKS5 из пула (round-robin), без привязки к ящику."""
+    proxies = await list_sendable_proxies(session, user_id)
+    skip = exclude_ids or set()
+    available = [p for p in proxies if int(p.id) not in skip]
+    if not available:
+        return None
+
+    uid = int(user_id)
+    async with _rr_lock:
+        idx = _rr_index.get(uid, 0) % len(available)
+        _rr_index[uid] = idx + 1
+    return available[idx]
+
+
+async def clear_legacy_account_proxy_state(session: AsyncSession, user_id: int) -> int:
+    """
+    Сброс старой схемы (proxy_error / proxy_id на ящиках).
+    Ящики остаются active — прокси только из пула при отправке.
+    """
+    res = await session.execute(
+        update(EmailAccount)
+        .where(EmailAccount.user_id == int(user_id))
+        .where(
+            (EmailAccount.status == "proxy_error")
+            | (EmailAccount.proxy_id.isnot(None))
+        )
+        .values(proxy_id=None, status="active", last_error=None)
+    )
+    await session.commit()
+    n = int(res.rowcount or 0)
+    if n:
+        logger.info("cleared legacy proxy bind/error on %s accounts user_id=%s", n, user_id)
+    return n
+
+
+# Совместимость: больше не привязываем ящики к прокси
 async def assign_proxy_to_account(
     session: AsyncSession,
     account: EmailAccount,
     *,
     force_new: bool = False,
 ) -> Optional[Proxy]:
-    """Привязать ящик к прокси с наименьшей нагрузкой."""
-    uid = int(account.user_id)
-    if not force_new and account.proxy_id:
-        bound = await get_proxy_row(session, int(account.proxy_id), uid)
-        if bound:
-            return bound
-        account.proxy_id = None
-
-    proxy = await pick_least_loaded_proxy(session, uid)
-    if not proxy:
-        return None
-
-    account.proxy_id = int(proxy.id)
-    if (account.status or "").strip().lower() == "proxy_error":
-        account.status = "active"
-        account.last_error = None
-    await session.commit()
-    logger.info(
-        "proxy bind account_id=%s email=%s -> proxy_id=%s %s:%s",
-        account.id,
-        account.email,
-        proxy.id,
-        proxy.host,
-        proxy.port,
-    )
-    return proxy
+    del session, account, force_new
+    return None
 
 
 async def ensure_all_accounts_assigned(session: AsyncSession, user_id: int) -> int:
-    """Привязать только новые active-ящики без proxy_id (не трогаем proxy_error — ждут новый SOCKS5)."""
-    rows = (
-        await session.execute(
-            select(EmailAccount)
-            .where(EmailAccount.user_id == int(user_id))
-            .where(EmailAccount.proxy_id.is_(None))
-            .where(EmailAccount.status == "active")
-            .order_by(EmailAccount.id.asc())
-        )
-    ).scalars().all()
-    n = 0
-    for acc in rows:
-        if await assign_proxy_to_account(session, acc):
-            n += 1
-    return n
+    return await clear_legacy_account_proxy_state(session, user_id)
 
 
 async def assign_waiting_accounts(session: AsyncSession, user_id: int) -> int:
-    """После добавления нового прокси — ящики без привязки (в т.ч. proxy_error)."""
-    rows = (
-        await session.execute(
-            select(EmailAccount)
-            .where(EmailAccount.user_id == int(user_id))
-            .where(EmailAccount.proxy_id.is_(None))
-            .order_by(EmailAccount.id.asc())
-        )
-    ).scalars().all()
-    n = 0
-    for acc in rows:
-        if await assign_proxy_to_account(session, acc):
-            n += 1
-    return n
+    return await clear_legacy_account_proxy_state(session, user_id)
 
 
 def is_mailing_proxy_failure(err: str | None) -> bool:
-    """Срыв /send из‑за прокси/SMTP-туннеля — снимаем прокси с очереди рассылки."""
+    """Срыв /send из‑за прокси/SMTP-туннеля — убираем прокси из пула рассылки."""
     from services.sender import (
         is_definite_proxy_failure,
         is_proxy_error_marker,
@@ -190,18 +158,14 @@ def is_mailing_proxy_failure(err: str | None) -> bool:
     return False
 
 
-async def eject_proxy_after_mailing_failure(
+async def deactivate_proxy_from_mailing(
     session: AsyncSession,
-    *,
-    account: EmailAccount,
     proxy: Proxy | None,
     err: str | None,
-) -> Optional[Proxy]:
-    """
-    Прокси 🔴 + отвязка ящиков; этот ящик сразу на другой SOCKS5 (если есть).
-    """
+) -> bool:
+    """Мёртвый SOCKS5 → 🔴 в списке прокси, ящики не трогаем."""
     if not proxy or not is_mailing_proxy_failure(err):
-        return None
+        return False
 
     from services.proxy_manager import ProxyManager
 
@@ -210,17 +174,29 @@ async def eject_proxy_after_mailing_failure(
     await ProxyManager.note_proxy_failure(
         session, pid, err_txt, deactivate=True, from_mailing=True
     )
-    new_proxy = await assign_proxy_to_account(session, account, force_new=True)
     logger.warning(
-        "mailing eject proxy_id=%s %s:%s account=%s err=%s -> %s",
+        "mailing pool remove proxy_id=%s %s:%s err=%s",
         pid,
         proxy.host,
         proxy.port,
-        account.email,
         err_txt[:120],
-        f"proxy_id={new_proxy.id}" if new_proxy else "NO_REPLACEMENT",
     )
-    return new_proxy
+    return True
+
+
+async def eject_proxy_after_mailing_failure(
+    session: AsyncSession,
+    *,
+    account: EmailAccount,
+    proxy: Proxy | None,
+    err: str | None,
+) -> Optional[Proxy]:
+    """Совместимость: снять прокси с пула и вернуть следующий для retry."""
+    del account
+    if not await deactivate_proxy_from_mailing(session, proxy, err):
+        return None
+    exclude = {int(proxy.id)} if proxy else set()
+    return await pick_mailing_proxy(session, int(proxy.user_id), exclude_ids=exclude)
 
 
 async def detach_accounts_from_proxy(
@@ -229,44 +205,39 @@ async def detach_accounts_from_proxy(
     *,
     reason: str = "",
 ) -> int:
-    """Прокси умер — открепить ящики, не перекидывать на другой IP."""
-    err = (reason or "Прокси недоступен")[:500]
+    """Только сброс устаревшего proxy_id (статус ящика не меняем)."""
+    del reason
     res = await session.execute(
         update(EmailAccount)
         .where(EmailAccount.proxy_id == int(proxy_id))
-        .values(
-            proxy_id=None,
-            status="proxy_error",
-            last_error=err,
-        )
+        .values(proxy_id=None)
     )
     await session.commit()
-    n = int(res.rowcount or 0)
-    if n:
-        logger.warning("proxy detach proxy_id=%s accounts=%s", proxy_id, n)
-    return n
+    return int(res.rowcount or 0)
 
 
 async def resolve_proxy_for_account(
     session: AsyncSession,
     account: EmailAccount,
+    *,
+    exclude_ids: set[int] | None = None,
 ) -> tuple[Optional[Proxy], Optional[str]]:
-    """
-    Прокси для SMTP/IMAP этого ящика.
-    (proxy, None) | (None, error_code_message)
-    """
-    proxies = await list_sendable_proxies(session, int(account.user_id))
-    if not proxies:
-        return None, NO_ACTIVE_PROXY
-
-    if account.proxy_id:
-        bound = await get_proxy_row(session, int(account.proxy_id), int(account.user_id))
-        if bound:
-            return bound, None
-        account.proxy_id = None
-        await session.commit()
-
-    proxy = await assign_proxy_to_account(session, account)
+    """Прокси из пула для SMTP (рассылка и ответы)."""
+    uid = int(account.user_id)
+    proxy = await pick_mailing_proxy(session, uid, exclude_ids=exclude_ids)
     if proxy:
         return proxy, None
+    if exclude_ids:
+        return None, NO_ACTIVE_PROXY
+    if not await list_sendable_proxies(session, uid):
+        return None, NO_ACTIVE_PROXY
     return None, PROXY_NOT_ASSIGNED
+
+
+async def pick_least_loaded_proxy(
+    session: AsyncSession,
+    user_id: int,
+    *,
+    exclude_ids: set[int] | None = None,
+) -> Optional[Proxy]:
+    return await pick_mailing_proxy(session, user_id, exclude_ids=exclude_ids)

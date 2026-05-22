@@ -235,15 +235,8 @@ async def _bulk_add_accounts(
                 session.add(acc)
                 await session.flush()
 
-            try:
-                from services.proxy_binding import assign_proxy_to_account
-
-                await assign_proxy_to_account(session, acc)
-            except Exception:
-                logger.exception("assign_proxy_to_account failed for %s", work.email)
-
             ok_count += 1
-            px_note = f" · proxy #{acc.proxy_id}" if getattr(acc, "proxy_id", None) else ""
+            px_note = ""
             if gmail_only:
                 details.append(f"✅ <code>{_e(work.email)}</code>{px_note}")
             else:

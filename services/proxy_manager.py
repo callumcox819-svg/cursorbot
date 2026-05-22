@@ -122,11 +122,7 @@ class ProxyManager:
             try:
                 from services.proxy_binding import detach_accounts_from_proxy
 
-                await detach_accounts_from_proxy(
-                    session,
-                    int(proxy_id),
-                    reason=err_txt,
-                )
+                await detach_accounts_from_proxy(session, int(proxy_id))
             except Exception:
                 logger.exception("detach_accounts_from_proxy failed proxy_id=%s", proxy_id)
 

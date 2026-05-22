@@ -315,11 +315,15 @@ async def start_sending(message: Message):
 
         db_user_id = db_user.id
 
-        from services.proxy_binding import ensure_all_accounts_assigned
+        from services.proxy_binding import (
+            clear_legacy_account_proxy_state,
+            reset_mailing_proxy_round_robin,
+        )
 
-        bound_n = await ensure_all_accounts_assigned(session, int(db_user_id))
-        if bound_n:
-            logger.info("Assigned proxy to %s accounts for user_id=%s", bound_n, db_user_id)
+        cleared = await clear_legacy_account_proxy_state(session, int(db_user_id))
+        if cleared:
+            logger.info("Cleared legacy proxy state on %s accounts", cleared)
+        reset_mailing_proxy_round_robin(int(db_user_id))
 
         accounts = await _get_active_accounts(session, db_user_id)
 
@@ -688,19 +692,17 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                 set_sending_state(tg_user_id, state=state)
 
                 smtp_items = [(j[1], j[2], j[3]) for j in batch_jobs]
-                bound_proxy = None
-                if acc.proxy_id:
-                    from services.proxy_binding import get_proxy_row
-
-                    bound_proxy = await get_proxy_row(
-                        session, int(acc.proxy_id), int(db_user_id)
-                    )
-
-                async def _run_batch() -> list:
+                try:
                     from services.mailing_send import send_mailing_batch
 
+                    logger.info(
+                        "[mailing burst] from=%s count=%s first=%s",
+                        acc.email,
+                        len(smtp_items),
+                        smtp_items[0][0],
+                    )
                     async with smtp_sem:
-                        return await asyncio.wait_for(
+                        results = await asyncio.wait_for(
                             send_mailing_batch(
                                 session,
                                 db_user_id,
@@ -710,71 +712,18 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                             ),
                             timeout=send_one_timeout,
                         )
-
-                try:
-                    logger.info(
-                        "[mailing burst] from=%s count=%s first=%s",
-                        acc.email,
-                        len(smtp_items),
-                        smtp_items[0][0],
-                    )
-                    results = await _run_batch()
                 except asyncio.TimeoutError:
-                    t_err = normalize_send_error(
-                        f"SMTP_TIMEOUT|timeout|batch exceeded {send_one_timeout}s"
-                    )
-                    from services.proxy_binding import (
-                        eject_proxy_after_mailing_failure,
-                        is_mailing_proxy_failure,
-                    )
-
-                    if is_mailing_proxy_failure(t_err):
-                        await eject_proxy_after_mailing_failure(
-                            session,
-                            account=acc,
-                            proxy=bound_proxy,
-                            err=t_err,
+                    results = [
+                        (
+                            False,
+                            normalize_send_error(
+                                f"SMTP_TIMEOUT|timeout|batch exceeded {send_one_timeout}s"
+                            ),
                         )
-                        try:
-                            results = await _run_batch()
-                        except asyncio.TimeoutError:
-                            results = [(False, t_err)] * len(batch_jobs)
-                        except Exception as e:
-                            results = [(False, normalize_send_error(str(e)))] * len(
-                                batch_jobs
-                            )
-                    else:
-                        results = [(False, t_err)] * len(batch_jobs)
+                    ] * len(batch_jobs)
                 except Exception as e:
                     err_one = normalize_send_error(str(e))
                     results = [(False, err_one)] * len(batch_jobs)
-
-                if results and all(not ok for ok, _ in results):
-                    from services.proxy_binding import (
-                        eject_proxy_after_mailing_failure,
-                        is_mailing_proxy_failure,
-                    )
-
-                    first_err = results[0][1]
-                    if is_mailing_proxy_failure(first_err):
-                        replaced = await eject_proxy_after_mailing_failure(
-                            session,
-                            account=acc,
-                            proxy=bound_proxy,
-                            err=first_err,
-                        )
-                        if replaced:
-                            try:
-                                logger.info(
-                                    "[mailing burst retry] account=%s proxy_id=%s",
-                                    acc.email,
-                                    replaced.id,
-                                )
-                                results = await _run_batch()
-                            except asyncio.TimeoutError:
-                                pass
-                            except Exception:
-                                pass
 
                 state.current_to = ""
                 for (tgt, to_addr, subject, body), (ok, err) in zip(batch_jobs, results):
