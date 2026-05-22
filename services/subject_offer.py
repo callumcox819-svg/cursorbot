@@ -85,45 +85,81 @@ async def save_subject_rotation_index(session, user_id: int, value: int) -> None
     )
 
 
-_OUTGOING_SUBJ_PREFIX_RE = re.compile(
-    r"^(?:anfrage zu|kurze frage)\s*:?\s*",
-    re.IGNORECASE,
-)
-_OUTGOING_SUBJ_SUFFIX_RE = re.compile(
-    r"\s*[—\-]\s*noch verfuegbar\?\s*$",
-    re.IGNORECASE,
-)
+def _template_capture_pattern(template: str) -> str | None:
+    """Регэксп: группа 1 = то, что подставлено вместо OFFER."""
+    tpl = sanitize_email_subject(template)
+    if not tpl or "offer" not in tpl.lower():
+        return None
+    chunks: list[str] = []
+    pos = 0
+    for m in re.finditer(r"(\{\{OFFER\}\}|OFFER)", tpl, flags=re.IGNORECASE):
+        chunks.append(re.escape(tpl[pos : m.start()]))
+        chunks.append("(.+)")
+        pos = m.end()
+    chunks.append(re.escape(tpl[pos:]))
+    body = "".join(chunks).replace(r"\ ", r"\s+")
+    return rf"^{body}$"
 
 
-def extract_core_offer_title_from_subject(subject: str) -> str:
+def offer_title_from_mail_subject(subject: str) -> str:
     """
-    Из темы ответа Re: / из исходящей темы рассылки — только название лота
-    (без «Kurze Frage:», «Anfrage zu», «— noch verfuegbar?»).
+    Только название товара из темы письма — подстановка OFFER в шаблоне рассылки.
+    Не «Kurze Frage», «Anfrage zu», «noch verfuegbar» и т.п.
     """
     from services.offer_matching import normalized_reply_subject
 
     s = normalized_reply_subject(subject or "")
     if not s:
         return ""
-    s = _OUTGOING_SUBJ_PREFIX_RE.sub("", s).strip()
-    s = _OUTGOING_SUBJ_SUFFIX_RE.sub("", s).strip()
-    return sanitize_email_subject(s)
+
+    for tpl in rotation_subject_templates():
+        pat = _template_capture_pattern(tpl)
+        if not pat:
+            continue
+        m = re.match(pat, s, flags=re.IGNORECASE)
+        if m:
+            core = sanitize_email_subject((m.group(1) or "").strip())
+            if core and core.upper() != "OFFER" and len(core) >= 3:
+                return core
+
+    # Фолбэк: снять известные обёртки (старые письма / нестандартная тема)
+    s2 = re.sub(
+        r"^(?:anfrage zu|kurze frage)\s*:?\s*",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    ).strip()
+    s2 = re.sub(
+        r"\s*[—\-]\s*noch verfuegbar\?\s*$",
+        "",
+        s2,
+        flags=re.IGNORECASE,
+    ).strip()
+    if s2 and s2 != s and len(s2) >= 3:
+        return sanitize_email_subject(s2)
+    if s and not re.match(r"^(?:anfrage zu|kurze frage)\b", s, re.I):
+        return sanitize_email_subject(s)
+    return ""
+
+
+def extract_core_offer_title_from_subject(subject: str) -> str:
+    """Алиас: только OFFER-часть темы."""
+    return offer_title_from_mail_subject(subject)
 
 
 def subjects_same_for_mailing(sent_subject: str, reply_subject: str) -> bool:
-    """Тема ответа = тема исходящего письма /send (с учётом Re: и шаблонов)."""
-    from services.offer_matching import normalized_reply_subject
+    """Тема ответа = тема /send: сравниваем только подстановку OFFER."""
     from services.offer_storage import _title_compact
+
+    ca = _title_compact(offer_title_from_mail_subject(sent_subject))
+    cb = _title_compact(offer_title_from_mail_subject(reply_subject))
+    if ca and cb and (ca == cb or ca in cb or cb in ca):
+        return True
+    from services.offer_matching import normalized_reply_subject
 
     a = normalized_reply_subject(sent_subject or "")
     b = normalized_reply_subject(reply_subject or "")
-    if a and b and a == b:
-        return True
-    ca = _title_compact(extract_core_offer_title_from_subject(sent_subject))
-    cb = _title_compact(extract_core_offer_title_from_subject(reply_subject))
-    if ca and cb and (ca == cb or ca in cb or cb in ca):
-        return True
-    return False
+    return bool(a and b and a == b)
 
 
 def rotation_templates_preview() -> str:

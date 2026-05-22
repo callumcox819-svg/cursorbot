@@ -172,7 +172,9 @@ async def find_offer_by_incoming_subject(
     if not subject_is_informative(subject):
         return None
 
-    subj_norm = normalized_reply_subject(subject)
+    from services.subject_offer import offer_title_from_mail_subject
+
+    subj_norm = offer_title_from_mail_subject(subject) or normalized_reply_subject(subject)
     subj_compact = _title_compact(subj_norm)
     if len(subj_compact) < 4:
         return None
@@ -356,7 +358,9 @@ async def find_offer_by_subject_aggressive(
 
     if not subject_is_informative(subject):
         return None
-    subj_norm = normalized_reply_subject(subject)
+    from services.subject_offer import offer_title_from_mail_subject
+
+    subj_norm = offer_title_from_mail_subject(subject) or normalized_reply_subject(subject)
     toks = [t for t in _subject_tokens(subj_norm) if len(t) >= 3]
     word_toks = [t for t in toks if len(t) >= 4]
     if not word_toks:
@@ -409,18 +413,17 @@ async def find_offer_by_core_subject_title(
     subject: str,
 ) -> Offer | None:
     """
-    Лот по названию товара из темы Re: (без «Kurze Frage:»), даже если from_email не в OfferEmail.
+    Лот по OFFER-названию в теме (шаблон рассылки), даже если from_email не в OfferEmail.
     """
     from services.offer_matching import (
         _fold_match_text,
         _subject_title_conflicts,
         _subject_tokens,
-        normalized_reply_subject,
         resolve_offer_by_subject_tokens,
     )
-    from services.subject_offer import extract_core_offer_title_from_subject
+    from services.subject_offer import offer_title_from_mail_subject
 
-    core = extract_core_offer_title_from_subject(subject)
+    core = offer_title_from_mail_subject(subject)
     if not core or len(core) < 6:
         return None
 
@@ -441,11 +444,7 @@ async def find_offer_by_core_subject_title(
             .limit(800)
         )
     ).scalars().all()
-    product_toks = [
-        t
-        for t in _subject_tokens(core)
-        if len(t) >= 4 and t not in ("kurze", "frage", "anfrage", "verfuegbar", "noch")
-    ]
+    product_toks = [t for t in _subject_tokens(core) if len(t) >= 4]
     best: Offer | None = None
     best_hits = 0
     for off_row in rows:
@@ -472,20 +471,16 @@ async def diagnose_subject_match(
     subject: str,
 ) -> dict[str, Any]:
     """Подсказка в ошибке: есть ли похожие лоты в БД."""
-    from services.offer_matching import _fold_match_text, normalized_reply_subject, _subject_tokens
-    from services.subject_offer import extract_core_offer_title_from_subject
+    from services.offer_matching import _fold_match_text, _subject_tokens
+    from services.subject_offer import offer_title_from_mail_subject
 
     total = (
         await session.execute(
             sa_select(func.count(Offer.id)).where(Offer.user_id == int(user_id))
         )
     ).scalar() or 0
-    core = extract_core_offer_title_from_subject(subject) or normalized_reply_subject(subject)
-    word_toks = [
-        t
-        for t in _subject_tokens(core)
-        if len(t) >= 4 and t not in ("kurze", "frage", "anfrage", "verfuegbar", "noch")
-    ]
+    core = offer_title_from_mail_subject(subject)
+    word_toks = [t for t in _subject_tokens(core) if len(t) >= 4] if core else []
     near = 0
     samples: list[str] = []
     rows = (
@@ -629,9 +624,9 @@ async def pick_offer_for_incoming_reply(
     if len(bound) == 1:
         return bound[0]
 
-    from services.subject_offer import extract_core_offer_title_from_subject
+    from services.subject_offer import offer_title_from_mail_subject
 
-    core = _title_compact(extract_core_offer_title_from_subject(subject))
+    core = _title_compact(offer_title_from_mail_subject(subject))
     if core:
         hits: list[Offer] = []
         for off in bound:
@@ -695,11 +690,11 @@ async def find_offer_by_incoming_signals(
 
     fe_can = _canon_email(from_email)
     subj_norm = normalized_reply_subject(subject)
-    from services.subject_offer import extract_core_offer_title_from_subject
+    from services.subject_offer import offer_title_from_mail_subject
 
     title_hint = (
         (product_title or "").strip()
-        or extract_core_offer_title_from_subject(subject)
+        or offer_title_from_mail_subject(subject)
         or subj_norm
         or ""
     ).strip()

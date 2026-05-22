@@ -67,7 +67,7 @@ def _snapshot_matches_reply(
         if sent_c and subj_c and (sent_c in subj_c or subj_c in sent_c or sent_c == subj_c):
             return True
 
-    if snap and subj_norm and not _subject_title_conflicts(subject, snap):
+    if snap and subj_norm and not _subject_title_conflicts(subj_norm, snap):
         from services.offer_matching import _SUBJECT_WEAK, _fold_match_text
 
         folded_subj = _fold_match_text(subj_norm)
@@ -96,12 +96,12 @@ class MailingReplyContext:
 
 
 def _ctx_from_row(row: MailingSend, off: Offer) -> MailingReplyContext:
-    from services.subject_offer import extract_core_offer_title_from_subject
+    from services.subject_offer import offer_title_from_mail_subject
 
     title = (row.title_snapshot or offer_effective_title(off) or "").strip()
+    core = offer_title_from_mail_subject(row.subject or "")
     if not title:
-        title = extract_core_offer_title_from_subject(row.subject or "")
-    core = extract_core_offer_title_from_subject(row.subject or "")
+        title = core
     if core and title and title.lower().startswith(("kurze frage", "anfrage zu")):
         title = core
     title = title or None

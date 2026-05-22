@@ -1396,9 +1396,9 @@ async def _create_aqua_link_from_db_work(callback: CallbackQuery, mail_id: int) 
         subj = (getattr(mail, "subject", "") or "").strip()
         from services.offer_matching import normalized_reply_subject, resolve_offer_for_aqua_link
 
-        from services.subject_offer import extract_core_offer_title_from_subject
+        from services.subject_offer import offer_title_from_mail_subject
 
-        subj_product = extract_core_offer_title_from_subject(subj) or normalized_reply_subject(subj) or subj
+        subj_product = offer_title_from_mail_subject(subj) or subj
 
         offer, url = await resolve_offer_for_aqua_link(
             session,

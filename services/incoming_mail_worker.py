@@ -855,7 +855,7 @@ async def _enrich_incoming_card_meta(
     mail_ctx: Any | None = None,
 ) -> tuple[int | None, str | None, str | None, str | None, str | None]:
     """Сервис/фото/название с лота или журнала /send — не оставлять только тему Re:."""
-    from services.subject_offer import extract_core_offer_title_from_subject
+    from services.subject_offer import offer_title_from_mail_subject
 
     if mail_ctx is not None:
         return (
@@ -874,7 +874,7 @@ async def _enrich_incoming_card_meta(
             pt = tit or product_title
             if _product_title_looks_like_outgoing_subject(pt):
                 pt = (
-                    extract_core_offer_title_from_subject(subject)
+                    offer_title_from_mail_subject(subject)
                     or tit
                     or pt
                 )
@@ -886,7 +886,7 @@ async def _enrich_incoming_card_meta(
                 pr or offer_price,
             )
 
-    core = extract_core_offer_title_from_subject(subject)
+    core = offer_title_from_mail_subject(subject)
     if core and _product_title_looks_like_outgoing_subject(product_title):
         product_title = core
     return offer_id, service_label, product_title, photo_url, offer_price

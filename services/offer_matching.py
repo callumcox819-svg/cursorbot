@@ -149,8 +149,9 @@ def _fold_de(s: str) -> str:
 
 
 def _subject_distinct_tokens(subj: str) -> list[str]:
-    """Слова-товар из темы (Porte, Baignoire, Skechers), без bebe/baby."""
-    base = _fold_match_text(subj)
+    """Слова только из OFFER-названия в теме."""
+    core = offer_title_from_mail_subject(subj) or subj
+    base = _fold_match_text(core)
     return [t for t in _subject_tokens(base) if len(t) >= 4 and t not in _SUBJECT_WEAK]
 
 
@@ -169,9 +170,19 @@ def _subject_tokens(subj: str) -> list[str]:
     return out
 
 
+def offer_title_from_mail_subject(subject: str) -> str:
+    """Только подстановка OFFER в теме (название товара), не служебные слова шаблона."""
+    from services.subject_offer import offer_title_from_mail_subject as _core
+
+    return _core(subject)
+
+
 def _subject_significant_tokens(subj: str) -> list[str]:
-    """Слова из темы для поиска лота (Couchtisch, Vintage, …)."""
-    return [t for t in _subject_tokens(subj) if len(t) >= 4]
+    """Токены только из OFFER-части темы (название товара)."""
+    core = offer_title_from_mail_subject(subj)
+    if not core:
+        return []
+    return [t for t in _subject_tokens(core) if len(t) >= 4]
 
 
 async def resolve_offer_by_subject_tokens(
@@ -181,9 +192,12 @@ async def resolve_offer_by_subject_tokens(
     subject: str,
     candidate_offers: list[Offer] | None = None,
 ) -> Offer | None:
-    """Фолбэк: ≥2 значимых слова темы в названии оффера (или 1 длинное ≥8)."""
+    """Фолбэк: токены только из OFFER-названия в теме (≥2 слова или 1 длинное)."""
     from services.offer_storage import offer_effective_title
 
+    core = offer_title_from_mail_subject(subject)
+    if not core:
+        return None
     toks = _subject_significant_tokens(subject)
     if not toks:
         return None
@@ -205,7 +219,7 @@ async def resolve_offer_by_subject_tokens(
         title = _fold_match_text(offer_effective_title(off))
         if not title:
             continue
-        if _subject_title_conflicts(subject, offer_effective_title(off)):
+        if _subject_title_conflicts(core, offer_effective_title(off)):
             continue
         hits = sum(1 for t in toks if t in title)
         need = 2
@@ -481,8 +495,9 @@ async def resolve_offer_for_incoming(
 
 
 def _subject_title_conflicts(subj: str, title: str) -> bool:
-    """Явное противоречие темы ответа и названия оффера (6 Stühle Gratis vs 4 Stühle 80.-)."""
-    subj = _fold_match_text(subj)
+    """Явное противоречие OFFER-части темы и названия оффера."""
+    core = offer_title_from_mail_subject(subj) or subj
+    subj = _fold_match_text(core)
     title_l = _fold_match_text(title)
     if not subj or not title_l:
         return False
@@ -585,8 +600,8 @@ def offer_acceptable_for_subject(off: Offer | None, subject: str) -> bool:
 
 
 def gag_title_for_mail(*, offer: Offer | None, subject: str) -> str:
-    """Название для GAG: тема письма важнее чужого лота в БД."""
-    subj = normalized_reply_subject(subject) or (subject or "").strip()
+    """Название для GAG: OFFER-часть темы важнее чужого лота в БД."""
+    subj = offer_title_from_mail_subject(subject) or (subject or "").strip()
     if not offer or not offer_acceptable_for_subject(offer, subject):
         return subj
     from services.offer_storage import offer_effective_title
@@ -595,7 +610,10 @@ def gag_title_for_mail(*, offer: Offer | None, subject: str) -> str:
 
 
 def subject_is_informative(subject: str) -> bool:
-    """Re: Sofa / Re: TV — короткая тема с названием товара тоже информативна."""
+    """Информативна, если в теме есть подстановка OFFER (название товара)."""
+    core = offer_title_from_mail_subject(subject)
+    if core and len(core.replace(" ", "")) >= 5:
+        return True
     subj = _norm_subject(subject)
     if not subj:
         return False
@@ -614,23 +632,29 @@ def subject_is_informative(subject: str) -> bool:
 def subject_token_hits(subject: str, off: Offer) -> int:
     from services.offer_storage import offer_effective_title
 
+    core = offer_title_from_mail_subject(subject)
+    if not core:
+        return 0
     title_l = _fold_match_text(offer_effective_title(off))
     if not title_l:
         return 0
-    return sum(1 for tok in _subject_tokens(subject) if tok in title_l)
+    return sum(1 for tok in _subject_tokens(core) if tok in title_l)
 
 
 def subject_match_score(subject: str, off: Offer) -> float:
-    """Сильный матч темы письма к названию оффера (для продавцов с несколькими лотами)."""
+    """Матч OFFER-названия из темы к title лота."""
     from services.offer_storage import offer_effective_title
 
-    subj = _fold_match_text(subject)
-    if len(subj) < 6:
+    core = offer_title_from_mail_subject(subject)
+    if not core:
+        return 0.0
+    subj = _fold_match_text(core)
+    if len(subj) < 4:
         return 0.0
     raw_title = offer_effective_title(off)
     if not raw_title:
         return 0.0
-    if _subject_title_conflicts(subject, raw_title):
+    if _subject_title_conflicts(core, raw_title):
         return 0.0
 
     title = _fold_match_text(raw_title)
@@ -642,7 +666,7 @@ def subject_match_score(subject: str, off: Offer) -> float:
     subj_l = subj
     title_l = title
     tok_hits = 0
-    for tok in _subject_tokens(subject):
+    for tok in _subject_tokens(core):
         if tok in title_l:
             tok_hits += 1
             score += 24.0
@@ -1124,19 +1148,16 @@ async def resolve_offer_for_incoming_mail(
             if title and not _subject_title_conflicts(subj, title) and _incoming_offer_ok(only):
                 return only
 
-        from services.subject_offer import extract_core_offer_title_from_subject
-
-        subj_core = extract_core_offer_title_from_subject(subj) or subj
         off_tok = await resolve_offer_by_subject_tokens(
             session,
             user_id=int(user_id),
-            subject=subj_core,
+            subject=subj,
             candidate_offers=seller_offers or None,
         )
         if off_tok and _incoming_offer_ok(off_tok):
             return off_tok
         off_tok_g = await resolve_offer_by_subject_tokens(
-            session, user_id=int(user_id), subject=subj_core
+            session, user_id=int(user_id), subject=subj
         )
         if off_tok_g:
             return off_tok_g
@@ -1293,12 +1314,11 @@ async def resolve_offer_for_aqua_link(
     from services.incoming_mail_worker import resolve_offer_for_mail_card
     from services.offer_storage import find_offer_by_link, resolve_offer_from_saved_context
 
-    from services.subject_offer import extract_core_offer_title_from_subject
+    from services.subject_offer import offer_title_from_mail_subject
 
     title_hint = (
         (product_title or "").strip()
-        or extract_core_offer_title_from_subject(subject)
-        or normalized_reply_subject(subject)
+        or offer_title_from_mail_subject(subject)
         or ""
     ).strip()
 
