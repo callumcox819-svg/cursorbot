@@ -235,6 +235,8 @@ async def _upsert_convlink(
     generated_link: str | None = None,
     tg_message_id: int | None = None,
     pinned_offer_id: int | None = None,
+    clear_pinned_offer: bool = False,
+    clear_conv_links: bool = False,
 ) -> None:
     inbox = (inbox_email or "").strip().lower()
     contact = (contact_email or "").strip().lower()
@@ -263,12 +265,17 @@ async def _upsert_convlink(
                 )
                 session.add(row)
             else:
-                if ad_url:
+                if clear_pinned_offer or clear_conv_links:
+                    row.pinned_offer_id = None
+                    row.ad_url = None
+                    row.generated_link = None
+                elif ad_url:
                     row.ad_url = ad_url
                 if generated_link:
                     row.generated_link = generated_link
-                if pinned_offer_id and row.pinned_offer_id is None:
-                    row.pinned_offer_id = int(pinned_offer_id)
+                if not clear_pinned_offer:
+                    if pinned_offer_id:
+                        row.pinned_offer_id = int(pinned_offer_id)
                 if tg_message_id is not None:
                     row.tg_message_id = int(tg_message_id)
 
@@ -909,6 +916,7 @@ async def resolve_offer_for_mail_card(
         user_id=int(user_id),
         subject=subject,
         from_name=from_name,
+        from_email=from_email,
     )
     if off and _offer_ok_for_subject(off):
         return off
@@ -1193,75 +1201,99 @@ async def _process_mails_for_account_impl(
             resolved_offer_id: int | None = None
             resolved_offer_email_id: int | None = None
             mail_db_id: int | None = None
+            already_notified_tg: int | None = None
             account_already_smtp_blocked = False
-            try:
-                async with _imap_db_session() as session:
-                    from services.offer_matching import resolve_offer_for_incoming_mail
+            for _persist_try in range(3):
+                try:
+                    async with _imap_db_session() as session:
+                        from services.offer_matching import resolve_offer_for_incoming_mail
 
-                    if smtp_block_bounce:
-                        acc_st = (
-                            await session.execute(
-                                sa_select(EmailAccount.status).where(
-                                    EmailAccount.id == int(acc_id)
-                                ).limit(1)
+                        if smtp_block_bounce:
+                            acc_st = (
+                                await session.execute(
+                                    sa_select(EmailAccount.status).where(
+                                        EmailAccount.id == int(acc_id)
+                                    ).limit(1)
+                                )
+                            ).scalar_one_or_none()
+                            account_already_smtp_blocked = (
+                                str(acc_st or "").strip().lower() == "smtp_blocked"
                             )
-                        ).scalar_one_or_none()
-                        account_already_smtp_blocked = (
-                            str(acc_st or "").strip().lower() == "smtp_blocked"
-                        )
 
-                    subj = subject or ""
-                    off_mail = await resolve_offer_for_incoming_mail(
-                        session,
-                        user_id=int(user_id),
-                        from_email=from_email_clean,
-                        subject=subj,
-                        from_name=from_name or "",
-                        body_text=body_clean or "",
-                        stored_offer_id=None,
-                        inbox_email=inbox_email_clean,
-                    )
-                    if off_mail:
-                        resolved_offer_id = int(off_mail.id)
-                        resolved_offer_email_id = None
-                    else:
-                        resolved_offer_id = None
-                        resolved_offer_email_id = None
+                        subj = subject or ""
+                        from services.offer_matching import offer_acceptable_for_subject
 
-                    existing = (
-                        await session.execute(
-                            sa_select(IncomingMail)
-                            .where(IncomingMail.account_id == int(acc_id))
-                            .where(IncomingMail.imap_uid == int(db_imap_uid))
-                            .limit(1)
-                        )
-                    ).scalars().first()
-                    already_notified_tg = int(existing.telegram_message_id) if (
-                        existing and getattr(existing, "telegram_message_id", None)
-                    ) else None
-
-                    if not existing:
-                        existing = IncomingMail(
+                        off_mail = await resolve_offer_for_incoming_mail(
+                            session,
                             user_id=int(user_id),
-                            account_id=int(acc_id),
-                            imap_uid=int(db_imap_uid),
+                            from_email=from_email_clean,
+                            subject=subj,
+                            from_name=from_name or "",
+                            body_text=body_clean or "",
+                            stored_offer_id=None,
+                            inbox_email=inbox_email_clean,
                         )
-                        session.add(existing)
+                        if off_mail and offer_acceptable_for_subject(off_mail, subj):
+                            resolved_offer_id = int(off_mail.id)
+                            resolved_offer_email_id = None
+                        else:
+                            resolved_offer_id = None
+                            resolved_offer_email_id = None
 
-                    existing.account_email = inbox_email_clean
-                    existing.from_email = from_email_clean
-                    existing.from_name = (from_name or "").strip() or None
-                    existing.subject = (subject or "").strip() or None
-                    existing.date_str = (date_str or "").strip() or None
-                    existing.body = body_clean or None
-                    existing.resolved_offer_id = resolved_offer_id
-                    existing.resolved_offer_email_id = resolved_offer_email_id
+                        existing = (
+                            await session.execute(
+                                sa_select(IncomingMail)
+                                .where(IncomingMail.account_id == int(acc_id))
+                                .where(IncomingMail.imap_uid == int(db_imap_uid))
+                                .limit(1)
+                            )
+                        ).scalars().first()
+                        already_notified_tg = int(existing.telegram_message_id) if (
+                            existing and getattr(existing, "telegram_message_id", None)
+                        ) else None
 
-                    await _db_commit_retry(session)
-                    mail_db_id = int(existing.id)
+                        if not existing:
+                            existing = IncomingMail(
+                                user_id=int(user_id),
+                                account_id=int(acc_id),
+                                imap_uid=int(db_imap_uid),
+                            )
+                            session.add(existing)
 
-            except Exception:
-                logger.exception("Failed to persist IncomingMail acc=%s uid=%s", acc_id, uid)
+                        existing.account_email = inbox_email_clean
+                        existing.from_email = from_email_clean
+                        existing.from_name = (from_name or "").strip() or None
+                        existing.subject = (subject or "").strip() or None
+                        existing.date_str = (date_str or "").strip() or None
+                        existing.body = body_clean or None
+                        existing.resolved_offer_id = resolved_offer_id
+                        existing.resolved_offer_email_id = resolved_offer_email_id
+
+                        await _db_commit_retry(session)
+                        mail_db_id = int(existing.id)
+                        break
+                except Exception:
+                    logger.exception(
+                        "Failed to persist IncomingMail acc=%s uid=%s from=%s try=%s",
+                        acc_id,
+                        uid,
+                        from_email_clean,
+                        _persist_try + 1,
+                    )
+                    await asyncio.sleep(0.25 * (_persist_try + 1))
+
+            if not mail_db_id:
+                from database import engine as _eng
+
+                logger.error(
+                    "SKIP Telegram card: incoming_mails not saved (from=%s acc=%s uid=%s db=%s). "
+                    "Проверьте DATABASE_URL на imap-worker и cursorbot — одна Postgres, не sqlite.",
+                    from_email_clean,
+                    acc_id,
+                    uid,
+                    _eng.dialect.name,
+                )
+                continue
 
             if already_notified_tg:
                 forwarded += 1
@@ -1316,13 +1348,14 @@ async def _process_mails_for_account_impl(
             if ad_url:
                 FULL_META[(acc_id, uid_key)]["ad_url"] = ad_url
 
-            # Тред диалога (pin лота — после mail_card, когда товар точно определён)
+            # Тред диалога: без валидного лота — чистим старые чужие ad_url/GAG в conversation_links.
             await _upsert_convlink(
                 user_id=user_id,
                 inbox_email=_canon_email(inbox_email_clean),
                 contact_email=_canon_email(from_email_clean),
                 ad_url=(ad_url or None),
                 pinned_offer_id=None,
+                clear_conv_links=not bool(ad_url),
             )
 
             conv = await _load_convlink(
@@ -1330,14 +1363,14 @@ async def _process_mails_for_account_impl(
                 inbox_email=_canon_email(inbox_email_clean),
                 contact_email=_canon_email(from_email_clean),
             )
-            gen_link = _resolve_generated_link_for_card(
-                conv=conv,
-                meta_generated_link=FULL_META.get((acc_id, uid_key), {}).get("generated_link"),
-            )
+            gen_link = ""
+            if ad_url:
+                gen_link = _resolve_generated_link_for_card(
+                    conv=conv,
+                    meta_generated_link=FULL_META.get((acc_id, uid_key), {}).get("generated_link"),
+                )
             if gen_link:
                 FULL_META[(acc_id, uid_key)]["generated_link"] = gen_link
-            if conv and conv.ad_url and not FULL_META[(acc_id, uid_key)].get("ad_url"):
-                FULL_META[(acc_id, uid_key)]["ad_url"] = (conv.ad_url or "").strip()
 
             link_id = link_id_from_generated_url(gen_link)
             if link_id:
@@ -1417,6 +1450,16 @@ async def _process_mails_for_account_impl(
                                 FULL_META[(acc_id, uid_key)]["ad_url"] = pin_url
                 except Exception:
                     logger.exception("Failed to pin offer for dialog from=%s", from_email_clean)
+            else:
+                try:
+                    await _upsert_convlink(
+                        user_id=user_id,
+                        inbox_email=_canon_email(inbox_email_clean),
+                        contact_email=_canon_email(from_email_clean),
+                        clear_conv_links=True,
+                    )
+                except Exception:
+                    logger.exception("Failed to clear pin for from=%s", from_email_clean)
 
             photo_to_send: str | object | None = None
             photo_caption: str | None = None

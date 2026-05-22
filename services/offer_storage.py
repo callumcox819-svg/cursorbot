@@ -64,7 +64,14 @@ def fields_from_item(item: dict[str, Any]) -> dict[str, str]:
         ).strip(),
         "title": _title_from_item_dict(item),
         "price": str(item.get("item_price") or item.get("price") or "").strip(),
-        "link": str(item.get("item_link") or item.get("link") or item.get("url") or "").strip(),
+        "link": str(
+            item.get("item_link")
+            or item.get("link")
+            or item.get("url")
+            or item.get("ad_url")
+            or item.get("marketplace_link")
+            or ""
+        ).strip(),
         "photo": str(
             item.get("item_photo") or item.get("photo") or item.get("image") or item.get("img") or ""
         ).strip(),
@@ -123,7 +130,10 @@ def offer_effective_link(offer: Offer | None) -> str:
     if lk:
         return lk
     raw = parse_offer_raw(getattr(offer, "raw_json", None))
-    return _first_raw_str(raw, ("item_link", "link", "url", "ad_url"))
+    return _first_raw_str(
+        raw,
+        ("item_link", "link", "url", "ad_url", "marketplace_link"),
+    )
 
 
 def _title_compact(s: str) -> str:
@@ -140,6 +150,7 @@ async def find_offer_by_incoming_subject(
     user_id: int,
     subject: str,
     from_name: str = "",
+    from_email: str = "",
 ) -> Offer | None:
     """
     Прямой матч темы ответа к Offer.title / raw_json (Re: «Gabel-Schlüssel 32 / 36»).
@@ -148,9 +159,11 @@ async def find_offer_by_incoming_subject(
     from difflib import SequenceMatcher
 
     from services.offer_matching import (
+        _canon_email,
         _fold_match_text,
         _subject_title_conflicts,
         _subject_tokens,
+        list_offers_for_incoming_contact,
         list_offers_for_seller_name,
         normalized_reply_subject,
         subject_is_informative,
@@ -164,19 +177,30 @@ async def find_offer_by_incoming_subject(
     if len(subj_compact) < 4:
         return None
 
-    name_offs: list[Offer] = []
-    if (from_name or "").strip():
-        name_offs = await list_offers_for_seller_name(
+    fe_can = _canon_email(from_email)
+    pool: list[Offer] = []
+    if fe_can and "@" in fe_can:
+        pool = await list_offers_for_incoming_contact(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            from_name="",
+        )
+    if not pool and (from_name or "").strip() and not fe_can:
+        pool = await list_offers_for_seller_name(
             session, user_id=int(user_id), from_name=from_name
         )
-    pool = name_offs if name_offs else (
-        await session.execute(
-            sa_select(Offer)
-            .where(Offer.user_id == int(user_id))
-            .order_by(Offer.id.desc())
-            .limit(1200)
-        )
-    ).scalars().all()
+    if not pool and fe_can:
+        return None
+    if not pool:
+        pool = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.user_id == int(user_id))
+                .order_by(Offer.id.desc())
+                .limit(1200)
+            )
+        ).scalars().all()
 
     best: Offer | None = None
     best_key = 0.0
@@ -435,6 +459,27 @@ async def diagnose_subject_match(
     }
 
 
+async def offer_bound_to_validated_email(
+    session,
+    *,
+    user_id: int,
+    offer: Offer | None,
+    contact_email: str,
+) -> bool:
+    """Лот привязан к from_email: OfferEmail и/или validated_emails в raw_json (после валидации)."""
+    if not offer:
+        return False
+    from services.offer_matching import _canon_email, offer_has_validated_email_in_raw
+
+    fe = _canon_email(contact_email)
+    if not fe or "@" not in fe:
+        return True
+    ids = await _offer_ids_with_email(session, int(user_id), fe)
+    if int(offer.id) in ids:
+        return True
+    return offer_has_validated_email_in_raw(offer, contact_email)
+
+
 async def _offer_ids_with_email(session, user_id: int, fe_can: str) -> set[int]:
     """Offer.id, у которых есть строка OfferEmail с этим адресом."""
     from services.offer_matching import _canon_email
@@ -501,10 +546,11 @@ async def find_offer_by_incoming_signals(
             user_id=int(user_id),
             subject=subject,
             from_name=from_name,
+            from_email=from_email,
         )
         if off_subj and offer_acceptable_for_subject(off_subj, subject):
             if not fe_can or int(off_subj.id) in email_offer_ids or offer_has_contact_email(
-                off_subj, fe_can
+                off_subj, from_email
             ):
                 return off_subj
 
@@ -537,6 +583,10 @@ async def find_offer_by_incoming_signals(
 
     if len(candidates) == 1:
         only = candidates[0]
+        if fe_can and int(only.id) not in email_offer_ids and not offer_has_contact_email(
+            only, from_email
+        ):
+            return None
         if not offer_acceptable_for_subject(only, subject):
             return None
         return only
@@ -548,6 +598,10 @@ async def find_offer_by_incoming_signals(
     distinct = _subject_distinct_tokens(subj_norm) if subj_norm else []
 
     for off in candidates:
+        if fe_can and int(off.id) not in email_offer_ids and not offer_has_contact_email(
+            off, from_email
+        ):
+            continue
         title = offer_effective_title(off)
         if not offer_acceptable_for_subject(off, subject):
             continue
@@ -558,7 +612,7 @@ async def find_offer_by_incoming_signals(
 
         email_hit = bool(
             fe_can
-            and (int(off.id) in email_offer_ids or offer_has_contact_email(off, fe_can))
+            and (int(off.id) in email_offer_ids or offer_has_contact_email(off, from_email))
         )
         sc = score_offer(
             off,
@@ -584,7 +638,7 @@ async def find_offer_by_incoming_signals(
             best_sc = sc
             best = off
 
-    if not best and (from_name or "").strip() and subj_norm:
+    if not best and (from_name or "").strip() and subj_norm and not fe_can:
         name_offs = await list_offers_for_incoming_contact(
             session,
             user_id=int(user_id),
@@ -723,9 +777,15 @@ async def resolve_offer_from_saved_context(
             if (conv.ad_url or "").strip():
                 cu = (conv.ad_url or "").strip()
                 by_url = await find_offer_by_link(session, user_id=int(user_id), ad_url=cu)
-                got = _pair_saved(by_url, cu)
-                if got[0]:
-                    return got
+                if by_url and await offer_bound_to_validated_email(
+                    session,
+                    user_id=int(user_id),
+                    offer=by_url,
+                    contact_email=contact_email,
+                ):
+                    got = _pair_saved(by_url, cu)
+                    if got[0]:
+                        return got
             if getattr(conv, "pinned_offer_id", None):
                 off = (
                     await session.execute(

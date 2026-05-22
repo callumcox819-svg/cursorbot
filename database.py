@@ -198,7 +198,18 @@ async def _ensure_email_accounts_proxy_id_column() -> None:
 async def init_db() -> None:
     dialect = engine.dialect.name
     if dialect == "postgresql":
-        log.info("БД: PostgreSQL (данные сохраняются между перезапусками Railway)")
+        host_hint = ""
+        try:
+            from urllib.parse import urlparse
+
+            p = urlparse(DATABASE_URL.split("+", 1)[-1] if "+" in DATABASE_URL else DATABASE_URL)
+            host_hint = f" host={p.hostname or '?'}"
+        except Exception:
+            pass
+        log.info(
+            "БД: PostgreSQL (данные сохраняются между перезапусками Railway)%s",
+            host_hint,
+        )
     else:
         log.warning(
             "БД: %s — для Railway добавьте Postgres и переменную DATABASE_URL",

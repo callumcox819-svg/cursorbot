@@ -106,6 +106,8 @@ _PRODUCT_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"fridge", "kuehlschrank", "kühlschrank", "refrigerator", "gefrierschrank"}),
     frozenset({"washer", "waschmaschine", "washing", "trockner", "dryer"}),
     frozenset({"phone", "iphone", "samsung", "handy", "smartphone"}),
+    frozenset({"porte", "poussette", "landau", "poussettes"}),
+    frozenset({"baignoire", "baignoires", "bain"}),
 )
 
 
@@ -661,28 +663,26 @@ def subject_match_score(subject: str, off: Offer) -> float:
     return score
 
 
-def offer_has_contact_email(off: Offer, email: str) -> bool:
-    """Валидированный email в raw_json или совпадение с OfferEmail (проверяется снаружи)."""
+def offer_has_validated_email_in_raw(off: Offer, email: str) -> bool:
+    """Только validated_email / validated_emails из JSON после валидации (не пустой email парсера)."""
     from services.offer_storage import parse_offer_raw
 
     fe = _canon_email(email)
     if not fe:
         return False
     raw = parse_offer_raw(getattr(off, "raw_json", None))
+    ve = _canon_email(str(raw.get("validated_email") or ""))
+    if ve and ve == fe:
+        return True
     for em in raw.get("validated_emails") or []:
         if _canon_email(str(em or "")) == fe:
             return True
-    for key in (
-        "email",
-        "seller_email",
-        "contact_email",
-        "from_email",
-        "owner_email",
-        "account_email",
-    ):
-        if _canon_email(str(raw.get(key) or "")) == fe:
-            return True
     return False
+
+
+def offer_has_contact_email(off: Offer, email: str) -> bool:
+    """Валидированная почта в raw_json (validated_*) — для входящих и GAG."""
+    return offer_has_validated_email_in_raw(off, email)
 
 
 async def list_offers_for_incoming_contact(
@@ -692,7 +692,8 @@ async def list_offers_for_incoming_contact(
     from_email: str,
     from_name: str = "",
 ) -> list[Offer]:
-    """Все лоты продавца: OfferEmail + validated_emails в raw_json + имя."""
+    """Лоты продавца: OfferEmail + validated_emails в raw_json (как после импорта/валидации)."""
+    fe_can = _canon_email(from_email)
     seen: set[int] = set()
     out: list[Offer] = []
 
@@ -710,21 +711,20 @@ async def list_offers_for_incoming_contact(
     ):
         _add(off)
 
-    fe_can = _canon_email(from_email)
     if fe_can:
         recent = (
             await session.execute(
                 sa_select(Offer)
                 .where(Offer.user_id == int(user_id))
                 .order_by(Offer.id.desc())
-                .limit(800)
+                .limit(2500)
             )
         ).scalars().all()
         for off in recent:
-            if offer_has_contact_email(off, fe_can):
+            if offer_has_validated_email_in_raw(off, fe_can):
                 _add(off)
 
-    if (from_name or "").strip():
+    if (from_name or "").strip() and not fe_can:
         for off in await list_offers_for_seller_name(
             session, user_id=int(user_id), from_name=from_name
         ):
@@ -924,7 +924,7 @@ async def resolve_best_offer_by_subject_global(
     seller_offs = await list_offers_for_seller_email(
         session, user_id=int(user_id), from_email=from_email
     )
-    if not seller_offs and from_name:
+    if not seller_offs and from_name and not _canon_email(from_email):
         seller_offs = await list_offers_for_seller_name(
             session, user_id=int(user_id), from_name=from_name
         )
@@ -972,11 +972,17 @@ async def resolve_offer_for_incoming_mail(
     offer_email_id: int | None = None,
 ) -> Offer | None:
     """
-    Оффер под ЭТО письмо: сначала журнал рассылки (offer_id), затем тема, затем email.
+    Оффер под ЭТО письмо: журнал /send → OfferEmail с этим from_email → тема только среди этих лотов.
     """
     subj = (subject or "").strip()
+    fe_can = _canon_email(from_email)
+    from services.offer_storage import _offer_ids_with_email
 
-    def _incoming_offer_ok(off: Offer | None) -> bool:
+    email_offer_ids: set[int] = (
+        await _offer_ids_with_email(session, int(user_id), fe_can) if fe_can else set()
+    )
+
+    def _incoming_offer_ok(off: Offer | None, *, from_mailing_log: bool = False) -> bool:
         if not off:
             return False
         from services.offer_storage import offer_effective_title
@@ -985,6 +991,12 @@ async def resolve_offer_for_incoming_mail(
         if title and _subject_title_conflicts(subj, title):
             return False
         if subject_is_informative(subj) and not offer_matches_incoming_subject(off, subj):
+            return False
+        if fe_can and not from_mailing_log:
+            if int(off.id) in email_offer_ids:
+                return True
+            if offer_has_validated_email_in_raw(off, from_email):
+                return True
             return False
         return True
 
@@ -1008,7 +1020,7 @@ async def resolve_offer_for_incoming_mail(
             from_email=from_email,
             from_name=from_name,
         )
-        if _incoming_offer_ok(off_log):
+        if _incoming_offer_ok(off_log, from_mailing_log=True):
             return off_log
 
     def _pinned_incoming_ok(off: Offer | None) -> bool:
@@ -1030,22 +1042,8 @@ async def resolve_offer_for_incoming_mail(
                 .limit(1)
             )
         ).scalars().first()
-        if off and _pinned_incoming_ok(off):
+        if off and _pinned_incoming_ok(off) and _incoming_offer_ok(off):
             return off
-
-    if (from_email or "").strip() and "@" in from_email:
-        from services.offer_storage import find_offer_by_incoming_signals
-
-        off_sig = await find_offer_by_incoming_signals(
-            session,
-            user_id=int(user_id),
-            from_email=from_email,
-            subject=subj,
-            from_name=from_name,
-            body_text=body_text,
-        )
-        if _incoming_offer_ok(off_sig):
-            return off_sig
 
     if subject_is_informative(subj):
         from services.offer_storage import find_offer_by_incoming_subject, offer_effective_title
@@ -1055,8 +1053,9 @@ async def resolve_offer_for_incoming_mail(
             user_id=int(user_id),
             subject=subj,
             from_name=from_name,
+            from_email=from_email,
         )
-        if off_db:
+        if off_db and _incoming_offer_ok(off_db):
             return off_db
 
         off = await resolve_best_offer_by_subject(
@@ -1067,26 +1066,30 @@ async def resolve_offer_for_incoming_mail(
             from_name=from_name,
             body_text=body_text,
         )
-        if off:
+        if off and _incoming_offer_ok(off):
             return off
-        off = await resolve_best_offer_by_subject_global(
-            session,
-            user_id=int(user_id),
-            subject=subj,
-            from_email=from_email,
-            from_name=from_name,
-            body_text=body_text,
-        )
-        if off:
-            return off
+        if not fe_can:
+            off = await resolve_best_offer_by_subject_global(
+                session,
+                user_id=int(user_id),
+                subject=subj,
+                from_email=from_email,
+                from_name=from_name,
+                body_text=body_text,
+            )
+            if off and _incoming_offer_ok(off):
+                return off
 
         seller_offers = await list_offers_for_seller_email(
             session, user_id=int(user_id), from_email=from_email
         )
-        if not seller_offers and from_name:
-            seller_offers = await list_offers_for_seller_name(
-                session, user_id=int(user_id), from_name=from_name
-            )
+        if fe_can:
+            seller_offers = [
+                o
+                for o in seller_offers
+                if int(o.id) in email_offer_ids
+                or offer_has_validated_email_in_raw(o, from_email)
+            ]
         if len(seller_offers) > 1:
             picked = _pick_best_offer_by_subject_scores(
                 seller_offers,
@@ -1095,12 +1098,12 @@ async def resolve_offer_for_incoming_mail(
                 body_text=body_text,
                 min_score=32.0,
             )
-            if picked:
+            if picked and _incoming_offer_ok(picked):
                 return picked
         if len(seller_offers) == 1:
             only = seller_offers[0]
             title = offer_effective_title(only)
-            if title and not _subject_title_conflicts(subj, title):
+            if title and not _subject_title_conflicts(subj, title) and _incoming_offer_ok(only):
                 return only
 
         off_tok = await resolve_offer_by_subject_tokens(
@@ -1109,19 +1112,20 @@ async def resolve_offer_for_incoming_mail(
             subject=subj,
             candidate_offers=seller_offers or None,
         )
-        if off_tok:
+        if off_tok and _incoming_offer_ok(off_tok):
             return off_tok
 
-        from services.offer_storage import find_offer_by_subject_aggressive
+        if not fe_can:
+            from services.offer_storage import find_offer_by_subject_aggressive
 
-        off_agg = await find_offer_by_subject_aggressive(
-            session,
-            user_id=int(user_id),
-            subject=subj,
-            from_name=from_name,
-        )
-        if off_agg:
-            return off_agg
+            off_agg = await find_offer_by_subject_aggressive(
+                session,
+                user_id=int(user_id),
+                subject=subj,
+                from_name=from_name,
+            )
+            if off_agg and _incoming_offer_ok(off_agg):
+                return off_agg
 
         from services.offer_storage import find_offer_by_incoming_signals
 
@@ -1137,6 +1141,18 @@ async def resolve_offer_for_incoming_mail(
             return off_sig
 
         return None
+
+    if fe_can and not email_offer_ids:
+        recent_chk = (
+            await session.execute(
+                sa_select(Offer)
+                .where(Offer.user_id == int(user_id))
+                .order_by(Offer.id.desc())
+                .limit(2500)
+            )
+        ).scalars().all()
+        if not any(offer_has_validated_email_in_raw(o, from_email) for o in recent_chk):
+            return None
 
     oid, _ = await resolve_offer_for_incoming(
         session,
@@ -1153,7 +1169,7 @@ async def resolve_offer_for_incoming_mail(
             sa_select(Offer).where(Offer.id == int(oid)).where(Offer.user_id == int(user_id)).limit(1)
         )
     ).scalars().first()
-    if off and offer_matches_incoming_subject(off, subj):
+    if off and _incoming_offer_ok(off) and offer_matches_incoming_subject(off, subj):
         return off
     return None
 
@@ -1300,6 +1316,7 @@ async def resolve_offer_for_aqua_link(
             user_id=int(user_id),
             subject=subject,
             from_name=from_name,
+            from_email=from_email,
         )
         if off_subj and offer_acceptable_for_subject(off_subj, subject):
             off = off_subj
