@@ -75,18 +75,37 @@ async def _save_recipients(tg_id: int, emails: List[str]) -> None:
     await save_json_blob(int(tg_id), TEST_MAIL_BLOB, clean[:MAX_TEST_RECIPIENTS])
 
 
-def _menu_text(emails: List[str]) -> str:
+def _from_display(sender_name: str | None, acc_email: str) -> str:
+    em = html.escape(acc_email or "")
+    sn = (sender_name or "").strip()
+    if sn:
+        return f"{html.escape(sn)} &lt;{em}&gt;"
+    return f"<code>{em}</code>"
+
+
+def _menu_text(emails: List[str], *, sender_name: str | None = None) -> str:
+    from_line = ""
+    sn = (sender_name or "").strip()
+    if sn:
+        from_line = f"<b>From (имя отправителя):</b> <code>{html.escape(sn)}</code>\n"
+    else:
+        from_line = (
+            "⚠️ <b>Имя отправителя не задано</b> — укажите в «⚡ Быстрое добавление» (шаг 1) "
+            "или в настройках; иначе в письме только голый email.\n"
+        )
     if not emails:
         return (
             "🧪 <b>Тест маил</b>\n\n"
+            f"{from_line}\n"
             "Список получателей пуст.\n"
             "Нажмите «➕ Добавить email» — можно сразу несколько строк."
         )
     lines = "\n".join(f"{i + 1}. <code>{html.escape(em)}</code>" for i, em in enumerate(emails))
     return (
         "🧪 <b>Тест маил</b>\n\n"
+        f"{from_line}\n"
         f"<b>Сохранённые адреса ({len(emails)}):</b>\n{lines}\n\n"
-        "Отправка как в /send: тема <code>OFFER</code> → название товара, умный пресет, свой аккаунт на каждое письмо."
+        "Отправка как в /send: тема → товар, умный пресет, <b>имя в From</b>, свой аккаунт на письмо."
     )
 
 
@@ -113,9 +132,20 @@ def _menu_kb(emails: List[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+async def _user_sender_name(tg_id: int) -> str | None:
+    async with async_session() as session:
+        user = (
+            await session.execute(select(User).where(User.telegram_id == int(tg_id)).limit(1))
+        ).scalars().first()
+        if not user:
+            return None
+        sn = (getattr(user, "sender_name", None) or "").strip()
+        return sn or None
+
+
 async def _show_menu(message: Message, tg_id: int, *, edit: bool = False) -> None:
     emails = await _load_recipients(tg_id)
-    text = _menu_text(emails)
+    text = _menu_text(emails, sender_name=await _user_sender_name(tg_id))
     kb = _menu_kb(emails)
     if edit:
         try:
@@ -126,7 +156,9 @@ async def _show_menu(message: Message, tg_id: int, *, edit: bool = False) -> Non
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
-async def _pick_send_context(tg_id: int) -> tuple[int, EmailAccount, str, str, str] | None:
+async def _pick_send_context(
+    tg_id: int,
+) -> tuple[int, EmailAccount, str, str, str, str | None] | None:
     async with async_session() as session:
         user = (
             await session.execute(select(User).where(User.telegram_id == int(tg_id)))
@@ -135,6 +167,7 @@ async def _pick_send_context(tg_id: int) -> tuple[int, EmailAccount, str, str, s
             return None
 
         user_id = int(user.id)
+        sender_name = (getattr(user, "sender_name", None) or "").strip() or None
         accs = (
             await session.execute(select(EmailAccount).where(EmailAccount.user_id == user_id))
         ).scalars().all()
@@ -162,7 +195,7 @@ async def _pick_send_context(tg_id: int) -> tuple[int, EmailAccount, str, str, s
     body = fold_plain_mail_text(body)
 
     account = random.choice(accs)
-    return user_id, account, subject, body, offer_title
+    return user_id, account, subject, body, offer_title, sender_name
 
 
 async def _send_test_one(
@@ -176,6 +209,7 @@ async def _send_test_one(
     subject: str,
     body: str,
     offer_title: str,
+    sender_name: str | None = None,
 ) -> tuple[bool, str]:
     acc_email = account.email or ""
     try:
@@ -187,6 +221,7 @@ async def _send_test_one(
                 to_email,
                 subject,
                 body,
+                sender_name=sender_name,
             )
     except Exception as e:
         return False, f"{acc_email}: {e}"
@@ -236,7 +271,10 @@ async def _send_test_one(
             session2.add(OfferEmail(offer_id=test_offer.id, email=to_email))
             await session2.commit()
 
-    return True, f"✅ <code>{to_email}</code> ← <code>{acc_email}</code>{imap_note}"
+    return (
+        True,
+        f"✅ <code>{to_email}</code> ← {_from_display(sender_name, acc_email)}{imap_note}",
+    )
 
 
 async def _run_test_batch(
@@ -251,6 +289,7 @@ async def _run_test_batch(
     fail_n = 0
     lines: List[str] = []
     last_subject = ""
+    last_sender_name: str | None = None
 
     for i, to_email in enumerate(targets):
         if i > 0:
@@ -260,8 +299,9 @@ async def _run_test_batch(
             fail_n += 1
             lines.append(f"❌ {to_email}: нет аккаунта/шаблона")
             continue
-        user_id, account, subject, body, offer_title = ctx
+        user_id, account, subject, body, offer_title, sender_name = ctx
         last_subject = subject
+        last_sender_name = sender_name
         ok, line = await _send_test_one(
             bot=bot,
             chat_id=chat_id,
@@ -272,6 +312,7 @@ async def _run_test_batch(
             subject=subject,
             body=body,
             offer_title=offer_title,
+            sender_name=sender_name,
         )
         if ok:
             ok_n += 1
@@ -286,9 +327,13 @@ async def _run_test_batch(
         except Exception:
             pass
 
+    from_part = ""
+    if last_sender_name:
+        from_part = f"From: <code>{html.escape(last_sender_name)}</code>\n"
     summary = (
         f"<b>Тест завершён</b> — OK: {ok_n}, ошибок: {fail_n}\n"
-        f"Тема (как в рассылке): <code>{html.escape(last_subject or '—')}</code>\n\n"
+        f"Тема (как в рассылке): <code>{html.escape(last_subject or '—')}</code>\n"
+        f"{from_part}\n"
         + "\n".join(lines)
     )
     try:
