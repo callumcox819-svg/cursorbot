@@ -713,20 +713,28 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                             account_send_counts.get(int(acc.id), 0) + 1
                         )
                         offer_sent = getattr(tgt, "offer", None)
-                        if offer_sent:
-                            try:
-                                from services.offer_storage import (
-                                    offer_effective_link,
-                                    offer_effective_title,
+                        if not offer_sent and getattr(tgt, "offer_id", None):
+                            offer_sent = (
+                                await session.execute(
+                                    select(Offer)
+                                    .where(Offer.id == int(tgt.offer_id))
+                                    .where(Offer.user_id == int(db_user_id))
+                                    .limit(1)
                                 )
-                                from services.mailing_send_log import record_mailing_send
-                                from services.incoming_mail_worker import _upsert_convlink
+                            ).scalars().first()
+                        if offer_sent:
+                            from services.offer_storage import (
+                                offer_effective_link,
+                                offer_effective_title,
+                            )
+                            from services.mailing_send_log import record_mailing_send
+                            from services.incoming_mail_worker import _upsert_convlink
+                            from services.offer_matching import _canon_email
 
-                                offer_link = (offer_effective_link(offer_sent) or "").strip()
-                                from services.offer_matching import _canon_email
-
-                                inbox_c = _canon_email(acc.email or "")
-                                contact_c = _canon_email(to_addr)
+                            offer_link = (offer_effective_link(offer_sent) or "").strip()
+                            inbox_c = _canon_email(acc.email or "")
+                            contact_c = _canon_email(to_addr)
+                            try:
                                 await record_mailing_send(
                                     session,
                                     user_id=int(db_user_id),
@@ -737,19 +745,40 @@ async def _sending_loop(*, bot: Bot, chat_id: int, tg_user_id: int) -> None:
                                     subject=subject,
                                     title_snapshot=offer_effective_title(offer_sent),
                                 )
-                                if offer_link:
-                                    await _upsert_convlink(
-                                        user_id=int(db_user_id),
-                                        inbox_email=inbox_c,
-                                        contact_email=contact_c,
-                                        ad_url=offer_link,
-                                        pinned_offer_id=int(offer_sent.id),
-                                    )
+                                await _safe_commit(session)
+                                logger.info(
+                                    "mailing_sends saved offer_id=%s to=%s inbox=%s",
+                                    int(offer_sent.id),
+                                    contact_c,
+                                    inbox_c,
+                                )
                             except Exception:
+                                await _safe_rollback(session)
                                 logger.exception(
-                                    "mailing_send_log / convlink after send to=%s",
+                                    "mailing_sends commit failed to=%s",
                                     to_addr,
                                 )
+                            else:
+                                try:
+                                    if offer_link:
+                                        await _upsert_convlink(
+                                            user_id=int(db_user_id),
+                                            inbox_email=inbox_c,
+                                            contact_email=contact_c,
+                                            ad_url=offer_link,
+                                            pinned_offer_id=int(offer_sent.id),
+                                        )
+                                except Exception:
+                                    logger.exception(
+                                        "convlink after send to=%s",
+                                        to_addr,
+                                    )
+                        else:
+                            logger.warning(
+                                "send ok but no Offer for tgt id=%s to=%s — mailing_sends skipped",
+                                int(tgt.id),
+                                to_addr,
+                            )
                         await _purge_target(session, db_user_id, tgt.id)
                     else:
                         state.last_status = "NORMAL"

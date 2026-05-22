@@ -259,6 +259,25 @@ async def init_db() -> None:
     except Exception as e:
         log.error("Failed offers.raw_json migration: %s", e)
 
+    if dialect == "postgresql":
+        try:
+            async with engine.begin() as conn:
+                has_ms = (
+                    await conn.execute(
+                        text(
+                            "SELECT 1 FROM information_schema.tables "
+                            "WHERE table_name = 'mailing_sends' LIMIT 1"
+                        )
+                    )
+                ).first()
+                if not has_ms:
+                    log.warning(
+                        "Таблица mailing_sends отсутствует — пересоздайте схему (restart bot) "
+                        "или выполните create_all"
+                    )
+        except Exception as e:
+            log.error("mailing_sends table check failed: %s", e)
+
     try:
         await _ensure_conversation_links_pinned_offer_id_column()
     except Exception as e:

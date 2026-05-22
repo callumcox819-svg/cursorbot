@@ -37,6 +37,7 @@ async def record_mailing_send(
         title_snapshot=(title_snapshot or "").strip() or None,
     )
     session.add(row)
+    await session.flush()
 
 
 async def find_offer_by_mailing_log(
