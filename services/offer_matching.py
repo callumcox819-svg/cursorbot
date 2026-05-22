@@ -1025,6 +1025,20 @@ async def resolve_offer_for_incoming_mail(
         if _incoming_offer_ok(off_log, from_mailing_log=True):
             return off_log
 
+    if fe_can:
+        from services.offer_storage import pick_offer_for_incoming_reply
+
+        off_db = await pick_offer_for_incoming_reply(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            subject=subj,
+            from_name=from_name,
+            inbox_email=inbox_email,
+        )
+        if off_db:
+            return off_db
+
     def _pinned_incoming_ok(off: Offer | None) -> bool:
         if not off:
             return False
@@ -1104,6 +1118,8 @@ async def resolve_offer_for_incoming_mail(
                 return picked
         if len(seller_offers) == 1:
             only = seller_offers[0]
+            if offer_has_validated_email_in_raw(only, from_email) or int(only.id) in email_offer_ids:
+                return only
             title = offer_effective_title(only)
             if title and not _subject_title_conflicts(subj, title) and _incoming_offer_ok(only):
                 return only

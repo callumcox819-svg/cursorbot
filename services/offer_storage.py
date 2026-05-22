@@ -502,6 +502,96 @@ async def _offer_ids_with_email(session, user_id: int, fe_can: str) -> set[int]:
     return out
 
 
+async def offers_bound_to_validated_email(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+    from_name: str = "",
+) -> list[Offer]:
+    """Лоты из БД после валидации JSON: OfferEmail + validated_emails в raw_json."""
+    from services.offer_matching import (
+        _canon_email,
+        list_offers_for_incoming_contact,
+        offer_has_validated_email_in_raw,
+    )
+
+    fe = _canon_email(from_email)
+    if not fe:
+        return []
+    email_offer_ids = await _offer_ids_with_email(session, int(user_id), fe)
+    seen: set[int] = set()
+    out: list[Offer] = []
+    for off in await list_offers_for_incoming_contact(
+        session,
+        user_id=int(user_id),
+        from_email=from_email,
+        from_name=from_name,
+    ):
+        oid = int(off.id)
+        if oid in seen:
+            continue
+        if oid in email_offer_ids or offer_has_validated_email_in_raw(off, from_email):
+            seen.add(oid)
+            out.append(off)
+    return out
+
+
+async def pick_offer_for_incoming_reply(
+    session,
+    *,
+    user_id: int,
+    from_email: str,
+    subject: str = "",
+    from_name: str = "",
+    inbox_email: str | None = None,
+) -> Offer | None:
+    """
+    Один validated email → один лот из импорта (фото/цена/ссылка в Offer).
+    Несколько лотов → тема Re: / журнал /send (без путаницы Caroline).
+    """
+    bound = await offers_bound_to_validated_email(
+        session,
+        user_id=int(user_id),
+        from_email=from_email,
+        from_name=from_name,
+    )
+    if not bound:
+        return None
+    if len(bound) == 1:
+        return bound[0]
+
+    from services.subject_offer import extract_core_offer_title_from_subject
+
+    core = _title_compact(extract_core_offer_title_from_subject(subject))
+    if core:
+        hits: list[Offer] = []
+        for off in bound:
+            tc = _title_compact(offer_effective_title(off))
+            if tc and (tc == core or tc in core or core in tc):
+                hits.append(off)
+        if len(hits) == 1:
+            return hits[0]
+
+    if (inbox_email or "").strip():
+        from services.mailing_send_log import resolve_mailing_reply_context
+
+        ctx = await resolve_mailing_reply_context(
+            session,
+            user_id=int(user_id),
+            inbox_email=inbox_email or "",
+            subject=subject,
+            from_email=from_email,
+            from_name=from_name,
+        )
+        if ctx:
+            for off in bound:
+                if int(off.id) == int(ctx.offer_id):
+                    return off
+
+    return None
+
+
 async def find_offer_by_incoming_signals(
     session,
     *,
@@ -587,6 +677,8 @@ async def find_offer_by_incoming_signals(
             only, from_email
         ):
             return None
+        if offer_has_contact_email(only, from_email):
+            return only
         if not offer_acceptable_for_subject(only, subject):
             return None
         return only
@@ -727,6 +819,19 @@ async def resolve_offer_from_saved_context(
         url = (mctx.ad_url or offer_effective_link(mctx.offer) or "").strip()
         if url:
             return mctx.offer, url
+
+    off_pick = await pick_offer_for_incoming_reply(
+        session,
+        user_id=int(user_id),
+        from_email=contact_email,
+        subject=subject,
+        from_name=from_name,
+        inbox_email=inbox_email,
+    )
+    if off_pick:
+        url = (offer_effective_link(off_pick) or "").strip()
+        if url:
+            return off_pick, url
 
     off_sig = await find_offer_by_incoming_signals(
         session,

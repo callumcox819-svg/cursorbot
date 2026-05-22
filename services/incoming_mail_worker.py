@@ -943,6 +943,20 @@ async def resolve_offer_for_mail_card(
         if off_saved:
             return off_saved
 
+    if (from_email or "").strip():
+        from services.offer_storage import pick_offer_for_incoming_reply
+
+        off_pick = await pick_offer_for_incoming_reply(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            subject=subject,
+            from_name=from_name,
+            inbox_email=inbox_email,
+        )
+        if off_pick:
+            return off_pick
+
     inbox = _canon_email(inbox_email or "")
     contact = _canon_email(from_email or "")
     if inbox and contact:
@@ -1122,6 +1136,24 @@ async def mail_card_offer_meta(
                     mctx.photo_url,
                     mctx.offer_price,
                 )
+
+        from services.offer_storage import pick_offer_for_incoming_reply
+
+        off_pick = await pick_offer_for_incoming_reply(
+            session,
+            user_id=int(user_id),
+            from_email=from_email,
+            subject=subject,
+            from_name=from_name,
+            inbox_email=inbox_email,
+        )
+        if off_pick:
+            oid, service_label, product_title, photo_url, offer_price = _meta_tuple_from_offer(
+                off_pick, subject=subject
+            )
+            if not service_label:
+                service_label = _service_label_from_body(body_text) or None
+            return oid, service_label, product_title, photo_url, offer_price
 
         if resolved_offer_id:
             off_saved = await _load_offer_by_id(
