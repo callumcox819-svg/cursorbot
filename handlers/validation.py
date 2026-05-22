@@ -7,6 +7,7 @@ import re
 from typing import Any, Dict, List
 
 from aiogram import Router, F
+from aiogram.filters import Command
 from aiogram.types import Message, FSInputFile
 
 from sqlalchemy import select, delete
@@ -63,8 +64,14 @@ def _format_validation_status(
     short_nicks: int,
     no_email: int,
     errors: int,
+    stopped_early: bool = False,
 ) -> str:
-    title = "✅ Подбор завершён" if finished else "🔎 Подбор email…"
+    if finished and stopped_early:
+        title = "⏹ Подбор остановлен (/stoppodbor)"
+    elif finished:
+        title = "✅ Подбор завершён"
+    else:
+        title = "🔎 Подбор email…"
     bar, pct = _progress_bar(processed, total)
     lines = [
         f"<b>{title}</b>",
@@ -298,10 +305,18 @@ async def validation_handler(message: Message):
     if bg_is_running(tg_id, "validation"):
         return await message.answer("⏳ Валидация уже выполняется. Дождитесь результата.")
 
+    from services.validation_run import clear_validation_run, register_validation_run
+
+    register_validation_run(tg_id, items_count=len(items))
+
     async def _validation_job() -> None:
-        await _run_validation_pipeline(message, status_msg, items)
+        try:
+            await _run_validation_pipeline(message, status_msg, items)
+        finally:
+            clear_validation_run(tg_id)
 
     if not bg_start(tg_id, "validation", _validation_job()):
+        clear_validation_run(tg_id)
         return await message.answer("⏳ Валидация уже выполняется. Дождитесь результата.")
 
 
@@ -373,6 +388,9 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
         seller_name_keys=name_keys,
     )
 
+    from services.validation_run import get_validation_run, register_validation_run
+
+    vrun = get_validation_run(tg_id) or register_validation_run(tg_id, items_count=total_offers)
     live_stats: dict = {"offers_total": total_offers}
     ui_state = {"last_text": ""}
     stop_evt = asyncio.Event()
@@ -380,7 +398,7 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
     def _progress_cb(done: int, total: int, limit: int, in_use: int) -> None:
         pass
 
-    def _ui_from_stats(vstats: dict, *, finished: bool = False) -> str:
+    def _ui_from_stats(vstats: dict, *, finished: bool = False, stopped_early: bool = False) -> str:
         total = int(vstats.get("offers_total") or total_offers)
         seller_i = int(vstats.get("seller_index") or 0)
         added = int(vstats.get("sellers_with_email") or 0)
@@ -411,6 +429,7 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
             short_nicks=short_n,
             no_email=no_email,
             errors=err,
+            stopped_early=stopped_early,
         )
 
     try:
@@ -433,19 +452,53 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
 
     updater = asyncio.create_task(_progress_updater(status_msg, stop_evt, live_stats))
 
+    validated: list = []
     try:
         validated = await validate_offers(
-            items, domains, cfg, progress_cb=_progress_cb, stats=live_stats
+            items,
+            domains,
+            cfg,
+            progress_cb=_progress_cb,
+            stats=live_stats,
+            cancel_event=vrun.cancel_event,
         )
     finally:
         stop_evt.set()
         await updater
 
-    validated_count = len(validated or [])
-    eligible = int(live_stats.get("offers_eligible") or 0)
+    stopped_early = bool(live_stats.get("stopped_early")) or vrun.cancel_event.is_set()
+    await _persist_validation_results(
+        message=message,
+        status_msg=status_msg,
+        items=items,
+        validated=validated or [],
+        live_stats=live_stats,
+        total_offers=total_offers,
+        user_line=user_line,
+        ui_from_stats=lambda v, **kw: _ui_from_stats(v, **kw),
+        stopped_early=stopped_early,
+    )
 
+
+async def _persist_validation_results(
+    *,
+    message: Message,
+    status_msg: Message,
+    items: list,
+    validated: list,
+    live_stats: dict,
+    total_offers: int,
+    user_line: str,
+    ui_from_stats,
+    stopped_early: bool = False,
+) -> None:
+    """Все лоты в БД; валидные email в OfferEmail; очередь /send при активной рассылке."""
+    tg_id = message.from_user.id
+    eligible = int(live_stats.get("offers_eligible") or 0)
     pending_names = live_stats.get("pending_seller_names") or set()
     append_to_active_mailing = False
+    offers_saved = offers_with_email = saved_email_count = 0
+    output: list = []
 
     async with Session() as session:
         user = await get_or_create_user(session, tg_id)
@@ -502,7 +555,7 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
 
     out_path = os.path.join(
         tempfile.gettempdir(),
-        f"validated_{tg_id}_{int(time.time())}.json"
+        f"validated_{tg_id}_{int(time.time())}.json",
     )
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -513,16 +566,42 @@ async def _run_validation_pipeline(message: Message, status_msg: Message, items:
 
     try:
         await status_msg.edit_text(
-            _ui_from_stats(live_stats, finished=True), parse_mode="HTML"
+            ui_from_stats(live_stats, finished=True, stopped_early=stopped_early),
+            parse_mode="HTML",
         )
     except Exception:
         pass
 
+    stop_note = " · остановлено досрочно" if stopped_early else ""
     append_note = " · ➕ добавлено к активной рассылке" if append_to_active_mailing else ""
     await message.answer_document(
         FSInputFile(out_path),
         caption=(
             f"📎 Результат · в БД {offers_saved}/{total_offers} · email {saved_email_count}"
-            f"{append_note}"
+            f"{stop_note}{append_note}"
         ),
+    )
+
+
+@router.message(Command("stoppodbor"))
+async def cmd_stoppodbor(message: Message) -> None:
+    """Остановить подбор/валидацию; сохранить найденное в БД и очередь /send."""
+    from services.validation_run import request_stop_validation
+
+    tg_id = int(message.from_user.id)
+    if not request_stop_validation(tg_id):
+        if bg_is_running(tg_id, "validation"):
+            await message.answer("⏳ Останавливаю подбор… Сохранение в БД после завершения текущего шага.")
+            return
+        await message.answer(
+            "ℹ️ Сейчас подбор не выполняется.\n"
+            "Отправь JSON/TXT — после окончания (или /stoppodbor во время работы) всё найденное попадёт в БД."
+        )
+        return
+
+    await message.answer(
+        "⏹ <b>/stoppodbor</b> — останавливаю подбор.\n"
+        "Уже найденные валидные email будут сохранены в БД"
+        " и добавлены в очередь /send, если рассылка уже идёт.",
+        parse_mode="HTML",
     )

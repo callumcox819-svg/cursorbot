@@ -228,6 +228,7 @@ async def _register_bot_commands(bot: Bot) -> None:
             BotCommand(command="reset", description="Очистить очередь email"),
             BotCommand(command="stat", description="Статус рассылки"),
             BotCommand(command="imap_diag", description="Входящая почта / IMAP"),
+            BotCommand(command="stoppodbor", description="Остановить подбор email"),
         ]
     )
     logger.info("Меню команд Telegram обновлено (/reset и др.)")

@@ -288,6 +288,7 @@ async def _validate_offers_old(
     *,
     progress_cb: ProgressCb | None = None,
     stats: dict[str, Any] | None = None,
+    cancel_event: asyncio.Event | None = None,
 ) -> list[dict[str, Any]]:
     # домены: uniq + clean (сохраняем порядок = приоритет)
     domains_clean: list[str] = []
@@ -524,7 +525,12 @@ async def _validate_offers_old(
         eligible_o = int(stats.get("offers_eligible") or len(prepared))
         stats["offers_remaining"] = max(0, eligible_o - sellers_found)
 
+    def _stop_requested() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     async def _validate_seller(i: int, api_key: str) -> None:
+        if _stop_requested():
+            return
         row = prepared[i]
         async with state_lock:
             if stats is not None:
@@ -538,6 +544,8 @@ async def _validate_offers_old(
         extra_locals = locals_list[1:]
 
         for dom in domains_clean:
+            if _stop_requested():
+                break
             if len(found_by_idx[i]) >= per_seller_limit:
                 break
             batch = [f"{primary}@{dom}".lower()]
@@ -554,6 +562,8 @@ async def _validate_offers_old(
             return
 
         for dom in domains_clean:
+            if _stop_requested():
+                break
             if len(found_by_idx[i]) >= per_seller_limit:
                 break
             batch = [f"{local}@{dom}".lower() for local in extra_locals]
@@ -577,6 +587,8 @@ async def _validate_offers_old(
         nonlocal sellers_completed
         my_key = api_keys[key_idx]
         for i in range(key_idx, len(prepared), n_keys):
+            if _stop_requested():
+                break
             await _validate_seller(i, my_key)
             async with state_lock:
                 sellers_completed += 1
@@ -594,13 +606,18 @@ async def _validate_offers_old(
         await asyncio.gather(*(_worker(k) for k in range(n_keys)))
     else:
         for i in range(n_sellers):
+            if _stop_requested():
+                break
             await _validate_seller(i, api_keys[0])
             sellers_completed = i + 1
             if stats is not None:
                 stats["seller_index"] = sellers_completed
             _refresh_stats()
 
-    # 3) собираем результат
+    if stats is not None and _stop_requested():
+        stats["stopped_early"] = True
+
+    # 3) собираем результат (включая частичный при /stoppodbor)
     out_rows: list[dict[str, Any]] = []
     for i, row in enumerate(prepared):
         found = found_by_idx[i][:per_seller_limit]
@@ -778,7 +795,12 @@ async def validate_offers(*args, **kwargs):
         progress_cb = kwargs.get("progress_cb")
         stats = kwargs.get("stats")
         return await _validate_offers_old(
-            items, domains, cfg, progress_cb=progress_cb, stats=stats
+            items,
+            domains,
+            cfg,
+            progress_cb=progress_cb,
+            stats=stats,
+            cancel_event=kwargs.get("cancel_event"),
         )
 
     raise TypeError("validate_offers(): unsupported call signature")
