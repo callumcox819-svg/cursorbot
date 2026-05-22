@@ -393,12 +393,75 @@ async def find_offer_by_subject_aggressive(
         if not all(w in tf for w in word_toks):
             continue
         tc = _title_compact(title)
-        sc = float(hits) * 20.0
+        sc = float(len(word_toks)) * 20.0
         if tc and (tc == subj_c or tc in subj_c or subj_c in tc):
             sc += 100.0
         if sc > best_sc:
             best_sc = sc
             best = off
+    return best
+
+
+async def find_offer_by_core_subject_title(
+    session,
+    *,
+    user_id: int,
+    subject: str,
+) -> Offer | None:
+    """
+    Лот по названию товара из темы Re: (без «Kurze Frage:»), даже если from_email не в OfferEmail.
+    """
+    from services.offer_matching import (
+        _fold_match_text,
+        _subject_title_conflicts,
+        _subject_tokens,
+        normalized_reply_subject,
+        resolve_offer_by_subject_tokens,
+    )
+    from services.subject_offer import extract_core_offer_title_from_subject
+
+    core = extract_core_offer_title_from_subject(subject)
+    if not core or len(core) < 6:
+        return None
+
+    off = await resolve_offer_by_subject_tokens(
+        session, user_id=int(user_id), subject=core
+    )
+    if off:
+        return off
+
+    subj_c = _title_compact(core)
+    if not subj_c:
+        return None
+    rows = (
+        await session.execute(
+            sa_select(Offer)
+            .where(Offer.user_id == int(user_id))
+            .order_by(Offer.id.desc())
+            .limit(800)
+        )
+    ).scalars().all()
+    product_toks = [
+        t
+        for t in _subject_tokens(core)
+        if len(t) >= 4 and t not in ("kurze", "frage", "anfrage", "verfuegbar", "noch")
+    ]
+    best: Offer | None = None
+    best_hits = 0
+    for off_row in rows:
+        title = offer_effective_title(off_row)
+        if not title or _subject_title_conflicts(core, title):
+            continue
+        tc = _title_compact(title)
+        if tc and (tc == subj_c or subj_c in tc or tc in subj_c):
+            return off_row
+        tf = _fold_match_text(title)
+        if product_toks:
+            hits = sum(1 for t in product_toks if t in tf)
+            need = 2 if len(product_toks) >= 2 else 1
+            if hits >= need and hits > best_hits:
+                best_hits = hits
+                best = off_row
     return best
 
 
@@ -410,14 +473,19 @@ async def diagnose_subject_match(
 ) -> dict[str, Any]:
     """Подсказка в ошибке: есть ли похожие лоты в БД."""
     from services.offer_matching import _fold_match_text, normalized_reply_subject, _subject_tokens
+    from services.subject_offer import extract_core_offer_title_from_subject
 
     total = (
         await session.execute(
             sa_select(func.count(Offer.id)).where(Offer.user_id == int(user_id))
         )
     ).scalar() or 0
-    subj_norm = normalized_reply_subject(subject)
-    word_toks = [t for t in _subject_tokens(subj_norm) if len(t) >= 4]
+    core = extract_core_offer_title_from_subject(subject) or normalized_reply_subject(subject)
+    word_toks = [
+        t
+        for t in _subject_tokens(core)
+        if len(t) >= 4 and t not in ("kurze", "frage", "anfrage", "verfuegbar", "noch")
+    ]
     near = 0
     samples: list[str] = []
     rows = (
@@ -627,8 +695,21 @@ async def find_offer_by_incoming_signals(
 
     fe_can = _canon_email(from_email)
     subj_norm = normalized_reply_subject(subject)
-    title_hint = (product_title or subj_norm or "").strip()
+    from services.subject_offer import extract_core_offer_title_from_subject
+
+    title_hint = (
+        (product_title or "").strip()
+        or extract_core_offer_title_from_subject(subject)
+        or subj_norm
+        or ""
+    ).strip()
     email_offer_ids = await _offer_ids_with_email(session, int(user_id), fe_can) if fe_can else set()
+
+    off_core = await find_offer_by_core_subject_title(
+        session, user_id=int(user_id), subject=subject
+    )
+    if off_core:
+        return off_core
 
     if subj_norm and subject_is_informative(subject):
         off_subj = await find_offer_by_incoming_subject(

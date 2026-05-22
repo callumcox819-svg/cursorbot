@@ -1124,14 +1124,22 @@ async def resolve_offer_for_incoming_mail(
             if title and not _subject_title_conflicts(subj, title) and _incoming_offer_ok(only):
                 return only
 
+        from services.subject_offer import extract_core_offer_title_from_subject
+
+        subj_core = extract_core_offer_title_from_subject(subj) or subj
         off_tok = await resolve_offer_by_subject_tokens(
             session,
             user_id=int(user_id),
-            subject=subj,
+            subject=subj_core,
             candidate_offers=seller_offers or None,
         )
         if off_tok and _incoming_offer_ok(off_tok):
             return off_tok
+        off_tok_g = await resolve_offer_by_subject_tokens(
+            session, user_id=int(user_id), subject=subj_core
+        )
+        if off_tok_g:
+            return off_tok_g
 
         if not fe_can:
             from services.offer_storage import find_offer_by_subject_aggressive
@@ -1157,6 +1165,14 @@ async def resolve_offer_for_incoming_mail(
         )
         if _incoming_offer_ok(off_sig):
             return off_sig
+
+        from services.offer_storage import find_offer_by_core_subject_title
+
+        off_core = await find_offer_by_core_subject_title(
+            session, user_id=int(user_id), subject=subj
+        )
+        if off_core:
+            return off_core
 
         return None
 
@@ -1277,7 +1293,14 @@ async def resolve_offer_for_aqua_link(
     from services.incoming_mail_worker import resolve_offer_for_mail_card
     from services.offer_storage import find_offer_by_link, resolve_offer_from_saved_context
 
-    title_hint = (product_title or normalized_reply_subject(subject) or "").strip()
+    from services.subject_offer import extract_core_offer_title_from_subject
+
+    title_hint = (
+        (product_title or "").strip()
+        or extract_core_offer_title_from_subject(subject)
+        or normalized_reply_subject(subject)
+        or ""
+    ).strip()
 
     off, url = await resolve_offer_from_saved_context(
         session,
@@ -1307,6 +1330,19 @@ async def resolve_offer_for_aqua_link(
     from services.offer_storage import offer_effective_link
 
     url = offer_effective_link(off) if off else ""
+    if not off:
+        from services.offer_storage import (
+            find_offer_by_core_subject_title,
+            find_offer_by_incoming_signals,
+        )
+
+        off_core = await find_offer_by_core_subject_title(
+            session, user_id=int(user_id), subject=subject
+        )
+        if off_core:
+            off = off_core
+            url = (offer_effective_link(off_core) or "").strip()
+
     if not off:
         from services.offer_storage import find_offer_by_incoming_signals
 
@@ -1344,6 +1380,14 @@ async def resolve_offer_for_aqua_link(
             keep_saved = bool(off_log and int(off_log.id) == int(off.id))
 
         if not keep_saved:
+            from services.offer_storage import find_offer_by_core_subject_title
+
+            off_core_keep = await find_offer_by_core_subject_title(
+                session, user_id=int(user_id), subject=subject
+            )
+            keep_saved = bool(off_core_keep and int(off_core_keep.id) == int(off.id))
+
+        if not keep_saved:
             from services.offer_storage import find_offer_by_incoming_subject
 
             off_subj = await find_offer_by_incoming_subject(
@@ -1357,7 +1401,14 @@ async def resolve_offer_for_aqua_link(
                 off = off_subj
                 url = (offer_effective_link(off_subj) or "").strip()
             else:
-                off = None
-                url = ""
+                off_core2 = await find_offer_by_core_subject_title(
+                    session, user_id=int(user_id), subject=subject
+                )
+                if off_core2:
+                    off = off_core2
+                    url = (offer_effective_link(off_core2) or "").strip()
+                else:
+                    off = None
+                    url = ""
 
     return off, url
