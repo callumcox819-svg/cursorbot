@@ -101,6 +101,27 @@ def _template_capture_pattern(template: str) -> str | None:
     return rf"^{body}$"
 
 
+_ROTATION_SUFFIX_RE = re.compile(
+    r"\s*(?:[—\-–]\s*)?noch\s+verfuegbar\?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_rotation_subject_wrapper(text: str) -> str:
+    """Снять шаблон рассылки — остаётся только OFFER (название лота)."""
+    t = sanitize_email_subject(text or "")
+    if not t:
+        return ""
+    t = re.sub(
+        r"^(?:anfrage zu|kurze frage)\s*:?\s*",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    ).strip()
+    t = _ROTATION_SUFFIX_RE.sub("", t).strip()
+    return sanitize_email_subject(t)
+
+
 def offer_title_from_mail_subject(subject: str) -> str:
     """
     Только название товара из темы письма — подстановка OFFER в шаблоне рассылки.
@@ -121,25 +142,38 @@ def offer_title_from_mail_subject(subject: str) -> str:
             core = sanitize_email_subject((m.group(1) or "").strip())
             if core and core.upper() != "OFFER" and len(core) >= 3:
                 return core
+        # Re: без тире «OFFER noch verfuegbar?» (Gmail схлопывает «—»)
+        if "noch verfuegbar" in tpl.lower():
+            loose = re.match(
+                r"^(.+?)\s+noch\s+verfuegbar\?\s*$",
+                s,
+                flags=re.IGNORECASE,
+            )
+            if loose:
+                core = sanitize_email_subject((loose.group(1) or "").strip())
+                if core and core.upper() != "OFFER" and len(core) >= 3:
+                    return core
 
-    # Фолбэк: снять известные обёртки (старые письма / нестандартная тема)
-    s2 = re.sub(
-        r"^(?:anfrage zu|kurze frage)\s*:?\s*",
-        "",
-        s,
-        flags=re.IGNORECASE,
-    ).strip()
-    s2 = re.sub(
-        r"\s*[—\-]\s*noch verfuegbar\?\s*$",
-        "",
-        s2,
-        flags=re.IGNORECASE,
-    ).strip()
-    if s2 and s2 != s and len(s2) >= 3:
-        return sanitize_email_subject(s2)
-    if s and not re.match(r"^(?:anfrage zu|kurze frage)\b", s, re.I):
-        return sanitize_email_subject(s)
+    core = _strip_rotation_subject_wrapper(s)
+    if core and core.upper() != "OFFER" and len(core) >= 3:
+        return core
     return ""
+
+
+def display_product_title_from_subject(
+    subject: str,
+    *,
+    offer_title: str = "",
+) -> str:
+    """Товар в карточке: только OFFER, не вся тема Re:."""
+    core = offer_title_from_mail_subject(subject)
+    if core:
+        return core
+    ot = sanitize_email_subject((offer_title or "").strip())
+    if ot and not re.search(r"noch\s+verfuegbar", ot, re.I):
+        if not re.match(r"^(?:anfrage zu|kurze frage)\b", ot, re.I):
+            return ot
+    return core or ot
 
 
 def extract_core_offer_title_from_subject(subject: str) -> str:

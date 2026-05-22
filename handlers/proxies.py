@@ -481,7 +481,11 @@ async def open_proxies(callback: CallbackQuery):
         ).scalar_one_or_none()
         if not user:
             return
-        from services.proxy_binding import revive_proxies_after_transient_mailing_errors
+        from services.proxy_binding import (
+            reset_mailing_proxy_round_robin,
+            revive_proxies_after_transient_mailing_errors,
+            revive_soft_dead_proxies,
+        )
         from services.proxy_verify import heal_proxy_rows_from_stale_check_markers
 
         proxies = list(
@@ -489,7 +493,9 @@ async def open_proxies(callback: CallbackQuery):
         )
         heal_proxy_rows_from_stale_check_markers(proxies)
         await revive_proxies_after_transient_mailing_errors(session, int(user.id))
+        await revive_soft_dead_proxies(session, int(user.id))
         await session.commit()
+        reset_mailing_proxy_round_robin(int(user.id))
         proxies = list(
             (await session.execute(select(Proxy).where(Proxy.user_id == user.id))).scalars().all()
         )
@@ -684,6 +690,18 @@ async def _proxy_add_work(
                 if len(preview) > 120:
                     preview = preview[:120] + "…"
                 details.append(f"❌ `{preview}` — ошибка сохранения: {e}")
+
+        if ok_count > 0:
+            from services.proxy_binding import (
+                reset_mailing_proxy_round_robin,
+                revive_proxies_after_transient_mailing_errors,
+                revive_soft_dead_proxies,
+            )
+
+            await revive_proxies_after_transient_mailing_errors(session, int(user.id))
+            await revive_soft_dead_proxies(session, int(user.id))
+            await session.commit()
+            reset_mailing_proxy_round_robin(int(user.id))
 
     summary = (
         "Готово.\n\n"

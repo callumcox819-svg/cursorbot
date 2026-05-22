@@ -55,8 +55,11 @@ def _snapshot_matches_reply(
     if not snap:
         return False
 
+    from services.subject_offer import offer_title_from_mail_subject
+
     subj_norm = normalized_reply_subject(subject)
-    subj_c = _title_compact(subj_norm) if subj_norm else ""
+    subj_offer = offer_title_from_mail_subject(subject)
+    subj_c = _title_compact(subj_offer or subj_norm) if (subj_offer or subj_norm) else ""
     sc = _title_compact(snap)
     if sc and subj_c and (sc == subj_c or sc in subj_c or subj_c in sc):
         return True
@@ -96,15 +99,12 @@ class MailingReplyContext:
 
 
 def _ctx_from_row(row: MailingSend, off: Offer) -> MailingReplyContext:
-    from services.subject_offer import offer_title_from_mail_subject
+    from services.subject_offer import display_product_title_from_subject
 
-    title = (row.title_snapshot or offer_effective_title(off) or "").strip()
-    core = offer_title_from_mail_subject(row.subject or "")
-    if not title:
-        title = core
-    if core and title and title.lower().startswith(("kurze frage", "anfrage zu")):
-        title = core
-    title = title or None
+    snap = (row.title_snapshot or offer_effective_title(off) or "").strip()
+    title = display_product_title_from_subject(
+        row.subject or "", offer_title=snap
+    ) or snap or None
     link = (row.ad_url_snapshot or offer_effective_link(off) or "").strip()
     svc = (row.service_label or "").strip() or _service_from_link(link) or None
     photo = (row.photo_url or offer_effective_photo(off) or "").strip() or None
@@ -186,8 +186,11 @@ async def resolve_mailing_reply_context(
 
     contact = _canon_email(from_email) if (from_email or "").strip() else ""
     fn = (from_name or "").strip().lower()
+    from services.subject_offer import offer_title_from_mail_subject
+
     subj_norm = normalized_reply_subject(subject)
-    subj_c = _title_compact(subj_norm) if subj_norm else ""
+    subj_offer = offer_title_from_mail_subject(subject)
+    subj_c = _title_compact(subj_offer or subj_norm) if (subj_offer or subj_norm) else ""
     subj_strong = subject_is_informative(subject)
 
     rows = (

@@ -93,6 +93,27 @@ def exclude_proxy_for_mailing_session(user_id: int, proxy_id: int) -> None:
     _mailing_excluded.setdefault(int(user_id), set()).add(int(proxy_id))
 
 
+async def revive_soft_dead_proxies(session: AsyncSession, user_id: int) -> int:
+    """Снять 🔴 после проверки/таймаута, если это не [mailing] DEAD."""
+    from services.proxy_verify import is_mailing_marked_dead
+
+    rows = (
+        await session.execute(
+            select(Proxy).where(Proxy.user_id == int(user_id)).where(Proxy.is_active.is_(False))
+        )
+    ).scalars().all()
+    n = 0
+    for p in rows:
+        if is_mailing_marked_dead(p.last_error or ""):
+            continue
+        p.is_active = None
+        p.last_error = None
+        n += 1
+    if n:
+        await session.commit()
+    return n
+
+
 async def revive_proxies_after_transient_mailing_errors(
     session: AsyncSession,
     user_id: int,

@@ -886,9 +886,11 @@ async def _enrich_incoming_card_meta(
                 pr or offer_price,
             )
 
-    core = offer_title_from_mail_subject(subject)
-    if core and _product_title_looks_like_outgoing_subject(product_title):
-        product_title = core
+    from services.subject_offer import display_product_title_from_subject
+
+    product_title = display_product_title_from_subject(
+        subject, offer_title=(product_title or "")
+    ) or product_title
     return offer_id, service_label, product_title, photo_url, offer_price
 
 
@@ -898,18 +900,16 @@ def _meta_tuple_from_offer(
     subject: str = "",
 ) -> tuple[int, str | None, str | None, str | None, str | None]:
     """Сервис/товар/фото/цена строго с лота (для карточки и GAG)."""
-    from services.offer_matching import normalized_reply_subject
     from services.offer_storage import (
         offer_effective_link,
         offer_effective_photo,
         offer_effective_price,
         offer_effective_title,
     )
+    from services.subject_offer import display_product_title_from_subject
 
     title = (offer_effective_title(off) or "").strip()
-    subj_norm = normalized_reply_subject(subject)
-    subj_display = (subj_norm[:1].upper() + subj_norm[1:]) if subj_norm else None
-    product_title = title or subj_display
+    product_title = display_product_title_from_subject(subject, offer_title=title) or title
     eff_link = (offer_effective_link(off) or (off.link or "")).strip()
     service_label = _service_label_from_link(eff_link) or None
     photo_url = (offer_effective_photo(off) or "").strip() or None
@@ -1193,8 +1193,13 @@ async def mail_card_offer_meta(
             from_name=from_name,
             body_text=body_text,
         )
+        from services.subject_offer import display_product_title_from_subject, offer_title_from_mail_subject
+
         subj_norm = normalized_reply_subject(subject)
-        subj_display = (subj_norm[:1].upper() + subj_norm[1:]) if subj_norm else None
+        subj_offer = offer_title_from_mail_subject(subject)
+        subj_display = display_product_title_from_subject(subject) or (
+            (subj_norm[:1].upper() + subj_norm[1:]) if subj_norm else None
+        )
         if off:
             from services.offer_storage import _title_compact
 
@@ -1225,7 +1230,9 @@ async def mail_card_offer_meta(
                 subject_is_informative(subject) and subj_norm and not matched
             ):
                 offer_id = int(off.id)
-                product_title = title or subj_display
+                product_title = display_product_title_from_subject(
+                    subject, offer_title=title
+                ) or title or subj_display
                 eff_link = (offer_effective_link(off) or (off.link or "")).strip()
                 service_label = _service_label_from_link(eff_link) or None
                 ph = offer_effective_photo(off)
@@ -1235,7 +1242,7 @@ async def mail_card_offer_meta(
             else:
                 product_title = subj_display
         elif subject_is_informative(subject) and subj_display:
-            product_title = subj_display
+            product_title = subj_offer or subj_display
 
         if not service_label:
             service_label = _service_label_from_body(body_text) or None
@@ -1810,9 +1817,9 @@ async def _process_mails_for_account_impl(
 
                     photo_to_send = BufferedInputFile(incoming_photo_bytes, filename="mail.jpg")
                     photo_caption = "📎 Фото из входящего письма"
-                elif photo_url and is_first:
+                elif photo_url:
                     photo_to_send = photo_url
-                    photo_caption = "📷 Фото товара (первый ответ)"
+                    photo_caption = "📷 Фото товара"
                     if (product_title or "").strip():
                         photo_caption = f"📌 {(product_title or '').strip()}\n{photo_caption}"
                     if offer_price:
@@ -1836,7 +1843,7 @@ async def _process_mails_for_account_impl(
                             mail_ctx=mail_ctx,
                         )
                     )
-                    if photo_url and is_first and not photo_to_send:
+                    if photo_url and not photo_to_send:
                         photo_to_send = photo_url
                         photo_caption = "📷 Фото товара (первый ответ)"
                         if (product_title or "").strip():
